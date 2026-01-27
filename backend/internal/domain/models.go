@@ -26,3 +26,13 @@ type TransferMeta struct {
 	ExpiresAt     time.Time      `json:"expires_at"`
 	ScanStatus    ScanStatus     `json:"scan_status"`
 }
+
+type Session struct {
+	ID                  string    `json:"id"`
+	CreatedAt           time.Time `json:"created_at"`
+	ExpiresAt           time.Time `json:"expires_at"`
+	ClaimTokenHash      string    `json:"claim_token_hash"`
+	ClaimTokenExpiresAt time.Time `json:"claim_token_expires_at"`
+	ClaimTokenUsed      bool      `json:"claim_token_used"`
+	ReceiverPubKeyB64   string    `json:"receiver_pubkey_b64"`
+}

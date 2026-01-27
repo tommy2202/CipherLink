@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"universaldrop/internal/config"
+	"universaldrop/internal/domain"
 	"universaldrop/internal/storage"
 	"universaldrop/internal/token"
 )
@@ -109,6 +110,7 @@ func TestIndistinguishableErrors(t *testing.T) {
 
 type stubStorage struct {
 	manifest map[string][]byte
+	sessions map[string]domain.Session
 }
 
 func (s *stubStorage) SaveManifest(_ context.Context, transferID string, manifest []byte) error {
@@ -144,4 +146,48 @@ func (s *stubStorage) DeleteTransfer(_ context.Context, _ string) error {
 
 func (s *stubStorage) SweepExpired(_ context.Context, _ time.Time) (int, error) {
 	return 0, nil
+}
+
+func (s *stubStorage) CreateSession(_ context.Context, session domain.Session) error {
+	if s.sessions == nil {
+		s.sessions = map[string]domain.Session{}
+	}
+	if _, exists := s.sessions[session.ID]; exists {
+		return storage.ErrConflict
+	}
+	s.sessions[session.ID] = session
+	return nil
+}
+
+func (s *stubStorage) GetSession(_ context.Context, sessionID string) (domain.Session, error) {
+	if s.sessions == nil {
+		return domain.Session{}, storage.ErrNotFound
+	}
+	session, ok := s.sessions[sessionID]
+	if !ok {
+		return domain.Session{}, storage.ErrNotFound
+	}
+	return session, nil
+}
+
+func (s *stubStorage) UpdateSession(_ context.Context, session domain.Session) error {
+	if s.sessions == nil {
+		return storage.ErrNotFound
+	}
+	if _, ok := s.sessions[session.ID]; !ok {
+		return storage.ErrNotFound
+	}
+	s.sessions[session.ID] = session
+	return nil
+}
+
+func (s *stubStorage) DeleteSession(_ context.Context, sessionID string) error {
+	if s.sessions == nil {
+		return storage.ErrNotFound
+	}
+	if _, ok := s.sessions[sessionID]; !ok {
+		return storage.ErrNotFound
+	}
+	delete(s.sessions, sessionID)
+	return nil
 }

@@ -2,12 +2,14 @@ package localfs
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
+	"universaldrop/internal/domain"
 	"universaldrop/internal/storage"
 )
 
@@ -15,6 +17,7 @@ type Store struct {
 	mu           sync.Mutex
 	root         string
 	transfersDir string
+	sessionsDir  string
 }
 
 func New(root string) (*Store, error) {
@@ -28,10 +31,15 @@ func New(root string) (*Store, error) {
 	if err := os.MkdirAll(transfersDir, 0700); err != nil {
 		return nil, err
 	}
+	sessionsDir := filepath.Join(root, "sessions")
+	if err := os.MkdirAll(sessionsDir, 0700); err != nil {
+		return nil, err
+	}
 
 	return &Store{
 		root:         root,
 		transfersDir: transfersDir,
+		sessionsDir:  sessionsDir,
 	}, nil
 }
 
@@ -134,6 +142,68 @@ func (s *Store) SweepExpired(_ context.Context, _ time.Time) (int, error) {
 	return 0, nil
 }
 
+func (s *Store) CreateSession(_ context.Context, session domain.Session) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := s.sessionPath(session.ID)
+	if _, err := os.Stat(path); err == nil {
+		return storage.ErrConflict
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	return writeJSONAtomic(path, session)
+}
+
+func (s *Store) GetSession(_ context.Context, sessionID string) (domain.Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := s.sessionPath(sessionID)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return domain.Session{}, storage.ErrNotFound
+		}
+		return domain.Session{}, err
+	}
+
+	var session domain.Session
+	if err := json.Unmarshal(data, &session); err != nil {
+		return domain.Session{}, err
+	}
+	return session, nil
+}
+
+func (s *Store) UpdateSession(_ context.Context, session domain.Session) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := s.sessionPath(session.ID)
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return storage.ErrNotFound
+		}
+		return err
+	}
+	return writeJSONAtomic(path, session)
+}
+
+func (s *Store) DeleteSession(_ context.Context, sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := s.sessionPath(sessionID)
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return storage.ErrNotFound
+		}
+		return err
+	}
+	return nil
+}
+
 func (s *Store) transferDir(transferID string) string {
 	return filepath.Join(s.transfersDir, transferID)
 }
@@ -146,6 +216,10 @@ func (s *Store) dataPath(transferID string) string {
 	return filepath.Join(s.transferDir(transferID), "data.bin")
 }
 
+func (s *Store) sessionPath(sessionID string) string {
+	return filepath.Join(s.sessionsDir, sessionID+".json")
+}
+
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -156,4 +230,12 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+func writeJSONAtomic(path string, payload any) error {
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(path, data, 0600)
 }

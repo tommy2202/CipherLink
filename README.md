@@ -30,6 +30,7 @@ Configuration (optional):
 - `UD_RATE_LIMIT_HEALTH_WINDOW` (default `1m`)
 - `UD_RATE_LIMIT_V1_MAX` (default `30`)
 - `UD_RATE_LIMIT_V1_WINDOW` (default `1m`)
+- `UD_CLAIM_TOKEN_TTL` (default `3m`, min `2m`, max `5m`)
 
 ### Verify
 
@@ -62,5 +63,6 @@ flutter test
 ## Notes
 
 - Use the app home screen "Ping Backend" button against `/healthz`.
+- Receiver sessions are created via `POST /v1/session/create`.
 - `/v1` routes are rate-limited per IP and group.
 - See `/docs/security` for the security documentation skeleton.

@@ -35,6 +35,9 @@ class _HomeScreenState extends State<HomeScreen> {
       TextEditingController(text: 'http://localhost:8080');
   String _status = 'Idle';
   bool _loading = false;
+  bool _creatingSession = false;
+  String _sessionStatus = 'No session created yet.';
+  SessionCreateResponse? _sessionResponse;
 
   @override
   void dispose() {
@@ -86,6 +89,51 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _createSession() async {
+    final baseUrl = _baseUrlController.text.trim();
+    if (baseUrl.isEmpty) {
+      setState(() {
+        _sessionStatus = 'Enter a base URL first.';
+      });
+      return;
+    }
+
+    setState(() {
+      _creatingSession = true;
+      _sessionStatus = 'Creating session...';
+      _sessionResponse = null;
+    });
+
+    try {
+      final baseUri = Uri.parse(baseUrl);
+      final response = await http
+          .post(baseUri.resolve('/v1/session/create'))
+          .timeout(const Duration(seconds: 8));
+
+      if (response.statusCode != 200) {
+        setState(() {
+          _sessionStatus = 'Error: ${response.statusCode}';
+        });
+        return;
+      }
+
+      final payload = jsonDecode(response.body) as Map<String, dynamic>;
+      final sessionResponse = SessionCreateResponse.fromJson(payload);
+      setState(() {
+        _sessionResponse = sessionResponse;
+        _sessionStatus = 'Session created.';
+      });
+    } catch (err) {
+      setState(() {
+        _sessionStatus = 'Failed: $err';
+      });
+    } finally {
+      setState(() {
+        _creatingSession = false;
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -111,9 +159,71 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 16),
             Text('Status: $_status'),
+            const SizedBox(height: 32),
+            const Divider(),
+            const SizedBox(height: 16),
+            const Text(
+              'Receive Session',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 12),
+            ElevatedButton(
+              onPressed: _creatingSession ? null : _createSession,
+              child: Text(
+                _creatingSession ? 'Creating...' : 'Create Session',
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(_sessionStatus),
+            if (_sessionResponse != null) ...[
+              const SizedBox(height: 12),
+              Text('Expires at: ${_sessionResponse!.expiresAt}'),
+              Text('Short code: ${_sessionResponse!.shortCode}'),
+              const SizedBox(height: 8),
+              const Text('QR payload:'),
+              SelectableText(_sessionResponse!.qrPayload),
+            ],
           ],
         ),
       ),
     );
   }
+}
+
+class SessionCreateResponse {
+  SessionCreateResponse({
+    required this.sessionId,
+    required this.expiresAt,
+    required this.claimToken,
+    required this.receiverPubKeyB64,
+    required this.qrPayload,
+  }) : shortCode = deriveShortCode(claimToken);
+
+  final String sessionId;
+  final String expiresAt;
+  final String claimToken;
+  final String receiverPubKeyB64;
+  final String qrPayload;
+  final String shortCode;
+
+  static SessionCreateResponse fromJson(Map<String, dynamic> json) {
+    return SessionCreateResponse(
+      sessionId: json['session_id']?.toString() ?? '',
+      expiresAt: json['expires_at']?.toString() ?? '',
+      claimToken: json['claim_token']?.toString() ?? '',
+      receiverPubKeyB64: json['receiver_pubkey_b64']?.toString() ?? '',
+      qrPayload: json['qr_payload']?.toString() ?? '',
+    );
+  }
+}
+
+String deriveShortCode(String claimToken) {
+  final sanitized = claimToken.replaceAll(RegExp(r'[^A-Za-z0-9]'), '');
+  if (sanitized.isEmpty) {
+    return '';
+  }
+  if (sanitized.length <= 8) {
+    return sanitized.toUpperCase();
+  }
+  return sanitized.substring(sanitized.length - 8).toUpperCase();
 }

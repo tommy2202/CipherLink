@@ -87,6 +87,7 @@ func (s *Server) routes() http.Handler {
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(s.rateLimit("v1"))
 		r.Get("/ping", s.handlePing)
+		r.Post("/session/create", s.handleCreateSession)
 		r.Get("/transfers/{transferID}/manifest", s.handleGetTransferManifest)
 	})
 

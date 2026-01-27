@@ -16,7 +16,14 @@ type Config struct {
 	DataDir         string
 	RateLimitHealth RateLimit
 	RateLimitV1     RateLimit
+	ClaimTokenTTL   time.Duration
 }
+
+const (
+	DefaultClaimTokenTTL = 3 * time.Minute
+	MinClaimTokenTTL     = 2 * time.Minute
+	MaxClaimTokenTTL     = 5 * time.Minute
+)
 
 func Load() Config {
 	cfg := Config{
@@ -30,6 +37,7 @@ func Load() Config {
 			Max:    30,
 			Window: time.Minute,
 		},
+		ClaimTokenTTL: DefaultClaimTokenTTL,
 	}
 
 	if value := os.Getenv("UD_ADDRESS"); value != "" {
@@ -50,6 +58,12 @@ func Load() Config {
 	}
 	if value := parseDurationEnv("UD_RATE_LIMIT_V1_WINDOW"); value > 0 {
 		cfg.RateLimitV1.Window = value
+	}
+	if value := parseDurationEnv("UD_CLAIM_TOKEN_TTL"); value > 0 {
+		cfg.ClaimTokenTTL = value
+	}
+	if cfg.ClaimTokenTTL < MinClaimTokenTTL || cfg.ClaimTokenTTL > MaxClaimTokenTTL {
+		cfg.ClaimTokenTTL = DefaultClaimTokenTTL
 	}
 
 	return cfg
