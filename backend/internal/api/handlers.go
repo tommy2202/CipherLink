@@ -229,6 +229,7 @@ func (s *Server) handleApproveDrop(w http.ResponseWriter, r *http.Request) {
 		}
 		drop.ScanStatus = domain.ScanStatusClean
 		_ = s.store.DeleteScanCopy(r.Context(), dropID)
+		drop.ScanCopyPath = ""
 	}
 
 	drop.ReceiverApproved = true
@@ -282,6 +283,11 @@ func (s *Server) handleUploadReceiverCopy(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	drop, err = s.store.GetDrop(r.Context(), dropID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, errNotFound)
+		return
+	}
 	drop.Status = domain.DropStatusReceiverCopyUploaded
 	if err := s.store.UpdateDrop(r.Context(), drop); err != nil {
 		writeError(w, http.StatusNotFound, errNotFound)
@@ -324,6 +330,7 @@ func (s *Server) handleDownloadReceiverCopy(w http.ResponseWriter, r *http.Reque
 	}
 
 	drop.Status = domain.DropStatusReceived
+	drop.ReceiverCopyPath = ""
 	if err := s.store.UpdateDrop(r.Context(), drop); err != nil {
 		s.logger.Printf("drop_update_error=true")
 	}
