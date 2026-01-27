@@ -70,4 +70,5 @@ flutter test
 - Senders claim via `POST /v1/session/claim` and poll `/v1/session/poll`.
 - Receivers approve/reject via `POST /v1/session/approve`.
 - `/v1` routes are rate-limited per IP and group.
+- App crypto helpers live in `app/lib/crypto.dart` with tests under `app/test`.
 - See `/docs/security` for the security documentation skeleton.
