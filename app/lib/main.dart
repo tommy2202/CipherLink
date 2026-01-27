@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:convert';
 
+import 'package:cryptography/cryptography.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
@@ -38,10 +40,25 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _creatingSession = false;
   String _sessionStatus = 'No session created yet.';
   SessionCreateResponse? _sessionResponse;
+  final TextEditingController _qrPayloadController = TextEditingController();
+  final TextEditingController _sessionIdController = TextEditingController();
+  final TextEditingController _claimTokenController = TextEditingController();
+  final TextEditingController _senderLabelController =
+      TextEditingController(text: 'Sender');
+  bool _sending = false;
+  String _sendStatus = 'Idle';
+  String? _claimId;
+  String? _claimStatus;
+  Timer? _pollTimer;
 
   @override
   void dispose() {
     _baseUrlController.dispose();
+    _qrPayloadController.dispose();
+    _sessionIdController.dispose();
+    _claimTokenController.dispose();
+    _senderLabelController.dispose();
+    _pollTimer?.cancel();
     super.dispose();
   }
 
@@ -134,6 +151,134 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _claimSession() async {
+    final baseUrl = _baseUrlController.text.trim();
+    if (baseUrl.isEmpty) {
+      setState(() {
+        _sendStatus = 'Enter a base URL first.';
+      });
+      return;
+    }
+
+    final parsed = _parseQrPayload(_qrPayloadController.text.trim());
+    final sessionId = parsed.sessionId.isNotEmpty
+        ? parsed.sessionId
+        : _sessionIdController.text.trim();
+    final claimToken = parsed.claimToken.isNotEmpty
+        ? parsed.claimToken
+        : _claimTokenController.text.trim();
+    final senderLabel = _senderLabelController.text.trim();
+
+    if (sessionId.isEmpty || claimToken.isEmpty) {
+      setState(() {
+        _sendStatus = 'Provide a QR payload or session ID + claim token.';
+      });
+      return;
+    }
+    if (senderLabel.isEmpty) {
+      setState(() {
+        _sendStatus = 'Provide a sender label.';
+      });
+      return;
+    }
+
+    setState(() {
+      _sending = true;
+      _sendStatus = 'Claiming session...';
+      _claimId = null;
+      _claimStatus = null;
+    });
+
+    try {
+      final keyPair = await X25519().newKeyPair();
+      final publicKey = await keyPair.extractPublicKey();
+      final pubKeyB64 = base64Encode(publicKey.bytes);
+
+      final response = await http
+          .post(
+            Uri.parse(baseUrl).resolve('/v1/session/claim'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'session_id': sessionId,
+              'claim_token': claimToken,
+              'sender_label': senderLabel,
+              'sender_pubkey_b64': pubKeyB64,
+            }),
+          )
+          .timeout(const Duration(seconds: 8));
+
+      if (response.statusCode != 200) {
+        setState(() {
+          _sendStatus = 'Error: ${response.statusCode}';
+        });
+        return;
+      }
+
+      final payload = jsonDecode(response.body) as Map<String, dynamic>;
+      final claimId = payload['claim_id']?.toString();
+      final status = payload['status']?.toString() ?? 'pending';
+      setState(() {
+        _claimId = claimId;
+        _claimStatus = status;
+        _sendStatus = 'Claimed. Polling for approval...';
+      });
+      _startPolling(sessionId, claimToken);
+    } catch (err) {
+      setState(() {
+        _sendStatus = 'Failed: $err';
+      });
+    } finally {
+      setState(() {
+        _sending = false;
+      });
+    }
+  }
+
+  void _startPolling(String sessionId, String claimToken) {
+    _pollTimer?.cancel();
+    _pollTimer = Timer(const Duration(seconds: 1), () {
+      _pollOnce(sessionId, claimToken);
+    });
+  }
+
+  Future<void> _pollOnce(String sessionId, String claimToken) async {
+    try {
+      final baseUrl = _baseUrlController.text.trim();
+      final baseUri = Uri.parse(baseUrl);
+      final uri = baseUri.replace(
+        path: '/v1/session/poll',
+        queryParameters: {
+          'session_id': sessionId,
+          'claim_token': claimToken,
+        },
+      );
+      final response = await http.get(uri).timeout(const Duration(seconds: 5));
+      if (response.statusCode != 200) {
+        setState(() {
+          _sendStatus = 'Poll error: ${response.statusCode}';
+        });
+        return;
+      }
+
+      final payload = jsonDecode(response.body) as Map<String, dynamic>;
+      final status = payload['status']?.toString() ?? 'pending';
+      setState(() {
+        _claimStatus = status;
+        _sendStatus = 'Status: $status';
+      });
+
+      if (status == 'pending') {
+        _pollTimer = Timer(const Duration(seconds: 2), () {
+          _pollOnce(sessionId, claimToken);
+        });
+      }
+    } catch (err) {
+      setState(() {
+        _sendStatus = 'Poll failed: $err';
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -183,6 +328,54 @@ class _HomeScreenState extends State<HomeScreen> {
               const Text('QR payload:'),
               SelectableText(_sessionResponse!.qrPayload),
             ],
+            const SizedBox(height: 32),
+            const Divider(),
+            const SizedBox(height: 16),
+            const Text(
+              'Send Session',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _qrPayloadController,
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(),
+                labelText: 'QR payload (optional)',
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _sessionIdController,
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(),
+                labelText: 'Session ID',
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _claimTokenController,
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(),
+                labelText: 'Claim token',
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _senderLabelController,
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(),
+                labelText: 'Sender label',
+              ),
+            ),
+            const SizedBox(height: 12),
+            ElevatedButton(
+              onPressed: _sending ? null : _claimSession,
+              child: Text(_sending ? 'Claiming...' : 'Claim Session'),
+            ),
+            const SizedBox(height: 12),
+            Text(_sendStatus),
+            if (_claimId != null) Text('Claim ID: $_claimId'),
+            if (_claimStatus != null) Text('Claim status: $_claimStatus'),
           ],
         ),
       ),
@@ -226,4 +419,28 @@ String deriveShortCode(String claimToken) {
     return sanitized.toUpperCase();
   }
   return sanitized.substring(sanitized.length - 8).toUpperCase();
+}
+
+ParsedQrPayload _parseQrPayload(String payload) {
+  if (payload.isEmpty) {
+    return const ParsedQrPayload();
+  }
+  try {
+    final uri = Uri.parse(payload);
+    final sessionId = uri.queryParameters['session_id'] ?? '';
+    final claimToken = uri.queryParameters['claim_token'] ?? '';
+    if (sessionId.isEmpty && claimToken.isEmpty) {
+      return const ParsedQrPayload();
+    }
+    return ParsedQrPayload(sessionId: sessionId, claimToken: claimToken);
+  } catch (_) {
+    return const ParsedQrPayload();
+  }
+}
+
+class ParsedQrPayload {
+  const ParsedQrPayload({this.sessionId = '', this.claimToken = ''});
+
+  final String sessionId;
+  final String claimToken;
 }

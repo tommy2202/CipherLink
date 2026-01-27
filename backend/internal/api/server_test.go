@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -17,10 +19,11 @@ import (
 func TestHealthz(t *testing.T) {
 	server := NewServer(Dependencies{
 		Config: config.Config{
-			Address:         ":0",
-			DataDir:         "data",
-			RateLimitHealth: config.RateLimit{Max: 100, Window: time.Minute},
-			RateLimitV1:     config.RateLimit{Max: 100, Window: time.Minute},
+			Address:               ":0",
+			DataDir:               "data",
+			RateLimitHealth:       config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:           config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitSessionClaim: config.RateLimit{Max: 100, Window: time.Minute},
 		},
 		Store:  &stubStorage{},
 		Tokens: token.NewMemoryService(),
@@ -47,10 +50,11 @@ func TestHealthz(t *testing.T) {
 func TestRateLimitTriggers(t *testing.T) {
 	server := NewServer(Dependencies{
 		Config: config.Config{
-			Address:         ":0",
-			DataDir:         "data",
-			RateLimitHealth: config.RateLimit{Max: 100, Window: time.Minute},
-			RateLimitV1:     config.RateLimit{Max: 1, Window: time.Minute},
+			Address:               ":0",
+			DataDir:               "data",
+			RateLimitHealth:       config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:           config.RateLimit{Max: 1, Window: time.Minute},
+			RateLimitSessionClaim: config.RateLimit{Max: 100, Window: time.Minute},
 		},
 		Store:  &stubStorage{},
 		Tokens: token.NewMemoryService(),
@@ -77,10 +81,11 @@ func TestIndistinguishableErrors(t *testing.T) {
 	tokens := token.NewMemoryService()
 	server := NewServer(Dependencies{
 		Config: config.Config{
-			Address:         ":0",
-			DataDir:         "data",
-			RateLimitHealth: config.RateLimit{Max: 100, Window: time.Minute},
-			RateLimitV1:     config.RateLimit{Max: 100, Window: time.Minute},
+			Address:               ":0",
+			DataDir:               "data",
+			RateLimitHealth:       config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:           config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitSessionClaim: config.RateLimit{Max: 100, Window: time.Minute},
 		},
 		Store:  store,
 		Tokens: tokens,
@@ -106,6 +111,118 @@ func TestIndistinguishableErrors(t *testing.T) {
 	if invalidRec.Body.String() != missingRec.Body.String() {
 		t.Fatalf("expected same response body")
 	}
+}
+
+func TestClaimTokenSingleUse(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimBody := sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	}
+
+	firstRec := claimSession(t, server, claimBody)
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("expected claim 200 got %d", firstRec.Code)
+	}
+
+	secondRec := claimSession(t, server, claimBody)
+	invalidRec := claimSession(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      "invalid-token",
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+
+	if secondRec.Code != invalidRec.Code {
+		t.Fatalf("expected same status got %d and %d", secondRec.Code, invalidRec.Code)
+	}
+	if secondRec.Body.String() != invalidRec.Body.String() {
+		t.Fatalf("expected indistinguishable response body")
+	}
+}
+
+func TestClaimTokenExpiryBlocksClaim(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	session, err := store.GetSession(context.Background(), createResp.SessionID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	session.ClaimTokenExpiresAt = time.Now().UTC().Add(-time.Minute)
+	if err := store.UpdateSession(context.Background(), session); err != nil {
+		t.Fatalf("update session: %v", err)
+	}
+
+	expiredRec := claimSession(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+
+	invalidRec := claimSession(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      "invalid-token",
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+
+	if expiredRec.Code != invalidRec.Code {
+		t.Fatalf("expected same status got %d and %d", expiredRec.Code, invalidRec.Code)
+	}
+	if expiredRec.Body.String() != invalidRec.Body.String() {
+		t.Fatalf("expected indistinguishable response body")
+	}
+}
+
+func newSessionTestServer(store *stubStorage) *Server {
+	return NewServer(Dependencies{
+		Config: config.Config{
+			Address:               ":0",
+			DataDir:               "data",
+			RateLimitHealth:       config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:           config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitSessionClaim: config.RateLimit{Max: 100, Window: time.Minute},
+			ClaimTokenTTL:         config.DefaultClaimTokenTTL,
+		},
+		Store:  store,
+		Tokens: token.NewMemoryService(),
+	})
+}
+
+func createSession(t *testing.T, server *Server) sessionCreateResponse {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/create", nil)
+	server.Router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected create 200 got %d", rec.Code)
+	}
+	var payload sessionCreateResponse
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	return payload
+}
+
+func claimSession(t *testing.T, server *Server, reqBody sessionClaimRequest) *httptest.ResponseRecorder {
+	t.Helper()
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		t.Fatalf("marshal claim request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/claim", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	return rec
 }
 
 type stubStorage struct {

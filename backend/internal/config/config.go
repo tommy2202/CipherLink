@@ -12,11 +12,12 @@ type RateLimit struct {
 }
 
 type Config struct {
-	Address         string
-	DataDir         string
-	RateLimitHealth RateLimit
-	RateLimitV1     RateLimit
-	ClaimTokenTTL   time.Duration
+	Address               string
+	DataDir               string
+	RateLimitHealth       RateLimit
+	RateLimitV1           RateLimit
+	RateLimitSessionClaim RateLimit
+	ClaimTokenTTL         time.Duration
 }
 
 const (
@@ -35,6 +36,10 @@ func Load() Config {
 		},
 		RateLimitV1: RateLimit{
 			Max:    30,
+			Window: time.Minute,
+		},
+		RateLimitSessionClaim: RateLimit{
+			Max:    10,
 			Window: time.Minute,
 		},
 		ClaimTokenTTL: DefaultClaimTokenTTL,
@@ -58,6 +63,12 @@ func Load() Config {
 	}
 	if value := parseDurationEnv("UD_RATE_LIMIT_V1_WINDOW"); value > 0 {
 		cfg.RateLimitV1.Window = value
+	}
+	if value := parseIntEnv("UD_RATE_LIMIT_SESSION_CLAIM_MAX"); value > 0 {
+		cfg.RateLimitSessionClaim.Max = int(value)
+	}
+	if value := parseDurationEnv("UD_RATE_LIMIT_SESSION_CLAIM_WINDOW"); value > 0 {
+		cfg.RateLimitSessionClaim.Window = value
 	}
 	if value := parseDurationEnv("UD_CLAIM_TOKEN_TTL"); value > 0 {
 		cfg.ClaimTokenTTL = value

@@ -19,10 +19,10 @@ import (
 )
 
 type Dependencies struct {
-	Config config.Config
-	Store  storage.Storage
-	Tokens token.TokenService
-	Logger *log.Logger
+	Config  config.Config
+	Store   storage.Storage
+	Tokens  token.TokenService
+	Logger  *log.Logger
 	Version string
 }
 
@@ -58,6 +58,9 @@ func NewServer(deps Dependencies) *Server {
 	if deps.Config.RateLimitV1.Max > 0 {
 		rateLimiters["v1"] = ratelimit.New(deps.Config.RateLimitV1.Max, deps.Config.RateLimitV1.Window, clk)
 	}
+	if deps.Config.RateLimitSessionClaim.Max > 0 {
+		rateLimiters["session-claim"] = ratelimit.New(deps.Config.RateLimitSessionClaim.Max, deps.Config.RateLimitSessionClaim.Window, clk)
+	}
 
 	server := &Server{
 		cfg:          deps.Config,
@@ -87,6 +90,8 @@ func (s *Server) routes() http.Handler {
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(s.rateLimit("v1"))
 		r.Get("/ping", s.handlePing)
+		r.With(s.rateLimit("session-claim")).Post("/session/claim", s.handleClaimSession)
+		r.Get("/session/poll", s.handlePollSession)
 		r.Post("/session/create", s.handleCreateSession)
 		r.Get("/transfers/{transferID}/manifest", s.handleGetTransferManifest)
 	})
