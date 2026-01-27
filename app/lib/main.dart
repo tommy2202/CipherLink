@@ -9,7 +9,9 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:mime/mime.dart';
-import 'package:archive/archive.dart';
+import 'package:file_selector/file_selector.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 
 import 'clipboard_service.dart';
 import 'crypto.dart';
@@ -22,6 +24,7 @@ import 'transfer_manifest.dart';
 import 'transfer_coordinator.dart';
 import 'transfer_state_store.dart';
 import 'transport.dart';
+import 'zip_extract.dart';
 
 void main() {
   runApp(const UniversalDropApp());
@@ -87,6 +90,11 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _lastSavedMime;
   String _packagingMode = packagingModeOriginals;
   final TextEditingController _packageTitleController = TextEditingController();
+  Uint8List? _lastZipBytes;
+  TransferManifest? _lastManifest;
+  bool _extracting = false;
+  ExtractProgress? _extractProgress;
+  String _extractStatus = '';
   final TextEditingController _qrPayloadController = TextEditingController();
   final TextEditingController _sessionIdController = TextEditingController();
   final TextEditingController _claimTokenController = TextEditingController();
@@ -393,21 +401,13 @@ class _HomeScreenState extends State<HomeScreen> {
         });
         return;
       }
-      final defaultDestination =
-          await _destinationSelector.defaultDestination(result.manifest);
-      final choice = await _showDestinationSelector(
-        defaultDestination,
-        isMediaManifest(result.manifest),
-      );
-      if (choice == null) {
-        setState(() {
-          _manifestStatus = 'Save cancelled.';
-        });
-        return;
-      }
-      await _destinationSelector.rememberChoice(result.manifest, choice);
-
       final manifest = result.manifest;
+      _lastManifest = manifest;
+      _extractStatus = '';
+      _extractProgress = null;
+      if (manifest.packagingMode != packagingModeZip) {
+        _lastZipBytes = null;
+      }
       if (manifest.payloadKind == payloadKindText) {
         final text = utf8.decode(result.bytes);
         setState(() {
@@ -422,6 +422,20 @@ class _HomeScreenState extends State<HomeScreen> {
         );
         return;
       }
+
+      final defaultDestination =
+          await _destinationSelector.defaultDestination(manifest);
+      final choice = await _showDestinationSelector(
+        defaultDestination,
+        isMediaManifest(manifest),
+      );
+      if (choice == null) {
+        setState(() {
+          _manifestStatus = 'Save cancelled.';
+        });
+        return;
+      }
+      await _destinationSelector.rememberChoice(manifest, choice);
 
       if (manifest.packagingMode == packagingModeAlbum) {
         final outcome = await _saveAlbumPayload(
@@ -445,6 +459,9 @@ class _HomeScreenState extends State<HomeScreen> {
         return;
       }
 
+      if (manifest.packagingMode == packagingModeZip) {
+        _lastZipBytes = result.bytes;
+      }
       final fileName = _suggestFileName(manifest);
       final mime = _suggestMime(manifest);
       final isMedia = isMediaManifest(manifest);
@@ -900,7 +917,7 @@ class _HomeScreenState extends State<HomeScreen> {
     required TransferManifest manifest,
     required SaveDestination destination,
   }) async {
-    final archive = ZipDecoder().decodeBytes(bytes);
+    final entries = decodeZipEntries(bytes);
     final fileMap = <String, TransferManifestFile>{};
     for (final entry in manifest.files) {
       fileMap[entry.relativePath] = entry;
@@ -911,20 +928,20 @@ class _HomeScreenState extends State<HomeScreen> {
       usedFallback: false,
       savedToGallery: false,
     );
-    for (final file in archive.files) {
-      if (file.isFile == false) {
+    for (final entry in entries) {
+      if (!entry.isFile) {
         continue;
       }
-      final name = file.name;
+      final name = entry.name;
       if (!name.startsWith('media/')) {
         continue;
       }
       final relativePath = name.substring('media/'.length);
       final metadata = fileMap[relativePath];
-      final fileBytes = Uint8List.fromList(file.content as List<int>);
-      final mime = metadata?.mime ?? lookupMimeType(relativePath) ?? 'application/octet-stream';
+      final mime =
+          metadata?.mime ?? lookupMimeType(relativePath) ?? 'application/octet-stream';
       final outcome = await _saveService.saveBytes(
-        bytes: fileBytes,
+        bytes: entry.bytes,
         name: relativePath,
         mime: mime,
         isMedia: true,
@@ -941,6 +958,49 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     }
     return lastOutcome;
+  }
+
+  Future<void> _extractZip() async {
+    final zipBytes = _lastZipBytes;
+    final manifest = _lastManifest;
+    if (zipBytes == null || manifest == null) {
+      return;
+    }
+    setState(() {
+      _extracting = true;
+      _extractStatus = 'Extracting...';
+    });
+
+    try {
+      final destination = await getDirectoryPath();
+      String destPath;
+      if (destination == null) {
+        final dir = await getApplicationDocumentsDirectory();
+        destPath = p.join(dir.path, _defaultPackageTitle());
+      } else {
+        destPath = destination;
+      }
+      final result = await extractZipBytes(
+        bytes: zipBytes,
+        destinationDir: destPath,
+        onProgress: (progress) {
+          setState(() {
+            _extractProgress = progress;
+          });
+        },
+      );
+      setState(() {
+        _extractStatus = 'Extracted ${result.filesExtracted} files.';
+      });
+    } catch (_) {
+      setState(() {
+        _extractStatus = 'Extraction failed.';
+      });
+    } finally {
+      setState(() {
+        _extracting = false;
+      });
+    }
   }
 
   String _defaultPackageTitle() {
@@ -966,7 +1026,7 @@ class _HomeScreenState extends State<HomeScreen> {
       return 'text.txt';
     }
     if (manifest.files.isNotEmpty) {
-      return manifest.files.first.name;
+      return manifest.files.first.relativePath;
     }
     return 'transfer.bin';
   }
@@ -1419,6 +1479,25 @@ class _HomeScreenState extends State<HomeScreen> {
                     ],
                   ],
                 ),
+              ],
+              if (_lastManifest?.packagingMode == packagingModeZip &&
+                  _lastZipBytes != null) ...[
+                const SizedBox(height: 12),
+                ElevatedButton(
+                  onPressed: _extracting ? null : _extractZip,
+                  child:
+                      Text(_extracting ? 'Extracting...' : 'Extract ZIP'),
+                ),
+                if (_extractProgress != null) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    'Extracted ${_extractProgress!.filesExtracted}/${_extractProgress!.totalFiles} files',
+                  ),
+                ],
+                if (_extractStatus.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text(_extractStatus),
+                ],
               ],
             ],
           ],

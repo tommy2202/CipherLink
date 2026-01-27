@@ -27,6 +27,7 @@ void main() {
         bytes: Uint8List.fromList([1, 2, 3, 4]),
         payloadKind: payloadKindFile,
         mimeType: 'text/plain',
+        packagingMode: packagingModeOriginals,
       ),
       TransferFile(
         id: 'file-2',
@@ -34,6 +35,7 @@ void main() {
         bytes: Uint8List.fromList([5, 6, 7, 8]),
         payloadKind: payloadKindFile,
         mimeType: 'text/plain',
+        packagingMode: packagingModeOriginals,
       ),
     ];
 

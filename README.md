@@ -79,6 +79,7 @@ flutter test
 - Packaging modes: Originals (default), ZIP, and Album. ZIP saves to Files by
   default; Album saves to Photos/Gallery by default, with fallbacks when
   permissions are denied.
+- ZIP transfers can optionally be extracted locally; extraction is local-only.
 - Received media (image/video) defaults to Photos/Gallery, while other files
   default to Files. Permissions are requested only when needed; if denied, the
   app saves to its private storage and offers “Open in…” and “Save As…” actions.

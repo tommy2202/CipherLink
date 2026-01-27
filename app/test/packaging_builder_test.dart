@@ -1,10 +1,10 @@
 import 'dart:typed_data';
 
-import 'package:archive/archive.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:universaldrop_app/packaging_builder.dart';
 import 'package:universaldrop_app/transfer_coordinator.dart';
 import 'package:universaldrop_app/transfer_manifest.dart';
+import 'package:universaldrop_app/zip_extract.dart';
 
 void main() {
   test('zip builder produces package and manifest fields', () {
@@ -56,10 +56,9 @@ void main() {
       albumMode: true,
     );
 
-    final archive = ZipDecoder().decodeBytes(package.bytes);
-    final hasManifest = archive.files.any(
-      (file) => file.name == 'ALBUM_MANIFEST.json',
-    );
+    final entries = decodeZipEntries(package.bytes);
+    final hasManifest =
+        entries.any((entry) => entry.name == 'ALBUM_MANIFEST.json');
     expect(hasManifest, isTrue);
   });
 }
