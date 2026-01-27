@@ -60,10 +60,10 @@ func Load() Config {
 	}
 
 	if value := parseIntEnv("UD_RATE_LIMIT_CREATE"); value > 0 {
-		cfg.RateLimitCreate.Max = value
+		cfg.RateLimitCreate.Max = int(value)
 	}
 	if value := parseIntEnv("UD_RATE_LIMIT_REDEEM"); value > 0 {
-		cfg.RateLimitRedeem.Max = value
+		cfg.RateLimitRedeem.Max = int(value)
 	}
 	if value := parseDurationEnv("UD_RATE_LIMIT_WINDOW"); value > 0 {
 		cfg.RateLimitCreate.Window = value
