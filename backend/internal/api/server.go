@@ -4,12 +4,16 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"universaldrop/internal/clock"
 	"universaldrop/internal/config"
+	"universaldrop/internal/logging"
+	"universaldrop/internal/ratelimit"
 	"universaldrop/internal/storage"
 	"universaldrop/internal/token"
 )
@@ -23,12 +27,13 @@ type Dependencies struct {
 }
 
 type Server struct {
-	cfg     config.Config
-	store   storage.Storage
-	tokens  token.TokenService
-	logger  *log.Logger
-	version string
-	Router  http.Handler
+	cfg          config.Config
+	store        storage.Storage
+	tokens       token.TokenService
+	logger       *log.Logger
+	version      string
+	rateLimiters map[string]*ratelimit.Limiter
+	Router       http.Handler
 }
 
 func NewServer(deps Dependencies) *Server {
@@ -40,13 +45,27 @@ func NewServer(deps Dependencies) *Server {
 	if version == "" {
 		version = "0.1"
 	}
+	tokenService := deps.Tokens
+	if tokenService == nil {
+		tokenService = token.NewMemoryService()
+	}
+
+	rateLimiters := map[string]*ratelimit.Limiter{}
+	clk := clock.RealClock{}
+	if deps.Config.RateLimitHealth.Max > 0 {
+		rateLimiters["health"] = ratelimit.New(deps.Config.RateLimitHealth.Max, deps.Config.RateLimitHealth.Window, clk)
+	}
+	if deps.Config.RateLimitV1.Max > 0 {
+		rateLimiters["v1"] = ratelimit.New(deps.Config.RateLimitV1.Max, deps.Config.RateLimitV1.Window, clk)
+	}
 
 	server := &Server{
-		cfg:     deps.Config,
-		store:   deps.Store,
-		tokens:  deps.Tokens,
-		logger:  logSink,
-		version: version,
+		cfg:          deps.Config,
+		store:        deps.Store,
+		tokens:       tokenService,
+		logger:       logSink,
+		version:      version,
+		rateLimiters: rateLimiters,
 	}
 
 	server.Router = server.routes()
@@ -61,8 +80,14 @@ func (s *Server) routes() http.Handler {
 	r.Use(middleware.Timeout(15 * time.Second))
 	r.Use(s.safeLogger)
 
-	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	r.With(s.rateLimit("health")).Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": s.version})
+	})
+
+	r.Route("/v1", func(r chi.Router) {
+		r.Use(s.rateLimit("v1"))
+		r.Get("/ping", s.handlePing)
+		r.Get("/transfers/{transferID}/manifest", s.handleGetTransferManifest)
 	})
 
 	return r
@@ -79,7 +104,32 @@ func (s *Server) safeLogger(next http.Handler) http.Handler {
 		if route == "" {
 			route = "unknown"
 		}
-		s.logger.Printf("method=%s route=%s status=%d duration=%s",
-			r.Method, route, ww.Status(), time.Since(start).Truncate(time.Millisecond))
+		logging.Allowlist(s.logger, map[string]string{
+			"method":      r.Method,
+			"route":       route,
+			"status":      strconv.Itoa(ww.Status()),
+			"duration_ms": strconv.FormatInt(time.Since(start).Milliseconds(), 10),
+			"ip_hash":     anonHash(clientIP(r)),
+		})
 	})
+}
+
+func (s *Server) rateLimit(group string) func(http.Handler) http.Handler {
+	limiter := s.rateLimiters[group]
+	if limiter == nil {
+		return func(next http.Handler) http.Handler {
+			return next
+		}
+	}
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			key := group + ":" + clientIP(r)
+			if !limiter.Allow(key) {
+				writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate_limited"})
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }

@@ -26,6 +26,10 @@ Configuration (optional):
 
 - `UD_ADDRESS` (default `:8080`)
 - `UD_DATA_DIR` (default `data`)
+- `UD_RATE_LIMIT_HEALTH_MAX` (default `60`)
+- `UD_RATE_LIMIT_HEALTH_WINDOW` (default `1m`)
+- `UD_RATE_LIMIT_V1_MAX` (default `30`)
+- `UD_RATE_LIMIT_V1_WINDOW` (default `1m`)
 
 ### Verify
 
@@ -58,4 +62,5 @@ flutter test
 ## Notes
 
 - Use the app home screen "Ping Backend" button against `/healthz`.
+- `/v1` routes are rate-limited per IP and group.
 - See `/docs/security` for the security documentation skeleton.

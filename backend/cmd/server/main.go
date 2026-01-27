@@ -11,6 +11,7 @@ import (
 
 	"universaldrop/internal/api"
 	"universaldrop/internal/config"
+	"universaldrop/internal/logging"
 	"universaldrop/internal/storage/localfs"
 	"universaldrop/internal/token"
 )
@@ -21,7 +22,9 @@ func main() {
 
 	store, err := localfs.New(cfg.DataDir)
 	if err != nil {
-		logger.Fatalf("storage_init_failed=true")
+		logging.Fatal(logger, map[string]string{
+			"event": "storage_init_failed",
+		})
 	}
 	tokens := token.NewMemoryService()
 
