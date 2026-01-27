@@ -26,12 +26,14 @@ void main() {
         name: 'a.txt',
         bytes: Uint8List.fromList([1, 2, 3, 4]),
         payloadKind: payloadKindFile,
+        mimeType: 'text/plain',
       ),
       TransferFile(
         id: 'file-2',
         name: 'b.txt',
         bytes: Uint8List.fromList([5, 6, 7, 8]),
         payloadKind: payloadKindFile,
+        mimeType: 'text/plain',
       ),
     ];
 

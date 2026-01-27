@@ -2,15 +2,18 @@ class TransferManifestFile {
   TransferManifestFile({
     required this.name,
     required this.bytes,
+    this.mime,
   });
 
   final String name;
   final int bytes;
+  final String? mime;
 
   Map<String, dynamic> toJson() {
     return {
       'name': name,
       'bytes': bytes,
+      if (mime != null) 'mime': mime,
     };
   }
 
@@ -18,6 +21,7 @@ class TransferManifestFile {
     return TransferManifestFile(
       name: json['name']?.toString() ?? '',
       bytes: json['bytes'] is int ? json['bytes'] as int : 0,
+      mime: json['mime']?.toString(),
     );
   }
 }

@@ -76,4 +76,7 @@ flutter test
 - App crypto helpers live in `app/lib/crypto.dart` with tests under `app/test`.
 - The app supports live “Send Text” using the same E2E transfer pipeline;
   content is deleted on receipt or TTL expiry.
+- Received media (image/video) defaults to Photos/Gallery, while other files
+  default to Files. Permissions are requested only when needed; if denied, the
+  app saves to its private storage and offers “Open in…” and “Save As…” actions.
 - See `/docs/security` for the security documentation skeleton.

@@ -24,6 +24,7 @@ class TransferFile {
     required this.name,
     required this.bytes,
     required this.payloadKind,
+    required this.mimeType,
     this.textTitle,
   });
 
@@ -31,6 +32,7 @@ class TransferFile {
   final String name;
   final Uint8List bytes;
   final String payloadKind;
+  final String mimeType;
   final String? textTitle;
 }
 
@@ -278,6 +280,7 @@ class TransferCoordinator {
                 TransferManifestFile(
                   name: job.file.name,
                   bytes: job.file.bytes.length,
+                  mime: job.file.mimeType,
                 ),
               ],
         textTitle: job.file.payloadKind == payloadKindText

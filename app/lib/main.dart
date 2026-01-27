@@ -2,14 +2,20 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
+import 'dart:io';
 
 import 'package:cryptography/cryptography.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:mime/mime.dart';
 
 import 'clipboard_service.dart';
 import 'crypto.dart';
+import 'destination_preferences.dart';
+import 'destination_rules.dart';
+import 'destination_selector.dart';
+import 'save_service.dart';
 import 'transfer_manifest.dart';
 import 'transfer_coordinator.dart';
 import 'transfer_state_store.dart';
@@ -64,10 +70,19 @@ class _HomeScreenState extends State<HomeScreen> {
   TransferCoordinator? _coordinator;
   late final InMemoryTransferStateStore _transferStore =
       InMemoryTransferStateStore();
+  final DestinationPreferenceStore _destinationStore =
+      SharedPreferencesDestinationStore();
+  final SaveService _saveService = DefaultSaveService();
+  late final DestinationSelector _destinationSelector =
+      DestinationSelector(_destinationStore);
   final TextEditingController _textTitleController = TextEditingController();
   final TextEditingController _textContentController = TextEditingController();
   bool _sendTextMode = false;
   String _receivedText = '';
+  String _saveStatus = '';
+  String? _lastSavedPath;
+  bool _lastSaveIsMedia = false;
+  String? _lastSavedMime;
   final TextEditingController _qrPayloadController = TextEditingController();
   final TextEditingController _sessionIdController = TextEditingController();
   final TextEditingController _claimTokenController = TextEditingController();
@@ -373,22 +388,59 @@ class _HomeScreenState extends State<HomeScreen> {
         });
         return;
       }
-      if (result.manifest.payloadKind == payloadKindText) {
+      final defaultDestination =
+          await _destinationSelector.defaultDestination(result.manifest);
+      final choice = await _showDestinationSelector(
+        defaultDestination,
+        isMediaManifest(result.manifest),
+      );
+      if (choice == null) {
+        setState(() {
+          _manifestStatus = 'Save cancelled.';
+        });
+        return;
+      }
+      await _destinationSelector.rememberChoice(result.manifest, choice);
+
+      final manifest = result.manifest;
+      final fileName = _suggestFileName(manifest);
+      final mime = _suggestMime(manifest);
+      final isMedia = isMediaManifest(manifest);
+      final outcome = await _saveService.saveBytes(
+        bytes: result.bytes,
+        name: fileName,
+        mime: mime,
+        isMedia: isMedia,
+        destination: choice.destination,
+      );
+      _lastSavedPath = outcome.localPath;
+      _lastSaveIsMedia = isMedia;
+      _lastSavedMime = mime;
+      if (manifest.payloadKind == payloadKindText) {
         final text = utf8.decode(result.bytes);
         setState(() {
           _receivedText = text;
           _manifestStatus = 'Text received.';
+          _saveStatus = outcome.success
+              ? 'Saved.'
+              : 'Saved locally with fallback.';
         });
       } else {
         setState(() {
           _manifestStatus = 'Downloaded ${result.bytes.length} bytes.';
+          _saveStatus = outcome.success
+              ? 'Saved.'
+              : 'Saved locally with fallback.';
         });
       }
-      await coordinator.sendReceipt(
-        sessionId: sessionId,
-        transferId: result.transferId,
-        transferToken: transferToken,
-      );
+
+      if (outcome.success || outcome.localPath != null) {
+        await coordinator.sendReceipt(
+          sessionId: sessionId,
+          transferId: result.transferId,
+          transferToken: transferToken,
+        );
+      }
     } catch (err) {
       setState(() {
         _manifestStatus = 'Manifest error: $err';
@@ -495,12 +547,15 @@ class _HomeScreenState extends State<HomeScreen> {
       if (bytes == null) {
         continue;
       }
+      final mimeType = lookupMimeType(file.name, headerBytes: bytes) ??
+          'application/octet-stream';
       files.add(
         TransferFile(
           id: _randomId(),
           name: file.name,
           bytes: bytes,
           payloadKind: payloadKindFile,
+          mimeType: mimeType,
         ),
       );
     }
@@ -603,6 +658,7 @@ class _HomeScreenState extends State<HomeScreen> {
           : _textTitleController.text.trim(),
       bytes: Uint8List.fromList(utf8.encode(text)),
       payloadKind: payloadKindText,
+      mimeType: textMimePlain,
       textTitle: _textTitleController.text.trim().isEmpty
           ? null
           : _textTitleController.text.trim(),
@@ -634,6 +690,117 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _textContentController.text = text;
     });
+  }
+
+  Future<DestinationChoice?> _showDestinationSelector(
+    SaveDestination defaultDestination,
+    bool isMedia,
+  ) async {
+    SaveDestination selected =
+        isMedia ? defaultDestination : SaveDestination.files;
+    bool remember = false;
+    return showDialog<DestinationChoice>(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setState) {
+            return AlertDialog(
+              title: const Text('Choose destination'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  RadioListTile<SaveDestination>(
+                    value: SaveDestination.photos,
+                    groupValue: selected,
+                    onChanged: isMedia
+                        ? (value) {
+                            if (value == null) return;
+                            setState(() {
+                              selected = value;
+                            });
+                          }
+                        : null,
+                    title: const Text('Save to Photos/Gallery'),
+                  ),
+                  RadioListTile<SaveDestination>(
+                    value: SaveDestination.files,
+                    groupValue: selected,
+                    onChanged: (value) {
+                      if (value == null) return;
+                      setState(() {
+                        selected = value;
+                      });
+                    },
+                    title: const Text('Save to Files'),
+                  ),
+                  Row(
+                    children: [
+                      Checkbox(
+                        value: remember,
+                        onChanged: (value) {
+                          setState(() {
+                            remember = value ?? false;
+                          });
+                        },
+                      ),
+                      const Text('Remember my choice'),
+                    ],
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('Cancel'),
+                ),
+                ElevatedButton(
+                  onPressed: () {
+                    Navigator.of(context).pop(
+                      DestinationChoice(
+                        destination: selected,
+                        remember: remember,
+                      ),
+                    );
+                  },
+                  child: const Text('Save'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  String _suggestFileName(TransferManifest manifest) {
+    if (manifest.payloadKind == payloadKindText) {
+      final title = manifest.textTitle?.trim();
+      if (title != null && title.isNotEmpty) {
+        return '$title.txt';
+      }
+      return 'text.txt';
+    }
+    if (manifest.files.isNotEmpty) {
+      return manifest.files.first.name;
+    }
+    return 'transfer.bin';
+  }
+
+  String _suggestMime(TransferManifest manifest) {
+    if (manifest.payloadKind == payloadKindText) {
+      return manifest.textMime ?? textMimePlain;
+    }
+    if (manifest.files.isNotEmpty) {
+      return manifest.files.first.mime ?? 'application/octet-stream';
+    }
+    return 'application/octet-stream';
+  }
+
+  String _suggestedExportName() {
+    if (_lastSavedPath == null) {
+      return 'export.bin';
+    }
+    return _lastSavedPath!.split(Platform.pathSeparator).last;
   }
 
   void _startPolling(String sessionId, String claimToken) {
@@ -976,6 +1143,51 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
                 child: const Text('Copy to Clipboard'),
               ),
+            ],
+            if (_saveStatus.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text(_saveStatus),
+              if (_lastSavedPath != null) ...[
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    ElevatedButton(
+                      onPressed: () => _saveService.openIn(_lastSavedPath!),
+                      child: const Text('Open in…'),
+                    ),
+                    const SizedBox(width: 8),
+                    OutlinedButton(
+                      onPressed: () => _saveService.saveAs(
+                        _lastSavedPath!,
+                        _suggestedExportName(),
+                      ),
+                      child: const Text('Save As…'),
+                    ),
+                    if (_lastSaveIsMedia) ...[
+                      const SizedBox(width: 8),
+                      TextButton(
+                        onPressed: () async {
+                          final path = _lastSavedPath!;
+                          final bytes = await File(path).readAsBytes();
+                          final outcome = await _saveService.saveBytes(
+                            bytes: bytes,
+                            name: _suggestedExportName(),
+                            mime: _lastSavedMime ?? 'application/octet-stream',
+                            isMedia: true,
+                            destination: SaveDestination.photos,
+                          );
+                          setState(() {
+                            _saveStatus = outcome.success
+                                ? 'Saved to Photos.'
+                                : 'Save to Photos failed.';
+                          });
+                        },
+                        child: const Text('Save to Photos'),
+                      ),
+                    ],
+                  ],
+                ),
+              ],
             ],
           ],
         ),
