@@ -82,6 +82,12 @@ flutter test
 - ZIP transfers can optionally be extracted locally; extraction is local-only.
 - Optional Verified Scan Mode uploads a separate scan-copy encrypted to a server
   scan key; the receiver copy remains strict E2E and is never decrypted server-side.
+
+## Security Guarantees
+
+- Strict E2E by default: receiver copy is never decrypted server-side.
+- Delete-on-receipt plus TTL sweeper for expired sessions/transfers/scan sessions.
+- Optional scan-copy mode is explicit and isolated from receiver copy.
 - Received media (image/video) defaults to Photos/Gallery, while other files
   default to Files. Permissions are requested only when needed; if denied, the
   app saves to its private storage and offers “Open in…” and “Save As…” actions.
