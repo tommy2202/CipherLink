@@ -54,3 +54,11 @@ type Session struct {
 	ReceiverPubKeyB64   string         `json:"receiver_pubkey_b64"`
 	Claims              []SessionClaim `json:"claims,omitempty"`
 }
+
+type SessionAuthContext struct {
+	SessionID         string    `json:"session_id"`
+	ClaimID           string    `json:"claim_id"`
+	SenderPubKeyB64   string    `json:"sender_pubkey_b64"`
+	ReceiverPubKeyB64 string    `json:"receiver_pubkey_b64"`
+	ApprovedAt        time.Time `json:"approved_at"`
+}

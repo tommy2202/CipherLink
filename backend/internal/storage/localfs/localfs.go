@@ -18,6 +18,7 @@ type Store struct {
 	root         string
 	transfersDir string
 	sessionsDir  string
+	authDir      string
 }
 
 func New(root string) (*Store, error) {
@@ -35,11 +36,16 @@ func New(root string) (*Store, error) {
 	if err := os.MkdirAll(sessionsDir, 0700); err != nil {
 		return nil, err
 	}
+	authDir := filepath.Join(root, "session_auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		return nil, err
+	}
 
 	return &Store{
 		root:         root,
 		transfersDir: transfersDir,
 		sessionsDir:  sessionsDir,
+		authDir:      authDir,
 	}, nil
 }
 
@@ -204,6 +210,34 @@ func (s *Store) DeleteSession(_ context.Context, sessionID string) error {
 	return nil
 }
 
+func (s *Store) SaveSessionAuthContext(_ context.Context, auth domain.SessionAuthContext) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := s.authPath(auth.SessionID, auth.ClaimID)
+	return writeJSONAtomic(path, auth)
+}
+
+func (s *Store) GetSessionAuthContext(_ context.Context, sessionID string, claimID string) (domain.SessionAuthContext, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := s.authPath(sessionID, claimID)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return domain.SessionAuthContext{}, storage.ErrNotFound
+		}
+		return domain.SessionAuthContext{}, err
+	}
+
+	var auth domain.SessionAuthContext
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return domain.SessionAuthContext{}, err
+	}
+	return auth, nil
+}
+
 func (s *Store) transferDir(transferID string) string {
 	return filepath.Join(s.transfersDir, transferID)
 }
@@ -218,6 +252,11 @@ func (s *Store) dataPath(transferID string) string {
 
 func (s *Store) sessionPath(sessionID string) string {
 	return filepath.Join(s.sessionsDir, sessionID+".json")
+}
+
+func (s *Store) authPath(sessionID string, claimID string) string {
+	file := sessionID + "_" + claimID + ".json"
+	return filepath.Join(s.authDir, file)
 }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {

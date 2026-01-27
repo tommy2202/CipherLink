@@ -14,8 +14,6 @@ import (
 	"universaldrop/internal/storage"
 )
 
-const transferReadScope = "transfer:read"
-
 type sessionCreateResponse struct {
 	SessionID         string `json:"session_id"`
 	ExpiresAt         string `json:"expires_at"`
@@ -46,6 +44,7 @@ type sessionPollReceiverResponse struct {
 	SessionID string                    `json:"session_id"`
 	ExpiresAt string                    `json:"expires_at"`
 	Claims    []sessionPollClaimSummary `json:"claims"`
+	SASState  string                    `json:"sas_state"`
 }
 
 type sessionPollSenderResponse struct {
@@ -53,6 +52,18 @@ type sessionPollSenderResponse struct {
 	ExpiresAt string `json:"expires_at"`
 	ClaimID   string `json:"claim_id"`
 	Status    string `json:"status"`
+	SASState  string `json:"sas_state"`
+}
+
+type sessionApproveRequest struct {
+	SessionID string `json:"session_id"`
+	ClaimID   string `json:"claim_id"`
+	Approve   bool   `json:"approve"`
+}
+
+type sessionApproveResponse struct {
+	Status        string `json:"status"`
+	TransferToken string `json:"transfer_token,omitempty"`
 }
 
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
@@ -197,6 +208,97 @@ func (s *Server) handleClaimSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleApproveSession(w http.ResponseWriter, r *http.Request) {
+	var req sessionApproveRequest
+	if err := decodeJSON(w, r, &req, 8<<10); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	if req.SessionID == "" || req.ClaimID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+
+	session, err := s.store.GetSession(r.Context(), req.SessionID)
+	if err != nil {
+		writeIndistinguishable(w)
+		return
+	}
+	if time.Now().UTC().After(session.ExpiresAt) {
+		writeIndistinguishable(w)
+		return
+	}
+
+	claimIndex := -1
+	for i, claim := range session.Claims {
+		if claim.ID == req.ClaimID {
+			claimIndex = i
+			break
+		}
+	}
+	if claimIndex < 0 {
+		writeIndistinguishable(w)
+		return
+	}
+
+	now := time.Now().UTC()
+	claim := session.Claims[claimIndex]
+	if req.Approve {
+		claim.Status = domain.SessionClaimApproved
+	} else {
+		claim.Status = domain.SessionClaimRejected
+	}
+	claim.UpdatedAt = now
+	session.Claims[claimIndex] = claim
+
+	if err := s.store.UpdateSession(r.Context(), session); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+		return
+	}
+
+	if !req.Approve {
+		logging.Allowlist(s.logger, map[string]string{
+			"event":           "session_rejected",
+			"session_id_hash": anonHash(session.ID),
+			"claim_id_hash":   anonHash(req.ClaimID),
+		})
+		writeJSON(w, http.StatusOK, sessionApproveResponse{
+			Status: string(domain.SessionClaimRejected),
+		})
+		return
+	}
+
+	auth := domain.SessionAuthContext{
+		SessionID:         session.ID,
+		ClaimID:           claim.ID,
+		SenderPubKeyB64:   claim.SenderPubKeyB64,
+		ReceiverPubKeyB64: session.ReceiverPubKeyB64,
+		ApprovedAt:        now,
+	}
+	if err := s.store.SaveSessionAuthContext(r.Context(), auth); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+		return
+	}
+
+	scope := transferScope(session.ID, claim.ID)
+	transferToken, err := s.tokens.Issue(r.Context(), scope, s.cfg.TransferTokenTTL)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+		return
+	}
+
+	logging.Allowlist(s.logger, map[string]string{
+		"event":           "session_approved",
+		"session_id_hash": anonHash(session.ID),
+		"claim_id_hash":   anonHash(claim.ID),
+	})
+
+	writeJSON(w, http.StatusOK, sessionApproveResponse{
+		Status:        string(domain.SessionClaimApproved),
+		TransferToken: transferToken,
+	})
+}
+
 func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.URL.Query().Get("session_id")
 	if sessionID == "" {
@@ -231,6 +333,7 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 			ExpiresAt: session.ExpiresAt.Format(time.RFC3339),
 			ClaimID:   claimID,
 			Status:    string(status),
+			SASState:  "not_supported_yet",
 		})
 		return
 	}
@@ -251,6 +354,7 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 		SessionID: session.ID,
 		ExpiresAt: session.ExpiresAt.Format(time.RFC3339),
 		Claims:    claims,
+		SASState:  "not_supported_yet",
 	})
 }
 
@@ -265,9 +369,20 @@ func shortFingerprint(value string) string {
 	return strings.ToUpper(hash[:8])
 }
 
+func transferScope(sessionID string, claimID string) string {
+	return "transfer:session:" + sessionID + ":claim:" + claimID
+}
+
 func (s *Server) handleGetTransferManifest(w http.ResponseWriter, r *http.Request) {
 	transferID := chi.URLParam(r, "transferID")
 	if transferID == "" {
+		writeIndistinguishable(w)
+		return
+	}
+
+	sessionID := r.URL.Query().Get("session_id")
+	claimID := r.URL.Query().Get("claim_id")
+	if sessionID == "" || claimID == "" {
 		writeIndistinguishable(w)
 		return
 	}
@@ -278,8 +393,14 @@ func (s *Server) handleGetTransferManifest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	ok, err := s.tokens.Validate(r.Context(), token, transferReadScope)
+	scope := transferScope(sessionID, claimID)
+	ok, err := s.tokens.Validate(r.Context(), token, scope)
 	if err != nil || !ok {
+		writeIndistinguishable(w)
+		return
+	}
+
+	if _, err := s.store.GetSessionAuthContext(r.Context(), sessionID, claimID); err != nil {
 		writeIndistinguishable(w)
 		return
 	}
@@ -297,7 +418,8 @@ func (s *Server) handleGetTransferManifest(w http.ResponseWriter, r *http.Reques
 	logging.Allowlist(s.logger, map[string]string{
 		"event":            "transfer_manifest_read",
 		"transfer_id_hash": anonHash(transferID),
-		"scope":            transferReadScope,
+		"session_id_hash":  anonHash(sessionID),
+		"claim_id_hash":    anonHash(claimID),
 	})
 
 	w.Header().Set("Content-Type", "application/octet-stream")

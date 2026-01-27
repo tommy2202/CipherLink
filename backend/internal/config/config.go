@@ -18,12 +18,16 @@ type Config struct {
 	RateLimitV1           RateLimit
 	RateLimitSessionClaim RateLimit
 	ClaimTokenTTL         time.Duration
+	TransferTokenTTL      time.Duration
 }
 
 const (
-	DefaultClaimTokenTTL = 3 * time.Minute
-	MinClaimTokenTTL     = 2 * time.Minute
-	MaxClaimTokenTTL     = 5 * time.Minute
+	DefaultClaimTokenTTL    = 3 * time.Minute
+	MinClaimTokenTTL        = 2 * time.Minute
+	MaxClaimTokenTTL        = 5 * time.Minute
+	DefaultTransferTokenTTL = 5 * time.Minute
+	MinTransferTokenTTL     = 1 * time.Minute
+	MaxTransferTokenTTL     = 15 * time.Minute
 )
 
 func Load() Config {
@@ -42,7 +46,8 @@ func Load() Config {
 			Max:    10,
 			Window: time.Minute,
 		},
-		ClaimTokenTTL: DefaultClaimTokenTTL,
+		ClaimTokenTTL:    DefaultClaimTokenTTL,
+		TransferTokenTTL: DefaultTransferTokenTTL,
 	}
 
 	if value := os.Getenv("UD_ADDRESS"); value != "" {
@@ -75,6 +80,12 @@ func Load() Config {
 	}
 	if cfg.ClaimTokenTTL < MinClaimTokenTTL || cfg.ClaimTokenTTL > MaxClaimTokenTTL {
 		cfg.ClaimTokenTTL = DefaultClaimTokenTTL
+	}
+	if value := parseDurationEnv("UD_TRANSFER_TOKEN_TTL"); value > 0 {
+		cfg.TransferTokenTTL = value
+	}
+	if cfg.TransferTokenTTL < MinTransferTokenTTL || cfg.TransferTokenTTL > MaxTransferTokenTTL {
+		cfg.TransferTokenTTL = DefaultTransferTokenTTL
 	}
 
 	return cfg

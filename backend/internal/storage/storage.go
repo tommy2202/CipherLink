@@ -24,4 +24,7 @@ type Storage interface {
 	GetSession(ctx context.Context, sessionID string) (domain.Session, error)
 	UpdateSession(ctx context.Context, session domain.Session) error
 	DeleteSession(ctx context.Context, sessionID string) error
+
+	SaveSessionAuthContext(ctx context.Context, auth domain.SessionAuthContext) error
+	GetSessionAuthContext(ctx context.Context, sessionID string, claimID string) (domain.SessionAuthContext, error)
 }

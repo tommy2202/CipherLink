@@ -50,6 +50,10 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _claimId;
   String? _claimStatus;
   Timer? _pollTimer;
+  bool _refreshingClaims = false;
+  String _claimsStatus = 'No pending claims.';
+  List<PendingClaim> _pendingClaims = [];
+  final Set<String> _trustedFingerprints = {};
 
   @override
   void dispose() {
@@ -139,6 +143,8 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() {
         _sessionResponse = sessionResponse;
         _sessionStatus = 'Session created.';
+        _claimsStatus = 'Session created. Refresh to load claims.';
+        _pendingClaims = [];
       });
     } catch (err) {
       setState(() {
@@ -147,6 +153,99 @@ class _HomeScreenState extends State<HomeScreen> {
     } finally {
       setState(() {
         _creatingSession = false;
+      });
+    }
+  }
+
+  Future<void> _refreshClaims() async {
+    final baseUrl = _baseUrlController.text.trim();
+    final sessionId = _sessionResponse?.sessionId ?? '';
+    if (baseUrl.isEmpty || sessionId.isEmpty) {
+      setState(() {
+        _claimsStatus = 'Create a session first.';
+      });
+      return;
+    }
+
+    setState(() {
+      _refreshingClaims = true;
+      _claimsStatus = 'Refreshing claims...';
+    });
+
+    try {
+      final baseUri = Uri.parse(baseUrl);
+      final uri = baseUri.replace(
+        path: '/v1/session/poll',
+        queryParameters: {'session_id': sessionId},
+      );
+      final response = await http.get(uri).timeout(const Duration(seconds: 6));
+      if (response.statusCode != 200) {
+        setState(() {
+          _claimsStatus = 'Error: ${response.statusCode}';
+        });
+        return;
+      }
+
+      final payload = jsonDecode(response.body) as Map<String, dynamic>;
+      final claims = (payload['claims'] as List<dynamic>? ?? [])
+          .map((item) => PendingClaim.fromJson(item as Map<String, dynamic>))
+          .toList();
+      setState(() {
+        _pendingClaims = claims;
+        _claimsStatus = claims.isEmpty ? 'No pending claims.' : 'Pending claims loaded.';
+      });
+    } catch (err) {
+      setState(() {
+        _claimsStatus = 'Failed: $err';
+      });
+    } finally {
+      setState(() {
+        _refreshingClaims = false;
+      });
+    }
+  }
+
+  Future<void> _respondToClaim(PendingClaim claim, bool approve) async {
+    final baseUrl = _baseUrlController.text.trim();
+    final sessionId = _sessionResponse?.sessionId ?? '';
+    if (baseUrl.isEmpty || sessionId.isEmpty) {
+      setState(() {
+        _claimsStatus = 'Create a session first.';
+      });
+      return;
+    }
+
+    setState(() {
+      _claimsStatus = approve ? 'Approving...' : 'Rejecting...';
+    });
+
+    try {
+      final response = await http
+          .post(
+            Uri.parse(baseUrl).resolve('/v1/session/approve'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'session_id': sessionId,
+              'claim_id': claim.claimId,
+              'approve': approve,
+            }),
+          )
+          .timeout(const Duration(seconds: 8));
+
+      if (response.statusCode != 200) {
+        setState(() {
+          _claimsStatus = 'Error: ${response.statusCode}';
+        });
+        return;
+      }
+
+      if (approve) {
+        _trustedFingerprints.add(claim.shortFingerprint);
+      }
+      await _refreshClaims();
+    } catch (err) {
+      setState(() {
+        _claimsStatus = 'Failed: $err';
       });
     }
   }
@@ -327,6 +426,61 @@ class _HomeScreenState extends State<HomeScreen> {
               const SizedBox(height: 8),
               const Text('QR payload:'),
               SelectableText(_sessionResponse!.qrPayload),
+              const SizedBox(height: 12),
+              ElevatedButton(
+                onPressed: _refreshingClaims ? null : _refreshClaims,
+                child: Text(_refreshingClaims ? 'Refreshing...' : 'Refresh Claims'),
+              ),
+              const SizedBox(height: 8),
+              Text(_claimsStatus),
+              const SizedBox(height: 8),
+              ..._pendingClaims.map((claim) {
+                final trusted = _trustedFingerprints.contains(claim.shortFingerprint);
+                return Card(
+                  margin: const EdgeInsets.symmetric(vertical: 6),
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('Sender: ${claim.senderLabel}'),
+                        Text('Fingerprint: ${claim.shortFingerprint}'),
+                        Text('Claim ID: ${claim.claimId}'),
+                        if (trusted)
+                          const Padding(
+                            padding: EdgeInsets.only(top: 4),
+                            child: Text(
+                              'Seen before',
+                              style: TextStyle(color: Colors.green),
+                            ),
+                          )
+                        else
+                          const Padding(
+                            padding: EdgeInsets.only(top: 4),
+                            child: Text(
+                              'New device',
+                              style: TextStyle(color: Colors.orange),
+                            ),
+                          ),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            ElevatedButton(
+                              onPressed: () => _respondToClaim(claim, true),
+                              child: const Text('Approve'),
+                            ),
+                            const SizedBox(width: 8),
+                            OutlinedButton(
+                              onPressed: () => _respondToClaim(claim, false),
+                              child: const Text('Reject'),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              }),
             ],
             const SizedBox(height: 32),
             const Divider(),
@@ -406,6 +560,26 @@ class SessionCreateResponse {
       claimToken: json['claim_token']?.toString() ?? '',
       receiverPubKeyB64: json['receiver_pubkey_b64']?.toString() ?? '',
       qrPayload: json['qr_payload']?.toString() ?? '',
+    );
+  }
+}
+
+class PendingClaim {
+  PendingClaim({
+    required this.claimId,
+    required this.senderLabel,
+    required this.shortFingerprint,
+  });
+
+  final String claimId;
+  final String senderLabel;
+  final String shortFingerprint;
+
+  factory PendingClaim.fromJson(Map<String, dynamic> json) {
+    return PendingClaim(
+      claimId: json['claim_id']?.toString() ?? '',
+      senderLabel: json['sender_label']?.toString() ?? '',
+      shortFingerprint: json['short_fingerprint']?.toString() ?? '',
     );
   }
 }

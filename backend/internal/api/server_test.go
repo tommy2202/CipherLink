@@ -91,16 +91,28 @@ func TestIndistinguishableErrors(t *testing.T) {
 		Tokens: tokens,
 	})
 
-	invalidReq := httptest.NewRequest(http.MethodGet, "/v1/transfers/alpha/manifest", nil)
+	auth := domain.SessionAuthContext{
+		SessionID:         "sess",
+		ClaimID:           "claim",
+		SenderPubKeyB64:   "sender",
+		ReceiverPubKeyB64: "receiver",
+		ApprovedAt:        time.Now().UTC(),
+	}
+	if err := store.SaveSessionAuthContext(context.Background(), auth); err != nil {
+		t.Fatalf("save auth context: %v", err)
+	}
+	scope := transferScope(auth.SessionID, auth.ClaimID)
+	validToken, err := tokens.Issue(context.Background(), scope, time.Minute)
+	if err != nil {
+		t.Fatalf("issue token: %v", err)
+	}
+
+	invalidReq := httptest.NewRequest(http.MethodGet, "/v1/transfers/alpha/manifest?session_id=sess&claim_id=claim", nil)
 	invalidReq.Header.Set("Authorization", "Bearer invalid-token")
 	invalidRec := httptest.NewRecorder()
 	server.Router.ServeHTTP(invalidRec, invalidReq)
 
-	validToken, err := tokens.Issue(context.Background(), transferReadScope, time.Minute)
-	if err != nil {
-		t.Fatalf("issue token: %v", err)
-	}
-	missingReq := httptest.NewRequest(http.MethodGet, "/v1/transfers/alpha/manifest", nil)
+	missingReq := httptest.NewRequest(http.MethodGet, "/v1/transfers/alpha/manifest?session_id=sess&claim_id=claim", nil)
 	missingReq.Header.Set("Authorization", "Bearer "+validToken)
 	missingRec := httptest.NewRecorder()
 	server.Router.ServeHTTP(missingRec, missingReq)
@@ -182,6 +194,90 @@ func TestClaimTokenExpiryBlocksClaim(t *testing.T) {
 	}
 }
 
+func TestCannotInitTransferBeforeApproval(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+
+	scope := transferScope(createResp.SessionID, claimResp.ClaimID)
+	transferToken, err := server.tokens.Issue(context.Background(), scope, time.Minute)
+	if err != nil {
+		t.Fatalf("issue token: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/transfers/t1/manifest?session_id="+createResp.SessionID+"&claim_id="+claimResp.ClaimID, nil)
+	req.Header.Set("Authorization", "Bearer "+transferToken)
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+
+	invalidReq := httptest.NewRequest(http.MethodGet, "/v1/transfers/t1/manifest?session_id="+createResp.SessionID+"&claim_id="+claimResp.ClaimID, nil)
+	invalidReq.Header.Set("Authorization", "Bearer invalid-token")
+	invalidRec := httptest.NewRecorder()
+	server.Router.ServeHTTP(invalidRec, invalidReq)
+
+	if rec.Code != invalidRec.Code {
+		t.Fatalf("expected same status got %d and %d", rec.Code, invalidRec.Code)
+	}
+	if rec.Body.String() != invalidRec.Body.String() {
+		t.Fatalf("expected indistinguishable response body")
+	}
+}
+
+func TestTransferTokenScopeEnforced(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	if approveResp.TransferToken == "" {
+		t.Fatalf("expected transfer token")
+	}
+
+	if err := store.SaveManifest(context.Background(), "t1", []byte("manifest")); err != nil {
+		t.Fatalf("save manifest: %v", err)
+	}
+
+	wrongToken, err := server.tokens.Issue(context.Background(), "transfer:session:other:claim:other", time.Minute)
+	if err != nil {
+		t.Fatalf("issue wrong token: %v", err)
+	}
+
+	wrongReq := httptest.NewRequest(http.MethodGet, "/v1/transfers/t1/manifest?session_id="+createResp.SessionID+"&claim_id="+claimResp.ClaimID, nil)
+	wrongReq.Header.Set("Authorization", "Bearer "+wrongToken)
+	wrongRec := httptest.NewRecorder()
+	server.Router.ServeHTTP(wrongRec, wrongReq)
+
+	invalidReq := httptest.NewRequest(http.MethodGet, "/v1/transfers/t1/manifest?session_id="+createResp.SessionID+"&claim_id="+claimResp.ClaimID, nil)
+	invalidReq.Header.Set("Authorization", "Bearer invalid-token")
+	invalidRec := httptest.NewRecorder()
+	server.Router.ServeHTTP(invalidRec, invalidReq)
+
+	if wrongRec.Code != invalidRec.Code {
+		t.Fatalf("expected same status got %d and %d", wrongRec.Code, invalidRec.Code)
+	}
+	if wrongRec.Body.String() != invalidRec.Body.String() {
+		t.Fatalf("expected indistinguishable response body")
+	}
+}
+
 func newSessionTestServer(store *stubStorage) *Server {
 	return NewServer(Dependencies{
 		Config: config.Config{
@@ -191,6 +287,7 @@ func newSessionTestServer(store *stubStorage) *Server {
 			RateLimitV1:           config.RateLimit{Max: 100, Window: time.Minute},
 			RateLimitSessionClaim: config.RateLimit{Max: 100, Window: time.Minute},
 			ClaimTokenTTL:         config.DefaultClaimTokenTTL,
+			TransferTokenTTL:      config.DefaultTransferTokenTTL,
 		},
 		Store:  store,
 		Tokens: token.NewMemoryService(),
@@ -225,9 +322,43 @@ func claimSession(t *testing.T, server *Server, reqBody sessionClaimRequest) *ht
 	return rec
 }
 
+func claimSessionSuccess(t *testing.T, server *Server, reqBody sessionClaimRequest) sessionClaimResponse {
+	t.Helper()
+	rec := claimSession(t, server, reqBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected claim 200 got %d", rec.Code)
+	}
+	var payload sessionClaimResponse
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode claim response: %v", err)
+	}
+	return payload
+}
+
+func approveSession(t *testing.T, server *Server, reqBody sessionApproveRequest) sessionApproveResponse {
+	t.Helper()
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		t.Fatalf("marshal approve request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/approve", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected approve 200 got %d", rec.Code)
+	}
+	var resp sessionApproveResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode approve response: %v", err)
+	}
+	return resp
+}
+
 type stubStorage struct {
 	manifest map[string][]byte
 	sessions map[string]domain.Session
+	auth     map[string]domain.SessionAuthContext
 }
 
 func (s *stubStorage) SaveManifest(_ context.Context, transferID string, manifest []byte) error {
@@ -307,4 +438,25 @@ func (s *stubStorage) DeleteSession(_ context.Context, sessionID string) error {
 	}
 	delete(s.sessions, sessionID)
 	return nil
+}
+
+func (s *stubStorage) SaveSessionAuthContext(_ context.Context, auth domain.SessionAuthContext) error {
+	if s.auth == nil {
+		s.auth = map[string]domain.SessionAuthContext{}
+	}
+	key := auth.SessionID + ":" + auth.ClaimID
+	s.auth[key] = auth
+	return nil
+}
+
+func (s *stubStorage) GetSessionAuthContext(_ context.Context, sessionID string, claimID string) (domain.SessionAuthContext, error) {
+	if s.auth == nil {
+		return domain.SessionAuthContext{}, storage.ErrNotFound
+	}
+	key := sessionID + ":" + claimID
+	auth, ok := s.auth[key]
+	if !ok {
+		return domain.SessionAuthContext{}, storage.ErrNotFound
+	}
+	return auth, nil
 }

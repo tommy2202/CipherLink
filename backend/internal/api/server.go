@@ -91,6 +91,7 @@ func (s *Server) routes() http.Handler {
 		r.Use(s.rateLimit("v1"))
 		r.Get("/ping", s.handlePing)
 		r.With(s.rateLimit("session-claim")).Post("/session/claim", s.handleClaimSession)
+		r.Post("/session/approve", s.handleApproveSession)
 		r.Get("/session/poll", s.handlePollSession)
 		r.Post("/session/create", s.handleCreateSession)
 		r.Get("/transfers/{transferID}/manifest", s.handleGetTransferManifest)
