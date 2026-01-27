@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:cryptography/cryptography.dart';
 
 import 'crypto.dart';
+import 'transfer_manifest.dart';
 import 'transfer_state_store.dart';
 import 'transport.dart';
 
@@ -22,11 +23,15 @@ class TransferFile {
     required this.id,
     required this.name,
     required this.bytes,
+    required this.payloadKind,
+    this.textTitle,
   });
 
   final String id;
   final String name;
   final Uint8List bytes;
+  final String payloadKind;
+  final String? textTitle;
 }
 
 class TransferCoordinator {
@@ -104,12 +109,25 @@ class TransferCoordinator {
     await runQueue();
   }
 
-  Future<Uint8List?> downloadTransfer({
+  Future<void> sendReceipt({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+  }) {
+    return _transport.sendReceipt(
+      sessionId: sessionId,
+      transferId: transferId,
+      transferToken: transferToken,
+    );
+  }
+
+  Future<TransferDownloadResult?> downloadTransfer({
     required String sessionId,
     required String transferToken,
     required String transferId,
     required SimplePublicKey senderPublicKey,
     required KeyPair receiverKeyPair,
+    bool sendReceipt = false,
   }) async {
     final existing = await _store.load(transferId);
     final state = existing ??
@@ -144,8 +162,9 @@ class TransferCoordinator {
     );
     final manifestJson =
         jsonDecode(utf8.decode(manifestPlaintext)) as Map<String, dynamic>;
-    final totalBytes = manifestJson['total_bytes'] as int? ?? 0;
-    final chunkSize = manifestJson['chunk_size'] as int? ?? 0;
+    final manifest = TransferManifest.fromJson(manifestJson);
+    final totalBytes = manifest.totalBytes;
+    final chunkSize = manifest.chunkSize;
 
     var nextOffset = state.nextOffset;
     var nextChunkIndex = state.nextChunkIndex;
@@ -207,14 +226,20 @@ class TransferCoordinator {
       return null;
     }
 
-    await _transport.sendReceipt(
-      sessionId: sessionId,
-      transferId: transferId,
-      transferToken: transferToken,
-    );
+    if (sendReceipt) {
+      await _transport.sendReceipt(
+        sessionId: sessionId,
+        transferId: transferId,
+        transferToken: transferToken,
+      );
+    }
     await _saveState(state.copyWith(status: statusCompleted));
     _partialDownloads.remove(transferId);
-    return fileBytes;
+    return TransferDownloadResult(
+      manifest: manifest,
+      bytes: fileBytes,
+      transferId: transferId,
+    );
   }
 
   Future<bool> _uploadJob(_TransferJob job) async {
@@ -242,17 +267,34 @@ class TransferCoordinator {
 
     if (transferId == null) {
       transferId = state.transferId;
-      final manifest = jsonEncode({
-        'transfer_id': transferId,
-        'total_bytes': job.file.bytes.length,
-        'chunk_size': job.chunkSize,
-        'file_name': job.file.name,
-      });
+      final manifest = TransferManifest(
+        transferId: transferId,
+        payloadKind: job.file.payloadKind,
+        totalBytes: job.file.bytes.length,
+        chunkSize: job.chunkSize,
+        files: job.file.payloadKind == payloadKindText
+            ? const []
+            : [
+                TransferManifestFile(
+                  name: job.file.name,
+                  bytes: job.file.bytes.length,
+                ),
+              ],
+        textTitle: job.file.payloadKind == payloadKindText
+            ? job.file.textTitle
+            : null,
+        textMime:
+            job.file.payloadKind == payloadKindText ? textMimePlain : null,
+        textLength: job.file.payloadKind == payloadKindText
+            ? job.file.bytes.length
+            : null,
+      );
+      final manifestJson = jsonEncode(manifest.toJson());
       final manifestPayload = await encryptManifest(
         sessionKey: sessionKey,
         sessionId: job.sessionId,
         transferId: transferId,
-        plaintext: Uint8List.fromList(utf8.encode(manifest)),
+        plaintext: Uint8List.fromList(utf8.encode(manifestJson)),
       );
       final manifestBytes = serializeEncryptedPayload(manifestPayload);
       final initResult = await _transport.initTransfer(
@@ -356,4 +398,16 @@ class _TransferJob {
   final KeyPair senderKeyPair;
   final int chunkSize;
   String? transferId;
+}
+
+class TransferDownloadResult {
+  TransferDownloadResult({
+    required this.manifest,
+    required this.bytes,
+    required this.transferId,
+  });
+
+  final TransferManifest manifest;
+  final Uint8List bytes;
+  final String transferId;
 }

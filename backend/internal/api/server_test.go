@@ -434,6 +434,61 @@ func TestReceiptDeletesTransferArtifacts(t *testing.T) {
 	}
 }
 
+func TestSmallPayloadLifecycle(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	if approveResp.TransferToken == "" {
+		t.Fatalf("expected transfer token")
+	}
+
+	manifest := []byte("manifest-cipher")
+	initResp := initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString(manifest),
+		TotalBytes:                5,
+	})
+
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("hello"))
+	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+
+	downloadedManifest := fetchManifest(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+	if !bytes.Equal(downloadedManifest, manifest) {
+		t.Fatalf("expected manifest to match")
+	}
+
+	payload := downloadRange(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, 4)
+	if string(payload) != "hello" {
+		t.Fatalf("expected payload to match")
+	}
+
+	receiptTransfer(t, server, transferReceiptRequest{
+		SessionID:     createResp.SessionID,
+		TransferID:    initResp.TransferID,
+		TransferToken: approveResp.TransferToken,
+		Status:        "complete",
+	})
+
+	missingRec := manifestRequestRecorder(t, server, createResp.SessionID, "missing", approveResp.TransferToken)
+	deletedRec := manifestRequestRecorder(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+	if missingRec.Code != deletedRec.Code {
+		t.Fatalf("expected same status got %d and %d", missingRec.Code, deletedRec.Code)
+	}
+}
+
 func newSessionTestServer(store *stubStorage) *Server {
 	return NewServer(Dependencies{
 		Config: config.Config{

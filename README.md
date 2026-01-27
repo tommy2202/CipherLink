@@ -74,4 +74,6 @@ flutter test
   `/v1/transfer/manifest`, `/v1/transfer/download`, and `/v1/transfer/receipt`.
 - `/v1` routes are rate-limited per IP and group.
 - App crypto helpers live in `app/lib/crypto.dart` with tests under `app/test`.
+- The app supports live “Send Text” using the same E2E transfer pipeline;
+  content is deleted on receipt or TTL expiry.
 - See `/docs/security` for the security documentation skeleton.

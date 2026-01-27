@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:universaldrop_app/transfer_coordinator.dart';
+import 'package:universaldrop_app/transfer_manifest.dart';
 import 'package:universaldrop_app/transfer_state_store.dart';
 import 'package:universaldrop_app/transport.dart';
 
@@ -24,11 +25,13 @@ void main() {
         id: 'file-1',
         name: 'a.txt',
         bytes: Uint8List.fromList([1, 2, 3, 4]),
+        payloadKind: payloadKindFile,
       ),
       TransferFile(
         id: 'file-2',
         name: 'b.txt',
         bytes: Uint8List.fromList([5, 6, 7, 8]),
+        payloadKind: payloadKindFile,
       ),
     ];
 

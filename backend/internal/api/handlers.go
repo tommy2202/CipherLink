@@ -637,6 +637,10 @@ func (s *Server) handleDownloadTransfer(w http.ResponseWriter, r *http.Request) 
 		writeIndistinguishable(w)
 		return
 	}
+	if len(data) == 0 {
+		writeIndistinguishable(w)
+		return
+	}
 
 	end := start + int64(len(data)) - 1
 	w.Header().Set("Content-Type", "application/octet-stream")

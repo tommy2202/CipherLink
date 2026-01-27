@@ -8,7 +8,9 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
+import 'clipboard_service.dart';
 import 'crypto.dart';
+import 'transfer_manifest.dart';
 import 'transfer_coordinator.dart';
 import 'transfer_state_store.dart';
 import 'transport.dart';
@@ -34,7 +36,12 @@ class UniversalDropApp extends StatelessWidget {
 }
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key});
+  const HomeScreen({
+    super.key,
+    ClipboardService? clipboardService,
+  }) : clipboardService = clipboardService ?? const SystemClipboardService();
+
+  final ClipboardService clipboardService;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -57,6 +64,10 @@ class _HomeScreenState extends State<HomeScreen> {
   TransferCoordinator? _coordinator;
   late final InMemoryTransferStateStore _transferStore =
       InMemoryTransferStateStore();
+  final TextEditingController _textTitleController = TextEditingController();
+  final TextEditingController _textContentController = TextEditingController();
+  bool _sendTextMode = false;
+  String _receivedText = '';
   final TextEditingController _qrPayloadController = TextEditingController();
   final TextEditingController _sessionIdController = TextEditingController();
   final TextEditingController _claimTokenController = TextEditingController();
@@ -83,6 +94,8 @@ class _HomeScreenState extends State<HomeScreen> {
     _sessionIdController.dispose();
     _claimTokenController.dispose();
     _senderLabelController.dispose();
+    _textTitleController.dispose();
+    _textContentController.dispose();
     _pollTimer?.cancel();
     super.dispose();
   }
@@ -191,6 +204,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _claimsStatus = 'Session created. Refresh to load claims.';
         _pendingClaims = [];
         _receiverKeyPair = keyPair;
+        _receivedText = '';
       });
     } catch (err) {
       setState(() {
@@ -322,7 +336,9 @@ class _HomeScreenState extends State<HomeScreen> {
       });
       return;
     }
-    if (transferToken.isEmpty || senderPubKeyB64.isEmpty || _receiverKeyPair == null) {
+    if (transferToken.isEmpty ||
+        senderPubKeyB64.isEmpty ||
+        _receiverKeyPair == null) {
       setState(() {
         _manifestStatus = 'Missing auth context or keys.';
       });
@@ -343,22 +359,36 @@ class _HomeScreenState extends State<HomeScreen> {
         return;
       }
       final senderPublicKey = publicKeyFromBase64(senderPubKeyB64);
-      final bytes = await coordinator.downloadTransfer(
+      final result = await coordinator.downloadTransfer(
         sessionId: sessionId,
         transferToken: transferToken,
         transferId: claim.transferId,
         senderPublicKey: senderPublicKey,
         receiverKeyPair: _receiverKeyPair!,
+        sendReceipt: false,
       );
-      if (bytes == null) {
+      if (result == null) {
         setState(() {
           _manifestStatus = 'Download paused or failed.';
         });
         return;
       }
-      setState(() {
-        _manifestStatus = 'Downloaded ${bytes.length} bytes.';
-      });
+      if (result.manifest.payloadKind == payloadKindText) {
+        final text = utf8.decode(result.bytes);
+        setState(() {
+          _receivedText = text;
+          _manifestStatus = 'Text received.';
+        });
+      } else {
+        setState(() {
+          _manifestStatus = 'Downloaded ${result.bytes.length} bytes.';
+        });
+      }
+      await coordinator.sendReceipt(
+        sessionId: sessionId,
+        transferId: result.transferId,
+        transferToken: transferToken,
+      );
     } catch (err) {
       setState(() {
         _manifestStatus = 'Manifest error: $err';
@@ -470,6 +500,7 @@ class _HomeScreenState extends State<HomeScreen> {
           id: _randomId(),
           name: file.name,
           bytes: bytes,
+          payloadKind: payloadKindFile,
         ),
       );
     }
@@ -535,6 +566,73 @@ class _HomeScreenState extends State<HomeScreen> {
     await _coordinator?.resume();
     setState(() {
       _sendStatus = 'Resumed.';
+    });
+  }
+
+  Future<void> _sendText() async {
+    final text = _textContentController.text;
+    if (text.trim().isEmpty) {
+      setState(() {
+        _sendStatus = 'Enter text first.';
+      });
+      return;
+    }
+    if (_senderTransferToken == null ||
+        _senderReceiverPubKeyB64 == null ||
+        _senderKeyPair == null ||
+        _senderSessionId == null) {
+      setState(() {
+        _sendStatus = 'Claim and wait for approval first.';
+      });
+      return;
+    }
+
+    _ensureCoordinator();
+    final coordinator = _coordinator;
+    if (coordinator == null) {
+      setState(() {
+        _sendStatus = 'Invalid base URL.';
+      });
+      return;
+    }
+
+    final payload = TransferFile(
+      id: _randomId(),
+      name: _textTitleController.text.trim().isEmpty
+          ? 'Text'
+          : _textTitleController.text.trim(),
+      bytes: Uint8List.fromList(utf8.encode(text)),
+      payloadKind: payloadKindText,
+      textTitle: _textTitleController.text.trim().isEmpty
+          ? null
+          : _textTitleController.text.trim(),
+    );
+
+    coordinator.enqueueUploads(
+      files: [payload],
+      sessionId: _senderSessionId!,
+      transferToken: _senderTransferToken!,
+      receiverPublicKey: publicKeyFromBase64(_senderReceiverPubKeyB64!),
+      senderKeyPair: _senderKeyPair!,
+      chunkSize: 16 * 1024,
+    );
+    setState(() {
+      _sendStatus = 'Sending text...';
+      _selectedFiles.clear();
+    });
+    await coordinator.runQueue();
+  }
+
+  Future<void> _pasteFromClipboard() async {
+    final text = await widget.clipboardService.readText();
+    if (text == null || text.isEmpty) {
+      setState(() {
+        _sendStatus = 'Clipboard empty.';
+      });
+      return;
+    }
+    setState(() {
+      _textContentController.text = text;
     });
   }
 
@@ -717,6 +815,63 @@ class _HomeScreenState extends State<HomeScreen> {
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
             ),
             const SizedBox(height: 12),
+            Row(
+              children: [
+                ChoiceChip(
+                  label: const Text('Send Files'),
+                  selected: !_sendTextMode,
+                  onSelected: (value) {
+                    setState(() {
+                      _sendTextMode = !value;
+                    });
+                  },
+                ),
+                const SizedBox(width: 8),
+                ChoiceChip(
+                  label: const Text('Send Text'),
+                  selected: _sendTextMode,
+                  onSelected: (value) {
+                    setState(() {
+                      _sendTextMode = value;
+                    });
+                  },
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            if (_sendTextMode) ...[
+              TextField(
+                controller: _textTitleController,
+                decoration: const InputDecoration(
+                  border: OutlineInputBorder(),
+                  labelText: 'Title (optional)',
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _textContentController,
+                maxLines: 4,
+                decoration: const InputDecoration(
+                  border: OutlineInputBorder(),
+                  labelText: 'Text to send',
+                ),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  ElevatedButton(
+                    onPressed: _pasteFromClipboard,
+                    child: const Text('Paste from Clipboard'),
+                  ),
+                  const SizedBox(width: 8),
+                  ElevatedButton(
+                    onPressed: _senderTransferToken == null ? null : _sendText,
+                    child: const Text('Send Text'),
+                  ),
+                ],
+              ),
+            ],
+            if (!_sendTextMode) ...[
             TextField(
               controller: _qrPayloadController,
               decoration: const InputDecoration(
@@ -806,6 +961,21 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 );
               }),
+            ],
+            ],
+            if (_receivedText.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              const Text('Received text'),
+              const SizedBox(height: 8),
+              SelectableText(_receivedText),
+              const SizedBox(height: 8),
+              ElevatedButton(
+                onPressed: () => copyToClipboard(
+                  widget.clipboardService,
+                  _receivedText,
+                ),
+                child: const Text('Copy to Clipboard'),
+              ),
             ],
           ],
         ),
