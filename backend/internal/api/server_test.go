@@ -91,31 +91,31 @@ func TestIndistinguishableErrors(t *testing.T) {
 		Tokens: tokens,
 	})
 
-	auth := domain.SessionAuthContext{
-		SessionID:         "sess",
-		ClaimID:           "claim",
-		SenderPubKeyB64:   "sender",
-		ReceiverPubKeyB64: "receiver",
-		ApprovedAt:        time.Now().UTC(),
-	}
-	if err := store.SaveSessionAuthContext(context.Background(), auth); err != nil {
-		t.Fatalf("save auth context: %v", err)
-	}
-	scope := transferScope(auth.SessionID, auth.ClaimID)
-	validToken, err := tokens.Issue(context.Background(), scope, time.Minute)
-	if err != nil {
-		t.Fatalf("issue token: %v", err)
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	if approveResp.TransferToken == "" {
+		t.Fatalf("expected transfer token")
 	}
 
-	invalidReq := httptest.NewRequest(http.MethodGet, "/v1/transfers/alpha/manifest?session_id=sess&claim_id=claim", nil)
-	invalidReq.Header.Set("Authorization", "Bearer invalid-token")
-	invalidRec := httptest.NewRecorder()
-	server.Router.ServeHTTP(invalidRec, invalidReq)
+	initResp := initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                10,
+	})
 
-	missingReq := httptest.NewRequest(http.MethodGet, "/v1/transfers/alpha/manifest?session_id=sess&claim_id=claim", nil)
-	missingReq.Header.Set("Authorization", "Bearer "+validToken)
-	missingRec := httptest.NewRecorder()
-	server.Router.ServeHTTP(missingRec, missingReq)
+	invalidRec := manifestRequestRecorder(t, server, createResp.SessionID, initResp.TransferID, "invalid-token")
+	missingRec := manifestRequestRecorder(t, server, createResp.SessionID, "missing", approveResp.TransferToken)
 
 	if invalidRec.Code != missingRec.Code {
 		t.Fatalf("expected same status got %d and %d", invalidRec.Code, missingRec.Code)
@@ -212,15 +212,18 @@ func TestCannotInitTransferBeforeApproval(t *testing.T) {
 		t.Fatalf("issue token: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/transfers/t1/manifest?session_id="+createResp.SessionID+"&claim_id="+claimResp.ClaimID, nil)
-	req.Header.Set("Authorization", "Bearer "+transferToken)
-	rec := httptest.NewRecorder()
-	server.Router.ServeHTTP(rec, req)
-
-	invalidReq := httptest.NewRequest(http.MethodGet, "/v1/transfers/t1/manifest?session_id="+createResp.SessionID+"&claim_id="+claimResp.ClaimID, nil)
-	invalidReq.Header.Set("Authorization", "Bearer invalid-token")
-	invalidRec := httptest.NewRecorder()
-	server.Router.ServeHTTP(invalidRec, invalidReq)
+	rec := initTransferRecorder(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             transferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                10,
+	})
+	invalidRec := initTransferRecorder(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             "invalid-token",
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                10,
+	})
 
 	if rec.Code != invalidRec.Code {
 		t.Fatalf("expected same status got %d and %d", rec.Code, invalidRec.Code)
@@ -251,29 +254,97 @@ func TestTransferTokenScopeEnforced(t *testing.T) {
 		t.Fatalf("expected transfer token")
 	}
 
-	if err := store.SaveManifest(context.Background(), "t1", []byte("manifest")); err != nil {
-		t.Fatalf("save manifest: %v", err)
-	}
+	initResp := initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                10,
+	})
 
 	wrongToken, err := server.tokens.Issue(context.Background(), "transfer:session:other:claim:other", time.Minute)
 	if err != nil {
 		t.Fatalf("issue wrong token: %v", err)
 	}
 
-	wrongReq := httptest.NewRequest(http.MethodGet, "/v1/transfers/t1/manifest?session_id="+createResp.SessionID+"&claim_id="+claimResp.ClaimID, nil)
-	wrongReq.Header.Set("Authorization", "Bearer "+wrongToken)
-	wrongRec := httptest.NewRecorder()
-	server.Router.ServeHTTP(wrongRec, wrongReq)
-
-	invalidReq := httptest.NewRequest(http.MethodGet, "/v1/transfers/t1/manifest?session_id="+createResp.SessionID+"&claim_id="+claimResp.ClaimID, nil)
-	invalidReq.Header.Set("Authorization", "Bearer invalid-token")
-	invalidRec := httptest.NewRecorder()
-	server.Router.ServeHTTP(invalidRec, invalidReq)
+	wrongRec := manifestRequestRecorder(t, server, createResp.SessionID, initResp.TransferID, wrongToken)
+	invalidRec := manifestRequestRecorder(t, server, createResp.SessionID, initResp.TransferID, "invalid-token")
 
 	if wrongRec.Code != invalidRec.Code {
 		t.Fatalf("expected same status got %d and %d", wrongRec.Code, invalidRec.Code)
 	}
 	if wrongRec.Body.String() != invalidRec.Body.String() {
+		t.Fatalf("expected indistinguishable response body")
+	}
+}
+
+func TestManifestDownloadReturnsIdenticalBytes(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	if approveResp.TransferToken == "" {
+		t.Fatalf("expected transfer token")
+	}
+
+	manifest := []byte("ciphertext-manifest")
+	initResp := initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString(manifest),
+		TotalBytes:                10,
+	})
+
+	downloaded := fetchManifest(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+	if !bytes.Equal(downloaded, manifest) {
+		t.Fatalf("manifest bytes mismatch")
+	}
+}
+
+func TestWrongTokenVsMissingTransferIndistinguishable(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	if approveResp.TransferToken == "" {
+		t.Fatalf("expected transfer token")
+	}
+
+	initResp := initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                10,
+	})
+
+	missingRec := manifestRequestRecorder(t, server, createResp.SessionID, "missing", approveResp.TransferToken)
+	wrongRec := manifestRequestRecorder(t, server, createResp.SessionID, initResp.TransferID, "invalid-token")
+
+	if missingRec.Code != wrongRec.Code {
+		t.Fatalf("expected same status got %d and %d", missingRec.Code, wrongRec.Code)
+	}
+	if missingRec.Body.String() != wrongRec.Body.String() {
 		t.Fatalf("expected indistinguishable response body")
 	}
 }
@@ -353,6 +424,57 @@ func approveSession(t *testing.T, server *Server, reqBody sessionApproveRequest)
 		t.Fatalf("decode approve response: %v", err)
 	}
 	return resp
+}
+
+func initTransfer(t *testing.T, server *Server, reqBody transferInitRequest) transferInitResponse {
+	t.Helper()
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		t.Fatalf("marshal init request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/transfer/init", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected init 200 got %d", rec.Code)
+	}
+	var resp transferInitResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode init response: %v", err)
+	}
+	return resp
+}
+
+func initTransferRecorder(t *testing.T, server *Server, reqBody transferInitRequest) *httptest.ResponseRecorder {
+	t.Helper()
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		t.Fatalf("marshal init request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/transfer/init", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	return rec
+}
+
+func fetchManifest(t *testing.T, server *Server, sessionID string, transferID string, token string) []byte {
+	t.Helper()
+	rec := manifestRequestRecorder(t, server, sessionID, transferID, token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected manifest 200 got %d", rec.Code)
+	}
+	return rec.Body.Bytes()
+}
+
+func manifestRequestRecorder(t *testing.T, server *Server, sessionID string, transferID string, token string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v1/transfer/manifest?session_id="+sessionID+"&transfer_id="+transferID, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	return rec
 }
 
 type stubStorage struct {

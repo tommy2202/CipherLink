@@ -16,6 +16,7 @@ import (
 	"universaldrop/internal/ratelimit"
 	"universaldrop/internal/storage"
 	"universaldrop/internal/token"
+	"universaldrop/internal/transfer"
 )
 
 type Dependencies struct {
@@ -33,6 +34,7 @@ type Server struct {
 	logger       *log.Logger
 	version      string
 	rateLimiters map[string]*ratelimit.Limiter
+	transfers    *transfer.Engine
 	Router       http.Handler
 }
 
@@ -69,6 +71,7 @@ func NewServer(deps Dependencies) *Server {
 		logger:       logSink,
 		version:      version,
 		rateLimiters: rateLimiters,
+		transfers:    transfer.New(deps.Store),
 	}
 
 	server.Router = server.routes()
@@ -94,7 +97,10 @@ func (s *Server) routes() http.Handler {
 		r.Post("/session/approve", s.handleApproveSession)
 		r.Get("/session/poll", s.handlePollSession)
 		r.Post("/session/create", s.handleCreateSession)
-		r.Get("/transfers/{transferID}/manifest", s.handleGetTransferManifest)
+		r.Post("/transfer/init", s.handleInitTransfer)
+		r.Put("/transfer/chunk", s.handleUploadChunk)
+		r.Post("/transfer/finalize", s.handleFinalizeTransfer)
+		r.Get("/transfer/manifest", s.handleGetTransferManifest)
 	})
 
 	return r

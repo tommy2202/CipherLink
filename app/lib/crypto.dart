@@ -29,6 +29,9 @@ class EncryptedPayload {
   }
 }
 
+const int _nonceLength = 12;
+const int _macLength = 16;
+
 Future<SecretKey> deriveSessionKey({
   required KeyPair localKeyPair,
   required SimplePublicKey peerPublicKey,
@@ -202,6 +205,30 @@ Future<Uint8List> decryptChunk({
     aad: aad,
   );
   return Uint8List.fromList(plaintext);
+}
+
+Uint8List serializeEncryptedPayload(EncryptedPayload payload) {
+  return Uint8List.fromList(
+    <int>[
+      ...payload.nonce,
+      ...payload.mac,
+      ...payload.cipherText,
+    ],
+  );
+}
+
+EncryptedPayload parseEncryptedPayload(Uint8List data) {
+  if (data.length < _nonceLength + _macLength) {
+    throw FormatException('invalid encrypted payload length');
+  }
+  final nonce = data.sublist(0, _nonceLength);
+  final mac = data.sublist(_nonceLength, _nonceLength + _macLength);
+  final cipherText = data.sublist(_nonceLength + _macLength);
+  return EncryptedPayload(
+    nonce: Uint8List.fromList(nonce),
+    cipherText: Uint8List.fromList(cipherText),
+    mac: Uint8List.fromList(mac),
+  );
 }
 
 SimplePublicKey publicKeyFromBase64(String value) {

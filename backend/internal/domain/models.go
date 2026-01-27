@@ -42,6 +42,8 @@ type SessionClaim struct {
 	Status          SessionClaimStatus `json:"status"`
 	CreatedAt       time.Time          `json:"created_at"`
 	UpdatedAt       time.Time          `json:"updated_at"`
+	TransferID      string             `json:"transfer_id,omitempty"`
+	TransferReady   bool               `json:"transfer_ready,omitempty"`
 }
 
 type Session struct {

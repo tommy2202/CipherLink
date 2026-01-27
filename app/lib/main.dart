@@ -1,9 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+
+import 'crypto.dart';
 
 void main() {
   runApp(const UniversalDropApp());
@@ -40,6 +44,11 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _creatingSession = false;
   String _sessionStatus = 'No session created yet.';
   SessionCreateResponse? _sessionResponse;
+  KeyPair? _receiverKeyPair;
+  String? _receiverPubKeyB64;
+  final Map<String, String> _senderPubKeysByClaim = {};
+  final Map<String, String> _transferTokensByClaim = {};
+  String _manifestStatus = 'No manifest downloaded.';
   final TextEditingController _qrPayloadController = TextEditingController();
   final TextEditingController _sessionIdController = TextEditingController();
   final TextEditingController _claimTokenController = TextEditingController();
@@ -49,6 +58,11 @@ class _HomeScreenState extends State<HomeScreen> {
   String _sendStatus = 'Idle';
   String? _claimId;
   String? _claimStatus;
+  String? _senderTransferToken;
+  String? _senderReceiverPubKeyB64;
+  String? _senderTransferId;
+  KeyPair? _senderKeyPair;
+  String? _senderSessionId;
   Timer? _pollTimer;
   bool _refreshingClaims = false;
   String _claimsStatus = 'No pending claims.';
@@ -126,9 +140,17 @@ class _HomeScreenState extends State<HomeScreen> {
     });
 
     try {
+      final keyPair = await X25519().newKeyPair();
+      final publicKey = await keyPair.extractPublicKey();
+      final receiverPubKeyB64 = publicKeyToBase64(publicKey);
+
       final baseUri = Uri.parse(baseUrl);
       final response = await http
-          .post(baseUri.resolve('/v1/session/create'))
+          .post(
+            baseUri.resolve('/v1/session/create'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'receiver_pubkey_b64': receiverPubKeyB64}),
+          )
           .timeout(const Duration(seconds: 8));
 
       if (response.statusCode != 200) {
@@ -145,6 +167,8 @@ class _HomeScreenState extends State<HomeScreen> {
         _sessionStatus = 'Session created.';
         _claimsStatus = 'Session created. Refresh to load claims.';
         _pendingClaims = [];
+        _receiverKeyPair = keyPair;
+        _receiverPubKeyB64 = receiverPubKeyB64;
       });
     } catch (err) {
       setState(() {
@@ -240,12 +264,91 @@ class _HomeScreenState extends State<HomeScreen> {
       }
 
       if (approve) {
+        final payload = jsonDecode(response.body) as Map<String, dynamic>;
+        final transferToken = payload['transfer_token']?.toString() ?? '';
+        final senderPubKey = payload['sender_pubkey_b64']?.toString() ?? '';
+        if (transferToken.isNotEmpty) {
+          _transferTokensByClaim[claim.claimId] = transferToken;
+        }
+        if (senderPubKey.isNotEmpty) {
+          _senderPubKeysByClaim[claim.claimId] = senderPubKey;
+        }
         _trustedFingerprints.add(claim.shortFingerprint);
       }
       await _refreshClaims();
     } catch (err) {
       setState(() {
         _claimsStatus = 'Failed: $err';
+      });
+    }
+  }
+
+  Future<void> _downloadManifest(PendingClaim claim) async {
+    final baseUrl = _baseUrlController.text.trim();
+    final sessionId = _sessionResponse?.sessionId ?? '';
+    final transferToken = _transferTokensByClaim[claim.claimId] ?? '';
+    final senderPubKeyB64 = _senderPubKeysByClaim[claim.claimId] ?? '';
+    if (baseUrl.isEmpty || sessionId.isEmpty) {
+      setState(() {
+        _manifestStatus = 'Create a session first.';
+      });
+      return;
+    }
+    if (claim.transferId.isEmpty) {
+      setState(() {
+        _manifestStatus = 'No transfer ID yet.';
+      });
+      return;
+    }
+    if (transferToken.isEmpty || senderPubKeyB64.isEmpty || _receiverKeyPair == null) {
+      setState(() {
+        _manifestStatus = 'Missing auth context or keys.';
+      });
+      return;
+    }
+
+    setState(() {
+      _manifestStatus = 'Downloading manifest...';
+    });
+
+    try {
+      final uri = Uri.parse(baseUrl).replace(
+        path: '/v1/transfer/manifest',
+        queryParameters: {
+          'session_id': sessionId,
+          'transfer_id': claim.transferId,
+        },
+      );
+      final response = await http.get(
+        uri,
+        headers: {'Authorization': 'Bearer $transferToken'},
+      ).timeout(const Duration(seconds: 8));
+      if (response.statusCode != 200) {
+        setState(() {
+          _manifestStatus = 'Manifest fetch failed: ${response.statusCode}';
+        });
+        return;
+      }
+
+      final payload = parseEncryptedPayload(response.bodyBytes);
+      final senderPublicKey = publicKeyFromBase64(senderPubKeyB64);
+      final sessionKey = await deriveSessionKey(
+        localKeyPair: _receiverKeyPair!,
+        peerPublicKey: senderPublicKey,
+        sessionId: sessionId,
+      );
+      final manifestPlaintext = await decryptManifest(
+        sessionKey: sessionKey,
+        sessionId: sessionId,
+        transferId: claim.transferId,
+        payload: payload,
+      );
+      setState(() {
+        _manifestStatus = 'Manifest: ${utf8.decode(manifestPlaintext)}';
+      });
+    } catch (err) {
+      setState(() {
+        _manifestStatus = 'Manifest error: $err';
       });
     }
   }
@@ -320,6 +423,8 @@ class _HomeScreenState extends State<HomeScreen> {
         _claimId = claimId;
         _claimStatus = status;
         _sendStatus = 'Claimed. Polling for approval...';
+        _senderKeyPair = keyPair;
+        _senderSessionId = sessionId;
       });
       _startPolling(sessionId, claimToken);
     } catch (err) {
@@ -361,9 +466,17 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final payload = jsonDecode(response.body) as Map<String, dynamic>;
       final status = payload['status']?.toString() ?? 'pending';
+      final transferToken = payload['transfer_token']?.toString();
+      final receiverPubKey = payload['receiver_pubkey_b64']?.toString();
       setState(() {
         _claimStatus = status;
         _sendStatus = 'Status: $status';
+        if (receiverPubKey != null && receiverPubKey.isNotEmpty) {
+          _senderReceiverPubKeyB64 = receiverPubKey;
+        }
+        if (transferToken != null && transferToken.isNotEmpty) {
+          _senderTransferToken = transferToken;
+        }
       });
 
       if (status == 'pending') {
@@ -374,6 +487,149 @@ class _HomeScreenState extends State<HomeScreen> {
     } catch (err) {
       setState(() {
         _sendStatus = 'Poll failed: $err';
+      });
+    }
+  }
+
+  Future<void> _sendSampleTransfer() async {
+    final baseUrl = _baseUrlController.text.trim();
+    if (baseUrl.isEmpty) {
+      setState(() {
+        _sendStatus = 'Enter a base URL first.';
+      });
+      return;
+    }
+    if (_senderKeyPair == null ||
+        _senderReceiverPubKeyB64 == null ||
+        _senderTransferToken == null ||
+        _senderSessionId == null) {
+      setState(() {
+        _sendStatus = 'Claim and wait for approval first.';
+      });
+      return;
+    }
+
+    setState(() {
+      _sendStatus = 'Encrypting and uploading...';
+    });
+
+    try {
+      final sessionId = _senderSessionId!;
+      final receiverPublicKey = publicKeyFromBase64(_senderReceiverPubKeyB64!);
+      final sessionKey = await deriveSessionKey(
+        localKeyPair: _senderKeyPair!,
+        peerPublicKey: receiverPublicKey,
+        sessionId: sessionId,
+      );
+
+      final transferId = _randomId();
+      final fileBytes = Uint8List.fromList(utf8.encode('Hello from CipherLink'));
+      final manifestPayload = jsonEncode({
+        'transfer_id': transferId,
+        'total_bytes': fileBytes.length,
+        'chunk_size': 8,
+      });
+      final encryptedManifest = await encryptManifest(
+        sessionKey: sessionKey,
+        sessionId: sessionId,
+        transferId: transferId,
+        plaintext: Uint8List.fromList(utf8.encode(manifestPayload)),
+      );
+      final manifestBytes = serializeEncryptedPayload(encryptedManifest);
+
+      final initResponse = await http
+          .post(
+            Uri.parse(baseUrl).resolve('/v1/transfer/init'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'session_id': sessionId,
+              'transfer_token': _senderTransferToken,
+              'file_manifest_ciphertext_b64': base64Encode(manifestBytes),
+              'total_bytes': fileBytes.length,
+              'transfer_id': transferId,
+            }),
+          )
+          .timeout(const Duration(seconds: 8));
+
+      if (initResponse.statusCode != 200) {
+        setState(() {
+          _sendStatus = 'Init failed: ${initResponse.statusCode}';
+        });
+        return;
+      }
+
+      final initPayload = jsonDecode(initResponse.body) as Map<String, dynamic>;
+      final serverTransferId = initPayload['transfer_id']?.toString() ?? '';
+      if (serverTransferId.isEmpty) {
+        setState(() {
+          _sendStatus = 'Init failed: missing transfer id';
+        });
+        return;
+      }
+
+      const chunkSize = 8;
+      var offset = 0;
+      var index = 0;
+      while (offset < fileBytes.length) {
+        final end = (offset + chunkSize).clamp(0, fileBytes.length);
+        final chunk = Uint8List.sublistView(fileBytes, offset, end);
+        final encryptedChunk = await encryptChunk(
+          sessionKey: sessionKey,
+          sessionId: sessionId,
+          transferId: serverTransferId,
+          chunkIndex: index,
+          plaintext: chunk,
+        );
+        final chunkBytes = serializeEncryptedPayload(encryptedChunk);
+        final chunkResponse = await http
+            .put(
+              Uri.parse(baseUrl).resolve('/v1/transfer/chunk'),
+              headers: {
+                'Content-Type': 'application/octet-stream',
+                'Authorization': 'Bearer ${_senderTransferToken!}',
+                'session_id': sessionId,
+                'transfer_id': serverTransferId,
+                'offset': offset.toString(),
+              },
+              body: chunkBytes,
+            )
+            .timeout(const Duration(seconds: 8));
+        if (chunkResponse.statusCode != 200) {
+          setState(() {
+            _sendStatus = 'Chunk failed: ${chunkResponse.statusCode}';
+          });
+          return;
+        }
+
+        offset = end;
+        index += 1;
+      }
+
+      final finalizeResponse = await http
+          .post(
+            Uri.parse(baseUrl).resolve('/v1/transfer/finalize'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'session_id': sessionId,
+              'transfer_id': serverTransferId,
+              'transfer_token': _senderTransferToken,
+            }),
+          )
+          .timeout(const Duration(seconds: 8));
+      if (finalizeResponse.statusCode != 200) {
+        setState(() {
+          _sendStatus = 'Finalize failed: ${finalizeResponse.statusCode}';
+        });
+        return;
+      }
+
+      setState(() {
+        _sendStatus = 'Transfer finalized.';
+        _senderTransferId = serverTransferId;
+      });
+    } catch (err) {
+      setState(() {
+        _sendStatus = 'Send failed: $err';
       });
     }
   }
@@ -446,6 +702,8 @@ class _HomeScreenState extends State<HomeScreen> {
                         Text('Sender: ${claim.senderLabel}'),
                         Text('Fingerprint: ${claim.shortFingerprint}'),
                         Text('Claim ID: ${claim.claimId}'),
+                        if (claim.transferId.isNotEmpty)
+                          Text('Transfer ID: ${claim.transferId}'),
                         if (trusted)
                           const Padding(
                             padding: EdgeInsets.only(top: 4),
@@ -474,6 +732,13 @@ class _HomeScreenState extends State<HomeScreen> {
                               onPressed: () => _respondToClaim(claim, false),
                               child: const Text('Reject'),
                             ),
+                            if (claim.transferId.isNotEmpty) ...[
+                              const SizedBox(width: 8),
+                              TextButton(
+                                onPressed: () => _downloadManifest(claim),
+                                child: const Text('Fetch Manifest'),
+                              ),
+                            ],
                           ],
                         ),
                       ],
@@ -481,6 +746,10 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 );
               }),
+              if (_pendingClaims.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Text(_manifestStatus),
+              ],
             ],
             const SizedBox(height: 32),
             const Divider(),
@@ -530,6 +799,11 @@ class _HomeScreenState extends State<HomeScreen> {
             Text(_sendStatus),
             if (_claimId != null) Text('Claim ID: $_claimId'),
             if (_claimStatus != null) Text('Claim status: $_claimStatus'),
+            const SizedBox(height: 12),
+            ElevatedButton(
+              onPressed: _senderTransferToken == null ? null : _sendSampleTransfer,
+              child: const Text('Send Sample Transfer'),
+            ),
           ],
         ),
       ),
@@ -569,17 +843,20 @@ class PendingClaim {
     required this.claimId,
     required this.senderLabel,
     required this.shortFingerprint,
+    required this.transferId,
   });
 
   final String claimId;
   final String senderLabel;
   final String shortFingerprint;
+  final String transferId;
 
   factory PendingClaim.fromJson(Map<String, dynamic> json) {
     return PendingClaim(
       claimId: json['claim_id']?.toString() ?? '',
       senderLabel: json['sender_label']?.toString() ?? '',
       shortFingerprint: json['short_fingerprint']?.toString() ?? '',
+      transferId: json['transfer_id']?.toString() ?? '',
     );
   }
 }
@@ -617,4 +894,13 @@ class ParsedQrPayload {
 
   final String sessionId;
   final String claimToken;
+}
+
+String _randomId() {
+  final bytes = Uint8List(18);
+  final random = Random.secure();
+  for (var i = 0; i < bytes.length; i++) {
+    bytes[i] = random.nextInt(256);
+  }
+  return base64UrlEncode(bytes).replaceAll('=', '');
 }
