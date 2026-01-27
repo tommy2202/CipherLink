@@ -9,12 +9,14 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:mime/mime.dart';
+import 'package:archive/archive.dart';
 
 import 'clipboard_service.dart';
 import 'crypto.dart';
 import 'destination_preferences.dart';
 import 'destination_rules.dart';
 import 'destination_selector.dart';
+import 'packaging_builder.dart';
 import 'save_service.dart';
 import 'transfer_manifest.dart';
 import 'transfer_coordinator.dart';
@@ -83,6 +85,8 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _lastSavedPath;
   bool _lastSaveIsMedia = false;
   String? _lastSavedMime;
+  String _packagingMode = packagingModeOriginals;
+  final TextEditingController _packageTitleController = TextEditingController();
   final TextEditingController _qrPayloadController = TextEditingController();
   final TextEditingController _sessionIdController = TextEditingController();
   final TextEditingController _claimTokenController = TextEditingController();
@@ -111,6 +115,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _senderLabelController.dispose();
     _textTitleController.dispose();
     _textContentController.dispose();
+    _packageTitleController.dispose();
     _pollTimer?.cancel();
     super.dispose();
   }
@@ -403,6 +408,43 @@ class _HomeScreenState extends State<HomeScreen> {
       await _destinationSelector.rememberChoice(result.manifest, choice);
 
       final manifest = result.manifest;
+      if (manifest.payloadKind == payloadKindText) {
+        final text = utf8.decode(result.bytes);
+        setState(() {
+          _receivedText = text;
+          _manifestStatus = 'Text received.';
+          _saveStatus = 'Ready to copy.';
+        });
+        await coordinator.sendReceipt(
+          sessionId: sessionId,
+          transferId: result.transferId,
+          transferToken: transferToken,
+        );
+        return;
+      }
+
+      if (manifest.packagingMode == packagingModeAlbum) {
+        final outcome = await _saveAlbumPayload(
+          bytes: result.bytes,
+          manifest: manifest,
+          destination: choice.destination,
+        );
+        setState(() {
+          _manifestStatus =
+              'Album: ${manifest.albumItemCount ?? manifest.files.length} items';
+          _saveStatus =
+              outcome.success ? 'Album saved.' : 'Album saved with fallback.';
+        });
+        if (outcome.success || outcome.localPath != null) {
+          await coordinator.sendReceipt(
+            sessionId: sessionId,
+            transferId: result.transferId,
+            transferToken: transferToken,
+          );
+        }
+        return;
+      }
+
       final fileName = _suggestFileName(manifest);
       final mime = _suggestMime(manifest);
       final isMedia = isMediaManifest(manifest);
@@ -416,23 +458,16 @@ class _HomeScreenState extends State<HomeScreen> {
       _lastSavedPath = outcome.localPath;
       _lastSaveIsMedia = isMedia;
       _lastSavedMime = mime;
-      if (manifest.payloadKind == payloadKindText) {
-        final text = utf8.decode(result.bytes);
-        setState(() {
-          _receivedText = text;
-          _manifestStatus = 'Text received.';
-          _saveStatus = outcome.success
-              ? 'Saved.'
-              : 'Saved locally with fallback.';
-        });
-      } else {
-        setState(() {
+      setState(() {
+        if (manifest.packagingMode == packagingModeZip) {
+          _manifestStatus = 'ZIP: ${manifest.outputFilename ?? fileName}';
+        } else if (manifest.files.isNotEmpty) {
+          _manifestStatus = 'File: ${manifest.files.first.relativePath}';
+        } else {
           _manifestStatus = 'Downloaded ${result.bytes.length} bytes.';
-          _saveStatus = outcome.success
-              ? 'Saved.'
-              : 'Saved locally with fallback.';
-        });
-      }
+        }
+        _saveStatus = outcome.success ? 'Saved.' : 'Saved locally with fallback.';
+      });
 
       if (outcome.success || outcome.localPath != null) {
         await coordinator.sendReceipt(
@@ -556,12 +591,55 @@ class _HomeScreenState extends State<HomeScreen> {
           bytes: bytes,
           payloadKind: payloadKindFile,
           mimeType: mimeType,
+          packagingMode: packagingModeOriginals,
         ),
       );
     }
     if (files.isEmpty) {
       setState(() {
         _sendStatus = 'No files loaded.';
+      });
+      return;
+    }
+    setState(() {
+      _selectedFiles
+        ..clear()
+        ..addAll(files);
+    });
+  }
+
+  Future<void> _pickMedia() async {
+    final result = await FilePicker.platform.pickFiles(
+      allowMultiple: true,
+      withData: true,
+      type: FileType.media,
+    );
+    if (result == null) {
+      return;
+    }
+    final files = <TransferFile>[];
+    for (final file in result.files) {
+      final bytes = file.bytes;
+      if (bytes == null) {
+        continue;
+      }
+      final name = file.name.isNotEmpty ? file.name : 'media';
+      final mimeType = lookupMimeType(name, headerBytes: bytes) ??
+          'application/octet-stream';
+      files.add(
+        TransferFile(
+          id: _randomId(),
+          name: name,
+          bytes: bytes,
+          payloadKind: payloadKindFile,
+          mimeType: mimeType,
+          packagingMode: packagingModeOriginals,
+        ),
+      );
+    }
+    if (files.isEmpty) {
+      setState(() {
+        _sendStatus = 'No media loaded.';
       });
       return;
     }
@@ -596,18 +674,62 @@ class _HomeScreenState extends State<HomeScreen> {
       });
       return;
     }
-    coordinator.enqueueUploads(
-      files: _selectedFiles,
-      sessionId: _senderSessionId!,
-      transferToken: _senderTransferToken!,
-      receiverPublicKey: publicKeyFromBase64(_senderReceiverPubKeyB64!),
-      senderKeyPair: _senderKeyPair!,
-      chunkSize: 64 * 1024,
-    );
-    setState(() {
-      _sendStatus = 'Queue started.';
-    });
-    await coordinator.runQueue();
+    if (_packagingMode == packagingModeOriginals) {
+      coordinator.enqueueUploads(
+        files: _selectedFiles,
+        sessionId: _senderSessionId!,
+        transferToken: _senderTransferToken!,
+        receiverPublicKey: publicKeyFromBase64(_senderReceiverPubKeyB64!),
+        senderKeyPair: _senderKeyPair!,
+        chunkSize: 64 * 1024,
+      );
+      setState(() {
+        _sendStatus = 'Queue started.';
+      });
+      await coordinator.runQueue();
+      return;
+    }
+
+    final packageTitle = _packageTitleController.text.trim().isEmpty
+        ? _defaultPackageTitle()
+        : _packageTitleController.text.trim();
+    try {
+      final package = buildZipPackage(
+        files: _selectedFiles,
+        packageTitle: packageTitle,
+        albumMode: _packagingMode == packagingModeAlbum,
+      );
+      final payloadKind = _packagingMode == packagingModeAlbum
+          ? payloadKindAlbum
+          : payloadKindZip;
+      final transferFile = TransferFile(
+        id: _randomId(),
+        name: package.outputName,
+        bytes: package.bytes,
+        payloadKind: payloadKind,
+        mimeType: 'application/zip',
+        packagingMode: _packagingMode,
+        packageTitle: packageTitle,
+        entries: package.entries,
+      );
+      coordinator.enqueueUploads(
+        files: [transferFile],
+        sessionId: _senderSessionId!,
+        transferToken: _senderTransferToken!,
+        receiverPublicKey: publicKeyFromBase64(_senderReceiverPubKeyB64!),
+        senderKeyPair: _senderKeyPair!,
+        chunkSize: 64 * 1024,
+      );
+      setState(() {
+        _sendStatus = 'Package queued.';
+        _selectedFiles.clear();
+      });
+      await coordinator.runQueue();
+    } catch (err) {
+      setState(() {
+        _sendStatus = 'Packaging failed: $err';
+      });
+    }
   }
 
   void _pauseQueue() {
@@ -659,6 +781,7 @@ class _HomeScreenState extends State<HomeScreen> {
       bytes: Uint8List.fromList(utf8.encode(text)),
       payloadKind: payloadKindText,
       mimeType: textMimePlain,
+      packagingMode: packagingModeOriginals,
       textTitle: _textTitleController.text.trim().isEmpty
           ? null
           : _textTitleController.text.trim(),
@@ -772,7 +895,69 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Future<SaveOutcome> _saveAlbumPayload({
+    required Uint8List bytes,
+    required TransferManifest manifest,
+    required SaveDestination destination,
+  }) async {
+    final archive = ZipDecoder().decodeBytes(bytes);
+    final fileMap = <String, TransferManifestFile>{};
+    for (final entry in manifest.files) {
+      fileMap[entry.relativePath] = entry;
+    }
+
+    SaveOutcome lastOutcome = SaveOutcome(
+      success: false,
+      usedFallback: false,
+      savedToGallery: false,
+    );
+    for (final file in archive.files) {
+      if (file.isFile == false) {
+        continue;
+      }
+      final name = file.name;
+      if (!name.startsWith('media/')) {
+        continue;
+      }
+      final relativePath = name.substring('media/'.length);
+      final metadata = fileMap[relativePath];
+      final fileBytes = Uint8List.fromList(file.content as List<int>);
+      final mime = metadata?.mime ?? lookupMimeType(relativePath) ?? 'application/octet-stream';
+      final outcome = await _saveService.saveBytes(
+        bytes: fileBytes,
+        name: relativePath,
+        mime: mime,
+        isMedia: true,
+        destination: destination,
+      );
+      if (_lastSavedPath == null && outcome.localPath != null) {
+        _lastSavedPath = outcome.localPath;
+        _lastSaveIsMedia = true;
+        _lastSavedMime = mime;
+      }
+      lastOutcome = outcome;
+      if (!outcome.success && outcome.localPath == null) {
+        return outcome;
+      }
+    }
+    return lastOutcome;
+  }
+
+  String _defaultPackageTitle() {
+    final now = DateTime.now();
+    final month = now.month.toString().padLeft(2, '0');
+    final day = now.day.toString().padLeft(2, '0');
+    final hour = now.hour.toString().padLeft(2, '0');
+    final minute = now.minute.toString().padLeft(2, '0');
+    return 'Package_${now.year}$month$day_$hour$minute';
+  }
+
   String _suggestFileName(TransferManifest manifest) {
+    if (manifest.packagingMode == packagingModeZip &&
+        manifest.outputFilename != null &&
+        manifest.outputFilename!.isNotEmpty) {
+      return manifest.outputFilename!;
+    }
     if (manifest.payloadKind == payloadKindText) {
       final title = manifest.textTitle?.trim();
       if (title != null && title.isNotEmpty) {
@@ -789,6 +974,9 @@ class _HomeScreenState extends State<HomeScreen> {
   String _suggestMime(TransferManifest manifest) {
     if (manifest.payloadKind == payloadKindText) {
       return manifest.textMime ?? textMimePlain;
+    }
+    if (manifest.packagingMode == packagingModeZip) {
+      return 'application/zip';
     }
     if (manifest.files.isNotEmpty) {
       return manifest.files.first.mime ?? 'application/octet-stream';
@@ -1082,9 +1270,42 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 12),
             Row(
               children: [
+                DropdownButton<String>(
+                  value: _packagingMode,
+                  onChanged: (value) {
+                    if (value == null) return;
+                    setState(() {
+                      _packagingMode = value;
+                      if (_packagingMode != packagingModeOriginals &&
+                          _packageTitleController.text.trim().isEmpty) {
+                        _packageTitleController.text = _defaultPackageTitle();
+                      }
+                    });
+                  },
+                  items: const [
+                    DropdownMenuItem(
+                      value: packagingModeOriginals,
+                      child: Text('Originals'),
+                    ),
+                    DropdownMenuItem(
+                      value: packagingModeZip,
+                      child: Text('ZIP'),
+                    ),
+                    DropdownMenuItem(
+                      value: packagingModeAlbum,
+                      child: Text('Album'),
+                    ),
+                  ],
+                ),
+                const SizedBox(width: 8),
                 ElevatedButton(
                   onPressed: _pickFiles,
                   child: const Text('Select Files'),
+                ),
+                const SizedBox(width: 8),
+                ElevatedButton(
+                  onPressed: _pickMedia,
+                  child: const Text('Select Photos'),
                 ),
                 const SizedBox(width: 8),
                 ElevatedButton(
@@ -1105,6 +1326,17 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 12),
             if (_selectedFiles.isNotEmpty) ...[
+              if (_packagingMode != packagingModeOriginals) ...[
+                const SizedBox(height: 8),
+                TextField(
+                  controller: _packageTitleController,
+                  decoration: const InputDecoration(
+                    border: OutlineInputBorder(),
+                    labelText: 'Package title',
+                  ),
+                ),
+                const SizedBox(height: 8),
+              ],
               const Text('Queue'),
               const SizedBox(height: 8),
               ..._selectedFiles.map((file) {

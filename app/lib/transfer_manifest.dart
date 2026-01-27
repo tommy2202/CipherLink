@@ -1,26 +1,41 @@
 class TransferManifestFile {
   TransferManifestFile({
-    required this.name,
-    required this.bytes,
+    required this.relativePath,
+    required this.mediaType,
+    required this.sizeBytes,
+    this.originalFilename,
     this.mime,
   });
 
-  final String name;
-  final int bytes;
+  final String relativePath;
+  final String mediaType;
+  final int sizeBytes;
+  final String? originalFilename;
   final String? mime;
 
   Map<String, dynamic> toJson() {
     return {
-      'name': name,
-      'bytes': bytes,
+      'relative_path': relativePath,
+      'media_type': mediaType,
+      'size_bytes': sizeBytes,
+      if (originalFilename != null) 'original_filename': originalFilename,
       if (mime != null) 'mime': mime,
     };
   }
 
   factory TransferManifestFile.fromJson(Map<String, dynamic> json) {
+    final relative = json['relative_path']?.toString() ?? json['name']?.toString() ?? '';
+    final size = json['size_bytes'];
+    final legacyBytes = json['bytes'];
+    final bytesValue =
+        size is int ? size : (legacyBytes is int ? legacyBytes : 0);
+    final mediaType = json['media_type']?.toString() ??
+        mediaTypeFromMime(json['mime']?.toString());
     return TransferManifestFile(
-      name: json['name']?.toString() ?? '',
-      bytes: json['bytes'] is int ? json['bytes'] as int : 0,
+      relativePath: relative,
+      mediaType: mediaType,
+      sizeBytes: bytesValue,
+      originalFilename: json['original_filename']?.toString(),
       mime: json['mime']?.toString(),
     );
   }
@@ -30,15 +45,26 @@ const String payloadKindFile = 'file';
 const String payloadKindZip = 'zip';
 const String payloadKindAlbum = 'album';
 const String payloadKindText = 'text';
+const String packagingModeOriginals = 'originals';
+const String packagingModeZip = 'zip';
+const String packagingModeAlbum = 'album';
+const String mediaTypeImage = 'image';
+const String mediaTypeVideo = 'video';
+const String mediaTypeOther = 'other';
 const String textMimePlain = 'text/plain; charset=utf-8';
 
 class TransferManifest {
   TransferManifest({
     required this.transferId,
     required this.payloadKind,
+    required this.packagingMode,
+    this.packageTitle,
     required this.totalBytes,
     required this.chunkSize,
     required this.files,
+    this.outputFilename,
+    this.albumTitle,
+    this.albumItemCount,
     this.textTitle,
     this.textMime,
     this.textLength,
@@ -46,9 +72,14 @@ class TransferManifest {
 
   final String transferId;
   final String payloadKind;
+  final String packagingMode;
+  final String? packageTitle;
   final int totalBytes;
   final int chunkSize;
   final List<TransferManifestFile> files;
+  final String? outputFilename;
+  final String? albumTitle;
+  final int? albumItemCount;
   final String? textTitle;
   final String? textMime;
   final int? textLength;
@@ -57,10 +88,18 @@ class TransferManifest {
     return {
       'transfer_id': transferId,
       'payload_kind': payloadKind,
+      'packaging_mode': packagingMode,
+      if (packageTitle != null) 'package_title': packageTitle,
       'total_bytes': totalBytes,
       'chunk_size': chunkSize,
       if (files.isNotEmpty)
         'files': files.map((file) => file.toJson()).toList(),
+      if (payloadKind == payloadKindZip && outputFilename != null)
+        'output_filename': outputFilename,
+      if (payloadKind == payloadKindAlbum && albumTitle != null)
+        'album_title': albumTitle,
+      if (payloadKind == payloadKindAlbum && albumItemCount != null)
+        'album_item_count': albumItemCount,
       if (payloadKind == payloadKindText) 'text_title': textTitle,
       if (payloadKind == payloadKindText) 'text_mime': textMime ?? textMimePlain,
       if (payloadKind == payloadKindText)
@@ -82,9 +121,15 @@ class TransferManifest {
     return TransferManifest(
       transferId: json['transfer_id']?.toString() ?? '',
       payloadKind: payloadKind,
+      packagingMode: json['packaging_mode']?.toString() ?? packagingModeOriginals,
+      packageTitle: json['package_title']?.toString(),
       totalBytes: json['total_bytes'] is int ? json['total_bytes'] as int : 0,
       chunkSize: json['chunk_size'] is int ? json['chunk_size'] as int : 0,
       files: files,
+      outputFilename: json['output_filename']?.toString(),
+      albumTitle: json['album_title']?.toString(),
+      albumItemCount:
+          json['album_item_count'] is int ? json['album_item_count'] as int : null,
       textTitle: payloadKind == payloadKindText
           ? json['text_title']?.toString()
           : null,
@@ -96,4 +141,17 @@ class TransferManifest {
           : null,
     );
   }
+}
+
+String mediaTypeFromMime(String? mime) {
+  if (mime == null) {
+    return mediaTypeOther;
+  }
+  if (mime.startsWith('image/')) {
+    return mediaTypeImage;
+  }
+  if (mime.startsWith('video/')) {
+    return mediaTypeVideo;
+  }
+  return mediaTypeOther;
 }

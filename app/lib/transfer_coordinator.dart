@@ -25,7 +25,10 @@ class TransferFile {
     required this.bytes,
     required this.payloadKind,
     required this.mimeType,
+    required this.packagingMode,
     this.textTitle,
+    this.packageTitle,
+    this.entries = const [],
   });
 
   final String id;
@@ -33,7 +36,10 @@ class TransferFile {
   final Uint8List bytes;
   final String payloadKind;
   final String mimeType;
+  final String packagingMode;
   final String? textTitle;
+  final String? packageTitle;
+  final List<TransferManifestFile> entries;
 }
 
 class TransferCoordinator {
@@ -269,20 +275,28 @@ class TransferCoordinator {
 
     if (transferId == null) {
       transferId = state.transferId;
+      final manifestEntries = job.file.entries.isNotEmpty
+          ? job.file.entries
+          : [
+              TransferManifestFile(
+                relativePath: job.file.name,
+                mediaType: mediaTypeFromMime(job.file.mimeType),
+                sizeBytes: job.file.bytes.length,
+                originalFilename: job.file.name,
+                mime: job.file.mimeType,
+              ),
+            ];
+      final packageTitle = job.file.packageTitle ?? job.file.name;
       final manifest = TransferManifest(
         transferId: transferId,
         payloadKind: job.file.payloadKind,
+        packagingMode: job.file.packagingMode,
+        packageTitle: packageTitle,
         totalBytes: job.file.bytes.length,
         chunkSize: job.chunkSize,
         files: job.file.payloadKind == payloadKindText
             ? const []
-            : [
-                TransferManifestFile(
-                  name: job.file.name,
-                  bytes: job.file.bytes.length,
-                  mime: job.file.mimeType,
-                ),
-              ],
+            : manifestEntries,
         textTitle: job.file.payloadKind == payloadKindText
             ? job.file.textTitle
             : null,
@@ -290,6 +304,13 @@ class TransferCoordinator {
             job.file.payloadKind == payloadKindText ? textMimePlain : null,
         textLength: job.file.payloadKind == payloadKindText
             ? job.file.bytes.length
+            : null,
+        outputFilename:
+            job.file.payloadKind == payloadKindZip ? job.file.name : null,
+        albumTitle:
+            job.file.payloadKind == payloadKindAlbum ? packageTitle : null,
+        albumItemCount: job.file.payloadKind == payloadKindAlbum
+            ? manifestEntries.length
             : null,
       );
       final manifestJson = jsonEncode(manifest.toJson());

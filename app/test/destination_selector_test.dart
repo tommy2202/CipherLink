@@ -11,6 +11,7 @@ void main() {
     final manifest = TransferManifest(
       transferId: 't1',
       payloadKind: payloadKindText,
+      packagingMode: packagingModeOriginals,
       totalBytes: 5,
       chunkSize: 5,
       files: const [],
@@ -32,6 +33,24 @@ void main() {
 
     final updated = await store.load();
     expect(updated.defaultFileDestination, SaveDestination.files);
+  });
+
+  test('destination selector defaults album to photos', () async {
+    final store = FakeDestinationStore();
+    final selector = DestinationSelector(store);
+    final manifest = TransferManifest(
+      transferId: 't2',
+      payloadKind: payloadKindAlbum,
+      packagingMode: packagingModeAlbum,
+      totalBytes: 5,
+      chunkSize: 5,
+      files: const [],
+      albumTitle: 'Album',
+      albumItemCount: 0,
+    );
+
+    final dest = await selector.defaultDestination(manifest);
+    expect(dest, SaveDestination.photos);
   });
 }
 

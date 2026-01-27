@@ -11,6 +11,7 @@ void main() {
     final manifest = TransferManifest(
       transferId: 'transfer-1',
       payloadKind: payloadKindText,
+      packagingMode: packagingModeOriginals,
       totalBytes: 12,
       chunkSize: 4,
       files: const [],
