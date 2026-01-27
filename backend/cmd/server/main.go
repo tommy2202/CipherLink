@@ -10,15 +10,18 @@ import (
 	"time"
 
 	"universaldrop/internal/api"
+	"universaldrop/internal/clock"
 	"universaldrop/internal/config"
 	"universaldrop/internal/logging"
 	"universaldrop/internal/storage/localfs"
+	"universaldrop/internal/sweeper"
 	"universaldrop/internal/token"
 )
 
 func main() {
 	cfg := config.Load()
 	logger := log.New(os.Stdout, "", log.LstdFlags)
+	clk := clock.RealClock{}
 
 	store, err := localfs.New(cfg.DataDir)
 	if err != nil {
@@ -43,6 +46,9 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	sweep := sweeper.New(store, clk, cfg.SweepInterval, logger)
+	sweep.Start(ctx)
 
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {

@@ -101,6 +101,8 @@ func (s *Server) routes() http.Handler {
 		r.Put("/transfer/chunk", s.handleUploadChunk)
 		r.Post("/transfer/finalize", s.handleFinalizeTransfer)
 		r.Get("/transfer/manifest", s.handleGetTransferManifest)
+		r.Get("/transfer/download", s.handleDownloadTransfer)
+		r.Post("/transfer/receipt", s.handleTransferReceipt)
 	})
 
 	return r

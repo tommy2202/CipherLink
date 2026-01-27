@@ -15,6 +15,9 @@ var ErrConflict = errors.New("conflict")
 type Storage interface {
 	SaveManifest(ctx context.Context, transferID string, manifest []byte) error
 	LoadManifest(ctx context.Context, transferID string) ([]byte, error)
+	SaveTransferMeta(ctx context.Context, transferID string, meta domain.TransferMeta) error
+	GetTransferMeta(ctx context.Context, transferID string) (domain.TransferMeta, error)
+	DeleteTransferMeta(ctx context.Context, transferID string) error
 	WriteChunk(ctx context.Context, transferID string, offset int64, data []byte) error
 	ReadRange(ctx context.Context, transferID string, offset int64, length int64) ([]byte, error)
 	DeleteTransfer(ctx context.Context, transferID string) error

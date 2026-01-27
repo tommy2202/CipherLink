@@ -4,10 +4,14 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:cryptography/cryptography.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
 import 'crypto.dart';
+import 'transfer_coordinator.dart';
+import 'transfer_state_store.dart';
+import 'transport.dart';
 
 void main() {
   runApp(const UniversalDropApp());
@@ -45,10 +49,14 @@ class _HomeScreenState extends State<HomeScreen> {
   String _sessionStatus = 'No session created yet.';
   SessionCreateResponse? _sessionResponse;
   KeyPair? _receiverKeyPair;
-  String? _receiverPubKeyB64;
   final Map<String, String> _senderPubKeysByClaim = {};
   final Map<String, String> _transferTokensByClaim = {};
   String _manifestStatus = 'No manifest downloaded.';
+  final Map<String, TransferState> _transferStates = {};
+  final List<TransferFile> _selectedFiles = [];
+  TransferCoordinator? _coordinator;
+  late final InMemoryTransferStateStore _transferStore =
+      InMemoryTransferStateStore();
   final TextEditingController _qrPayloadController = TextEditingController();
   final TextEditingController _sessionIdController = TextEditingController();
   final TextEditingController _claimTokenController = TextEditingController();
@@ -60,7 +68,6 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _claimStatus;
   String? _senderTransferToken;
   String? _senderReceiverPubKeyB64;
-  String? _senderTransferId;
   KeyPair? _senderKeyPair;
   String? _senderSessionId;
   Timer? _pollTimer;
@@ -78,6 +85,22 @@ class _HomeScreenState extends State<HomeScreen> {
     _senderLabelController.dispose();
     _pollTimer?.cancel();
     super.dispose();
+  }
+
+  void _ensureCoordinator() {
+    final baseUrl = _baseUrlController.text.trim();
+    if (baseUrl.isEmpty) {
+      return;
+    }
+    _coordinator = TransferCoordinator(
+      transport: HttpTransport(Uri.parse(baseUrl)),
+      store: _transferStore,
+      onState: (state) {
+        setState(() {
+          _transferStates[state.transferId] = state;
+        });
+      },
+    );
   }
 
   Future<void> _pingBackend() async {
@@ -168,7 +191,6 @@ class _HomeScreenState extends State<HomeScreen> {
         _claimsStatus = 'Session created. Refresh to load claims.';
         _pendingClaims = [];
         _receiverKeyPair = keyPair;
-        _receiverPubKeyB64 = receiverPubKeyB64;
       });
     } catch (err) {
       setState(() {
@@ -312,39 +334,30 @@ class _HomeScreenState extends State<HomeScreen> {
     });
 
     try {
-      final uri = Uri.parse(baseUrl).replace(
-        path: '/v1/transfer/manifest',
-        queryParameters: {
-          'session_id': sessionId,
-          'transfer_id': claim.transferId,
-        },
-      );
-      final response = await http.get(
-        uri,
-        headers: {'Authorization': 'Bearer $transferToken'},
-      ).timeout(const Duration(seconds: 8));
-      if (response.statusCode != 200) {
+      _ensureCoordinator();
+      final coordinator = _coordinator;
+      if (coordinator == null) {
         setState(() {
-          _manifestStatus = 'Manifest fetch failed: ${response.statusCode}';
+          _manifestStatus = 'Invalid base URL.';
         });
         return;
       }
-
-      final payload = parseEncryptedPayload(response.bodyBytes);
       final senderPublicKey = publicKeyFromBase64(senderPubKeyB64);
-      final sessionKey = await deriveSessionKey(
-        localKeyPair: _receiverKeyPair!,
-        peerPublicKey: senderPublicKey,
+      final bytes = await coordinator.downloadTransfer(
         sessionId: sessionId,
-      );
-      final manifestPlaintext = await decryptManifest(
-        sessionKey: sessionKey,
-        sessionId: sessionId,
+        transferToken: transferToken,
         transferId: claim.transferId,
-        payload: payload,
+        senderPublicKey: senderPublicKey,
+        receiverKeyPair: _receiverKeyPair!,
       );
+      if (bytes == null) {
+        setState(() {
+          _manifestStatus = 'Download paused or failed.';
+        });
+        return;
+      }
       setState(() {
-        _manifestStatus = 'Manifest: ${utf8.decode(manifestPlaintext)}';
+        _manifestStatus = 'Downloaded ${bytes.length} bytes.';
       });
     } catch (err) {
       setState(() {
@@ -438,6 +451,93 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _pickFiles() async {
+    final result = await FilePicker.platform.pickFiles(
+      allowMultiple: true,
+      withData: true,
+    );
+    if (result == null) {
+      return;
+    }
+    final files = <TransferFile>[];
+    for (final file in result.files) {
+      final bytes = file.bytes;
+      if (bytes == null) {
+        continue;
+      }
+      files.add(
+        TransferFile(
+          id: _randomId(),
+          name: file.name,
+          bytes: bytes,
+        ),
+      );
+    }
+    if (files.isEmpty) {
+      setState(() {
+        _sendStatus = 'No files loaded.';
+      });
+      return;
+    }
+    setState(() {
+      _selectedFiles
+        ..clear()
+        ..addAll(files);
+    });
+  }
+
+  Future<void> _startQueue() async {
+    if (_senderTransferToken == null ||
+        _senderReceiverPubKeyB64 == null ||
+        _senderKeyPair == null ||
+        _senderSessionId == null) {
+      setState(() {
+        _sendStatus = 'Claim and wait for approval first.';
+      });
+      return;
+    }
+    if (_selectedFiles.isEmpty) {
+      setState(() {
+        _sendStatus = 'Select files first.';
+      });
+      return;
+    }
+    _ensureCoordinator();
+    final coordinator = _coordinator;
+    if (coordinator == null) {
+      setState(() {
+        _sendStatus = 'Invalid base URL.';
+      });
+      return;
+    }
+    coordinator.enqueueUploads(
+      files: _selectedFiles,
+      sessionId: _senderSessionId!,
+      transferToken: _senderTransferToken!,
+      receiverPublicKey: publicKeyFromBase64(_senderReceiverPubKeyB64!),
+      senderKeyPair: _senderKeyPair!,
+      chunkSize: 64 * 1024,
+    );
+    setState(() {
+      _sendStatus = 'Queue started.';
+    });
+    await coordinator.runQueue();
+  }
+
+  void _pauseQueue() {
+    _coordinator?.pause();
+    setState(() {
+      _sendStatus = 'Paused.';
+    });
+  }
+
+  Future<void> _resumeQueue() async {
+    await _coordinator?.resume();
+    setState(() {
+      _sendStatus = 'Resumed.';
+    });
+  }
+
   void _startPolling(String sessionId, String claimToken) {
     _pollTimer?.cancel();
     _pollTimer = Timer(const Duration(seconds: 1), () {
@@ -491,148 +591,6 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> _sendSampleTransfer() async {
-    final baseUrl = _baseUrlController.text.trim();
-    if (baseUrl.isEmpty) {
-      setState(() {
-        _sendStatus = 'Enter a base URL first.';
-      });
-      return;
-    }
-    if (_senderKeyPair == null ||
-        _senderReceiverPubKeyB64 == null ||
-        _senderTransferToken == null ||
-        _senderSessionId == null) {
-      setState(() {
-        _sendStatus = 'Claim and wait for approval first.';
-      });
-      return;
-    }
-
-    setState(() {
-      _sendStatus = 'Encrypting and uploading...';
-    });
-
-    try {
-      final sessionId = _senderSessionId!;
-      final receiverPublicKey = publicKeyFromBase64(_senderReceiverPubKeyB64!);
-      final sessionKey = await deriveSessionKey(
-        localKeyPair: _senderKeyPair!,
-        peerPublicKey: receiverPublicKey,
-        sessionId: sessionId,
-      );
-
-      final transferId = _randomId();
-      final fileBytes = Uint8List.fromList(utf8.encode('Hello from CipherLink'));
-      final manifestPayload = jsonEncode({
-        'transfer_id': transferId,
-        'total_bytes': fileBytes.length,
-        'chunk_size': 8,
-      });
-      final encryptedManifest = await encryptManifest(
-        sessionKey: sessionKey,
-        sessionId: sessionId,
-        transferId: transferId,
-        plaintext: Uint8List.fromList(utf8.encode(manifestPayload)),
-      );
-      final manifestBytes = serializeEncryptedPayload(encryptedManifest);
-
-      final initResponse = await http
-          .post(
-            Uri.parse(baseUrl).resolve('/v1/transfer/init'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'session_id': sessionId,
-              'transfer_token': _senderTransferToken,
-              'file_manifest_ciphertext_b64': base64Encode(manifestBytes),
-              'total_bytes': fileBytes.length,
-              'transfer_id': transferId,
-            }),
-          )
-          .timeout(const Duration(seconds: 8));
-
-      if (initResponse.statusCode != 200) {
-        setState(() {
-          _sendStatus = 'Init failed: ${initResponse.statusCode}';
-        });
-        return;
-      }
-
-      final initPayload = jsonDecode(initResponse.body) as Map<String, dynamic>;
-      final serverTransferId = initPayload['transfer_id']?.toString() ?? '';
-      if (serverTransferId.isEmpty) {
-        setState(() {
-          _sendStatus = 'Init failed: missing transfer id';
-        });
-        return;
-      }
-
-      const chunkSize = 8;
-      var offset = 0;
-      var index = 0;
-      while (offset < fileBytes.length) {
-        final end = (offset + chunkSize).clamp(0, fileBytes.length);
-        final chunk = Uint8List.sublistView(fileBytes, offset, end);
-        final encryptedChunk = await encryptChunk(
-          sessionKey: sessionKey,
-          sessionId: sessionId,
-          transferId: serverTransferId,
-          chunkIndex: index,
-          plaintext: chunk,
-        );
-        final chunkBytes = serializeEncryptedPayload(encryptedChunk);
-        final chunkResponse = await http
-            .put(
-              Uri.parse(baseUrl).resolve('/v1/transfer/chunk'),
-              headers: {
-                'Content-Type': 'application/octet-stream',
-                'Authorization': 'Bearer ${_senderTransferToken!}',
-                'session_id': sessionId,
-                'transfer_id': serverTransferId,
-                'offset': offset.toString(),
-              },
-              body: chunkBytes,
-            )
-            .timeout(const Duration(seconds: 8));
-        if (chunkResponse.statusCode != 200) {
-          setState(() {
-            _sendStatus = 'Chunk failed: ${chunkResponse.statusCode}';
-          });
-          return;
-        }
-
-        offset = end;
-        index += 1;
-      }
-
-      final finalizeResponse = await http
-          .post(
-            Uri.parse(baseUrl).resolve('/v1/transfer/finalize'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'session_id': sessionId,
-              'transfer_id': serverTransferId,
-              'transfer_token': _senderTransferToken,
-            }),
-          )
-          .timeout(const Duration(seconds: 8));
-      if (finalizeResponse.statusCode != 200) {
-        setState(() {
-          _sendStatus = 'Finalize failed: ${finalizeResponse.statusCode}';
-        });
-        return;
-      }
-
-      setState(() {
-        _sendStatus = 'Transfer finalized.';
-        _senderTransferId = serverTransferId;
-      });
-    } catch (err) {
-      setState(() {
-        _sendStatus = 'Send failed: $err';
-      });
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -800,15 +758,73 @@ class _HomeScreenState extends State<HomeScreen> {
             if (_claimId != null) Text('Claim ID: $_claimId'),
             if (_claimStatus != null) Text('Claim status: $_claimStatus'),
             const SizedBox(height: 12),
-            ElevatedButton(
-              onPressed: _senderTransferToken == null ? null : _sendSampleTransfer,
-              child: const Text('Send Sample Transfer'),
+            Row(
+              children: [
+                ElevatedButton(
+                  onPressed: _pickFiles,
+                  child: const Text('Select Files'),
+                ),
+                const SizedBox(width: 8),
+                ElevatedButton(
+                  onPressed: _senderTransferToken == null ? null : _startQueue,
+                  child: const Text('Start Queue'),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton(
+                  onPressed: _coordinator?.isRunning == true ? _pauseQueue : null,
+                  child: const Text('Pause'),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton(
+                  onPressed: _coordinator?.isPaused == true ? _resumeQueue : null,
+                  child: const Text('Resume'),
+                ),
+              ],
             ),
+            const SizedBox(height: 12),
+            if (_selectedFiles.isNotEmpty) ...[
+              const Text('Queue'),
+              const SizedBox(height: 8),
+              ..._selectedFiles.map((file) {
+                final state = _transferStates[file.id];
+                final status = state?.status ?? statusQueued;
+                final progress = state == null || state.totalBytes == 0
+                    ? 0.0
+                    : _progressForState(state);
+                return Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: Row(
+                    children: [
+                      Expanded(child: Text(file.name)),
+                      Text(status),
+                      const SizedBox(width: 8),
+                      SizedBox(
+                        width: 120,
+                        child: LinearProgressIndicator(value: progress),
+                      ),
+                    ],
+                  ),
+                );
+              }),
+            ],
           ],
         ),
       ),
     );
   }
+}
+
+double _progressForState(TransferState state) {
+  if (state.chunkSize <= 0) {
+    return 0.0;
+  }
+  final chunks =
+      (state.totalBytes + state.chunkSize - 1) ~/ state.chunkSize;
+  final totalEncrypted = state.totalBytes + (chunks * 28);
+  if (totalEncrypted == 0) {
+    return 0.0;
+  }
+  return (state.nextOffset / totalEncrypted).clamp(0.0, 1.0);
 }
 
 class SessionCreateResponse {

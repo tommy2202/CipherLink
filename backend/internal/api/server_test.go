@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -349,6 +350,90 @@ func TestWrongTokenVsMissingTransferIndistinguishable(t *testing.T) {
 	}
 }
 
+func TestRangeResumeWorks(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	if approveResp.TransferToken == "" {
+		t.Fatalf("expected transfer token")
+	}
+	initResp := initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                8,
+	})
+
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("abcd"))
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 4, []byte("efgh"))
+	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+
+	first := downloadRange(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, 3)
+	if string(first) != "abcd" {
+		t.Fatalf("expected first range to match")
+	}
+	second := downloadRange(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 4, 7)
+	if string(second) != "efgh" {
+		t.Fatalf("expected second range to match")
+	}
+}
+
+func TestReceiptDeletesTransferArtifacts(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	if approveResp.TransferToken == "" {
+		t.Fatalf("expected transfer token")
+	}
+	initResp := initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                4,
+	})
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("data"))
+	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+	receiptTransfer(t, server, transferReceiptRequest{
+		SessionID:     createResp.SessionID,
+		TransferID:    initResp.TransferID,
+		TransferToken: approveResp.TransferToken,
+		Status:        "complete",
+	})
+
+	missingRec := manifestRequestRecorder(t, server, createResp.SessionID, "missing", approveResp.TransferToken)
+	deletedRec := manifestRequestRecorder(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+	if missingRec.Code != deletedRec.Code {
+		t.Fatalf("expected same status got %d and %d", missingRec.Code, deletedRec.Code)
+	}
+	if missingRec.Body.String() != deletedRec.Body.String() {
+		t.Fatalf("expected indistinguishable response body")
+	}
+}
+
 func newSessionTestServer(store *stubStorage) *Server {
 	return NewServer(Dependencies{
 		Config: config.Config{
@@ -459,6 +544,72 @@ func initTransferRecorder(t *testing.T, server *Server, reqBody transferInitRequ
 	return rec
 }
 
+func uploadChunk(t *testing.T, server *Server, sessionID string, transferID string, token string, offset int64, data []byte) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPut, "/v1/transfer/chunk", bytes.NewBuffer(data))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("session_id", sessionID)
+	req.Header.Set("transfer_id", transferID)
+	req.Header.Set("offset", strconv.FormatInt(offset, 10))
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected chunk 200 got %d", rec.Code)
+	}
+}
+
+func finalizeTransfer(t *testing.T, server *Server, sessionID string, transferID string, token string) {
+	t.Helper()
+	payload, err := json.Marshal(transferFinalizeRequest{
+		SessionID:     sessionID,
+		TransferID:    transferID,
+		TransferToken: token,
+	})
+	if err != nil {
+		t.Fatalf("marshal finalize request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/transfer/finalize", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected finalize 200 got %d", rec.Code)
+	}
+}
+
+func downloadRange(t *testing.T, server *Server, sessionID string, transferID string, token string, start int64, end int64) []byte {
+	t.Helper()
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/v1/transfer/download?session_id="+sessionID+"&transfer_id="+transferID,
+		nil,
+	)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Range", "bytes="+strconv.FormatInt(start, 10)+"-"+strconv.FormatInt(end, 10))
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("expected 206 got %d", rec.Code)
+	}
+	return rec.Body.Bytes()
+}
+
+func receiptTransfer(t *testing.T, server *Server, reqBody transferReceiptRequest) {
+	t.Helper()
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		t.Fatalf("marshal receipt request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/transfer/receipt", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected receipt 200 got %d", rec.Code)
+	}
+}
+
 func fetchManifest(t *testing.T, server *Server, sessionID string, transferID string, token string) []byte {
 	t.Helper()
 	rec := manifestRequestRecorder(t, server, sessionID, transferID, token)
@@ -479,6 +630,8 @@ func manifestRequestRecorder(t *testing.T, server *Server, sessionID string, tra
 
 type stubStorage struct {
 	manifest map[string][]byte
+	meta     map[string]domain.TransferMeta
+	chunks   map[string][]byte
 	sessions map[string]domain.Session
 	auth     map[string]domain.SessionAuthContext
 }
@@ -502,15 +655,80 @@ func (s *stubStorage) LoadManifest(_ context.Context, transferID string) ([]byte
 	return append([]byte(nil), data...), nil
 }
 
-func (s *stubStorage) WriteChunk(_ context.Context, _ string, _ int64, _ []byte) error {
+func (s *stubStorage) SaveTransferMeta(_ context.Context, transferID string, meta domain.TransferMeta) error {
+	if s.meta == nil {
+		s.meta = map[string]domain.TransferMeta{}
+	}
+	s.meta[transferID] = meta
 	return nil
 }
 
-func (s *stubStorage) ReadRange(_ context.Context, _ string, _ int64, _ int64) ([]byte, error) {
-	return nil, storage.ErrNotFound
+func (s *stubStorage) GetTransferMeta(_ context.Context, transferID string) (domain.TransferMeta, error) {
+	if s.meta == nil {
+		return domain.TransferMeta{}, storage.ErrNotFound
+	}
+	meta, ok := s.meta[transferID]
+	if !ok {
+		return domain.TransferMeta{}, storage.ErrNotFound
+	}
+	return meta, nil
 }
 
-func (s *stubStorage) DeleteTransfer(_ context.Context, _ string) error {
+func (s *stubStorage) DeleteTransferMeta(_ context.Context, transferID string) error {
+	if s.meta == nil {
+		return storage.ErrNotFound
+	}
+	if _, ok := s.meta[transferID]; !ok {
+		return storage.ErrNotFound
+	}
+	delete(s.meta, transferID)
+	return nil
+}
+
+func (s *stubStorage) WriteChunk(_ context.Context, transferID string, offset int64, data []byte) error {
+	if offset < 0 {
+		return storage.ErrInvalidRange
+	}
+	if s.chunks == nil {
+		s.chunks = map[string][]byte{}
+	}
+	existing := s.chunks[transferID]
+	end := int(offset) + len(data)
+	if end > len(existing) {
+		next := make([]byte, end)
+		copy(next, existing)
+		existing = next
+	}
+	copy(existing[offset:], data)
+	s.chunks[transferID] = existing
+	return nil
+}
+
+func (s *stubStorage) ReadRange(_ context.Context, transferID string, offset int64, length int64) ([]byte, error) {
+	if offset < 0 || length < 0 {
+		return nil, storage.ErrInvalidRange
+	}
+	data, ok := s.chunks[transferID]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	if offset >= int64(len(data)) {
+		return nil, storage.ErrInvalidRange
+	}
+	end := int(offset + length)
+	if end > len(data) {
+		end = len(data)
+	}
+	return append([]byte(nil), data[offset:end]...), nil
+}
+
+func (s *stubStorage) DeleteTransfer(_ context.Context, transferID string) error {
+	if s.chunks == nil {
+		return nil
+	}
+	delete(s.chunks, transferID)
+	delete(s.manifest, transferID)
+	delete(s.meta, transferID)
 	return nil
 }
 

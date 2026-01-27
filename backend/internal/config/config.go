@@ -19,6 +19,7 @@ type Config struct {
 	RateLimitSessionClaim RateLimit
 	ClaimTokenTTL         time.Duration
 	TransferTokenTTL      time.Duration
+	SweepInterval         time.Duration
 }
 
 const (
@@ -28,6 +29,7 @@ const (
 	DefaultTransferTokenTTL = 5 * time.Minute
 	MinTransferTokenTTL     = 1 * time.Minute
 	MaxTransferTokenTTL     = 15 * time.Minute
+	DefaultSweepInterval    = 30 * time.Second
 )
 
 func Load() Config {
@@ -48,6 +50,7 @@ func Load() Config {
 		},
 		ClaimTokenTTL:    DefaultClaimTokenTTL,
 		TransferTokenTTL: DefaultTransferTokenTTL,
+		SweepInterval:    DefaultSweepInterval,
 	}
 
 	if value := os.Getenv("UD_ADDRESS"); value != "" {
@@ -86,6 +89,9 @@ func Load() Config {
 	}
 	if cfg.TransferTokenTTL < MinTransferTokenTTL || cfg.TransferTokenTTL > MaxTransferTokenTTL {
 		cfg.TransferTokenTTL = DefaultTransferTokenTTL
+	}
+	if value := parseDurationEnv("UD_SWEEP_INTERVAL"); value > 0 {
+		cfg.SweepInterval = value
 	}
 
 	return cfg

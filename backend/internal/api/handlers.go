@@ -95,6 +95,13 @@ type transferFinalizeRequest struct {
 	TransferToken string `json:"transfer_token"`
 }
 
+type transferReceiptRequest struct {
+	SessionID     string `json:"session_id"`
+	TransferID    string `json:"transfer_id"`
+	TransferToken string `json:"transfer_token"`
+	Status        string `json:"status"`
+}
+
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -501,13 +508,14 @@ func (s *Server) handleInitTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	transferID := req.TransferID
+	expiresAt := session.ExpiresAt
 	if transferID != "" {
-		if err := s.transfers.CreateTransferWithID(r.Context(), transferID, manifest, req.TotalBytes); err != nil {
+		if err := s.transfers.CreateTransferWithID(r.Context(), transferID, manifest, req.TotalBytes, expiresAt); err != nil {
 			writeIndistinguishable(w)
 			return
 		}
 	} else {
-		transferID, err = s.transfers.CreateTransfer(r.Context(), manifest, req.TotalBytes)
+		transferID, err = s.transfers.CreateTransfer(r.Context(), manifest, req.TotalBytes, expiresAt)
 		if err != nil {
 			writeIndistinguishable(w)
 			return
@@ -597,6 +605,88 @@ func (s *Server) handleFinalizeTransfer(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (s *Server) handleDownloadTransfer(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.URL.Query().Get("session_id")
+	transferID := r.URL.Query().Get("transfer_id")
+	if sessionID == "" || transferID == "" {
+		writeIndistinguishable(w)
+		return
+	}
+
+	rangeHeader := r.Header.Get("Range")
+	start, length, ok := parseRange(rangeHeader)
+	if !ok {
+		writeIndistinguishable(w)
+		return
+	}
+
+	token := bearerToken(r)
+	session, claimID, ok := s.authorizeTransfer(r.Context(), sessionID, token)
+	if !ok {
+		writeIndistinguishable(w)
+		return
+	}
+	claim, ok := findClaim(session, claimID)
+	if !ok || claim.TransferID == "" || claim.TransferID != transferID || !claim.TransferReady {
+		writeIndistinguishable(w)
+		return
+	}
+
+	data, err := s.transfers.ReadRange(r.Context(), transferID, start, length)
+	if err != nil {
+		writeIndistinguishable(w)
+		return
+	}
+
+	end := start + int64(len(data)) - 1
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(start, 10)+"-"+strconv.FormatInt(end, 10)+"/*")
+	w.WriteHeader(http.StatusPartialContent)
+	_, _ = w.Write(data)
+}
+
+func (s *Server) handleTransferReceipt(w http.ResponseWriter, r *http.Request) {
+	var req transferReceiptRequest
+	if err := decodeJSON(w, r, &req, 8<<10); err != nil {
+		writeIndistinguishable(w)
+		return
+	}
+	if req.SessionID == "" || req.TransferID == "" || req.TransferToken == "" || req.Status != "complete" {
+		writeIndistinguishable(w)
+		return
+	}
+
+	session, claimID, ok := s.authorizeTransfer(r.Context(), req.SessionID, req.TransferToken)
+	if !ok {
+		writeIndistinguishable(w)
+		return
+	}
+	claim, ok := findClaim(session, claimID)
+	if !ok || claim.TransferID == "" || claim.TransferID != req.TransferID {
+		writeIndistinguishable(w)
+		return
+	}
+
+	if err := s.transfers.DeleteOnReceipt(r.Context(), req.TransferID); err != nil {
+		writeIndistinguishable(w)
+		return
+	}
+	if err := s.markTransferDeleted(r.Context(), session, claimID); err != nil {
+		writeIndistinguishable(w)
+		return
+	}
+
+	logging.Allowlist(s.logger, map[string]string{
+		"event":            "transfer_receipt",
+		"session_id_hash":  anonHash(session.ID),
+		"claim_id_hash":    anonHash(claimID),
+		"transfer_id_hash": anonHash(req.TransferID),
+	})
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 func (s *Server) authorizeTransfer(ctx context.Context, sessionID string, token string) (domain.Session, string, bool) {
 	if sessionID == "" || token == "" {
 		return domain.Session{}, "", false
@@ -664,6 +754,20 @@ func (s *Server) markTransferReady(ctx context.Context, session domain.Session, 
 	return storage.ErrNotFound
 }
 
+func (s *Server) markTransferDeleted(ctx context.Context, session domain.Session, claimID string) error {
+	for i, claim := range session.Claims {
+		if claim.ID != claimID {
+			continue
+		}
+		claim.TransferID = ""
+		claim.TransferReady = false
+		claim.UpdatedAt = time.Now().UTC()
+		session.Claims[i] = claim
+		return s.store.UpdateSession(ctx, session)
+	}
+	return storage.ErrNotFound
+}
+
 func findClaim(session domain.Session, claimID string) (domain.SessionClaim, bool) {
 	for _, claim := range session.Claims {
 		if claim.ID == claimID {
@@ -679,4 +783,29 @@ func headerValue(r *http.Request, key string) string {
 	}
 	canonical := textproto.CanonicalMIMEHeaderKey(strings.ReplaceAll(key, "_", "-"))
 	return r.Header.Get(canonical)
+}
+
+func parseRange(header string) (int64, int64, bool) {
+	if header == "" {
+		return 0, 0, false
+	}
+	if !strings.HasPrefix(header, "bytes=") {
+		return 0, 0, false
+	}
+	parts := strings.Split(strings.TrimPrefix(header, "bytes="), "-")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	if parts[0] == "" || parts[1] == "" {
+		return 0, 0, false
+	}
+	start, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || start < 0 {
+		return 0, 0, false
+	}
+	end, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || end < start {
+		return 0, 0, false
+	}
+	return start, end - start + 1, true
 }

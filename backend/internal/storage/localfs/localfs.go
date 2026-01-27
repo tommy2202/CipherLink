@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -70,6 +71,47 @@ func (s *Store) LoadManifest(_ context.Context, transferID string) ([]byte, erro
 		return nil, err
 	}
 	return data, nil
+}
+
+func (s *Store) SaveTransferMeta(_ context.Context, transferID string, meta domain.TransferMeta) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := s.transferMetaPath(transferID)
+	return writeJSONAtomic(path, meta)
+}
+
+func (s *Store) GetTransferMeta(_ context.Context, transferID string) (domain.TransferMeta, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := s.transferMetaPath(transferID)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return domain.TransferMeta{}, storage.ErrNotFound
+		}
+		return domain.TransferMeta{}, err
+	}
+	var meta domain.TransferMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return domain.TransferMeta{}, err
+	}
+	return meta, nil
+}
+
+func (s *Store) DeleteTransferMeta(_ context.Context, transferID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := s.transferMetaPath(transferID)
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return storage.ErrNotFound
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) WriteChunk(_ context.Context, transferID string, offset int64, data []byte) error {
@@ -144,8 +186,70 @@ func (s *Store) DeleteTransfer(_ context.Context, transferID string) error {
 	return nil
 }
 
-func (s *Store) SweepExpired(_ context.Context, _ time.Time) (int, error) {
-	return 0, nil
+func (s *Store) SweepExpired(_ context.Context, now time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now = now.UTC()
+	deleted := 0
+
+	sessionEntries, err := os.ReadDir(s.sessionsDir)
+	if err != nil {
+		return 0, err
+	}
+	for _, entry := range sessionEntries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(s.sessionsDir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var session domain.Session
+		if err := json.Unmarshal(data, &session); err != nil {
+			continue
+		}
+		if now.Before(session.ExpiresAt) {
+			continue
+		}
+		_ = os.Remove(path)
+		deleted++
+		s.deleteAuthContextsLocked(session.ID)
+		for _, claim := range session.Claims {
+			if claim.TransferID == "" {
+				continue
+			}
+			_ = os.RemoveAll(s.transferDir(claim.TransferID))
+			deleted++
+		}
+	}
+
+	transferEntries, err := os.ReadDir(s.transfersDir)
+	if err != nil {
+		return deleted, err
+	}
+	for _, entry := range transferEntries {
+		if !entry.IsDir() {
+			continue
+		}
+		metaPath := filepath.Join(s.transfersDir, entry.Name(), "meta.json")
+		data, err := os.ReadFile(metaPath)
+		if err != nil {
+			continue
+		}
+		var meta domain.TransferMeta
+		if err := json.Unmarshal(data, &meta); err != nil {
+			continue
+		}
+		if now.Before(meta.ExpiresAt) {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(s.transfersDir, entry.Name()))
+		deleted++
+	}
+
+	return deleted, nil
 }
 
 func (s *Store) CreateSession(_ context.Context, session domain.Session) error {
@@ -250,6 +354,10 @@ func (s *Store) dataPath(transferID string) string {
 	return filepath.Join(s.transferDir(transferID), "data.bin")
 }
 
+func (s *Store) transferMetaPath(transferID string) string {
+	return filepath.Join(s.transferDir(transferID), "meta.json")
+}
+
 func (s *Store) sessionPath(sessionID string) string {
 	return filepath.Join(s.sessionsDir, sessionID+".json")
 }
@@ -257,6 +365,23 @@ func (s *Store) sessionPath(sessionID string) string {
 func (s *Store) authPath(sessionID string, claimID string) string {
 	file := sessionID + "_" + claimID + ".json"
 	return filepath.Join(s.authDir, file)
+}
+
+func (s *Store) deleteAuthContextsLocked(sessionID string) {
+	entries, err := os.ReadDir(s.authDir)
+	if err != nil {
+		return
+	}
+	prefix := sessionID + "_"
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(s.authDir, entry.Name()))
+	}
 }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {

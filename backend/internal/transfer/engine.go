@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"time"
 
+	"universaldrop/internal/domain"
 	"universaldrop/internal/storage"
 )
 
@@ -19,7 +21,7 @@ func New(store storage.Storage) *Engine {
 	return &Engine{store: store}
 }
 
-func (e *Engine) CreateTransfer(ctx context.Context, manifest []byte, totalBytes int64) (string, error) {
+func (e *Engine) CreateTransfer(ctx context.Context, manifest []byte, totalBytes int64, expiresAt time.Time) (string, error) {
 	if len(manifest) == 0 || totalBytes < 0 {
 		return "", ErrInvalidInput
 	}
@@ -27,19 +29,29 @@ func (e *Engine) CreateTransfer(ctx context.Context, manifest []byte, totalBytes
 	if err != nil {
 		return "", err
 	}
-	if err := e.CreateTransferWithID(ctx, transferID, manifest, totalBytes); err != nil {
+	if err := e.CreateTransferWithID(ctx, transferID, manifest, totalBytes, expiresAt); err != nil {
 		return "", err
 	}
 	return transferID, nil
 }
 
-func (e *Engine) CreateTransferWithID(ctx context.Context, transferID string, manifest []byte, totalBytes int64) error {
+func (e *Engine) CreateTransferWithID(ctx context.Context, transferID string, manifest []byte, totalBytes int64, expiresAt time.Time) error {
 	if transferID == "" || len(manifest) == 0 || totalBytes < 0 {
 		return ErrInvalidInput
 	}
 	if _, err := e.store.LoadManifest(ctx, transferID); err == nil {
 		return storage.ErrConflict
 	} else if err != nil && err != storage.ErrNotFound {
+		return err
+	}
+	meta := domain.TransferMeta{
+		Status:        domain.TransferStatusActive,
+		BytesReceived: 0,
+		CreatedAt:     time.Now().UTC(),
+		ExpiresAt:     expiresAt.UTC(),
+		ScanStatus:    domain.ScanStatusNotRequired,
+	}
+	if err := e.store.SaveTransferMeta(ctx, transferID, meta); err != nil {
 		return err
 	}
 	return e.store.SaveManifest(ctx, transferID, manifest)
