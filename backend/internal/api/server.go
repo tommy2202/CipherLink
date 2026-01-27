@@ -9,54 +9,44 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
-	"universaldrop/internal/clock"
 	"universaldrop/internal/config"
-	"universaldrop/internal/ratelimit"
-	"universaldrop/internal/scanner"
 	"universaldrop/internal/storage"
+	"universaldrop/internal/token"
 )
 
 type Dependencies struct {
-	Config  config.Config
-	Store   storage.Storage
-	Scanner scanner.Scanner
-	Clock   clock.Clock
-	Logger  *log.Logger
+	Config config.Config
+	Store  storage.Storage
+	Tokens token.TokenService
+	Logger *log.Logger
+	Version string
 }
 
 type Server struct {
-	cfg           config.Config
-	store         storage.Storage
-	scanner       scanner.Scanner
-	clock         clock.Clock
-	limiterCreate *ratelimit.Limiter
-	limiterRedeem *ratelimit.Limiter
-	logger        *log.Logger
-	Router        http.Handler
+	cfg     config.Config
+	store   storage.Storage
+	tokens  token.TokenService
+	logger  *log.Logger
+	version string
+	Router  http.Handler
 }
 
 func NewServer(deps Dependencies) *Server {
-	clk := deps.Clock
-	if clk == nil {
-		clk = clock.RealClock{}
-	}
 	logSink := deps.Logger
 	if logSink == nil {
 		logSink = log.New(io.Discard, "", 0)
 	}
-	scan := deps.Scanner
-	if scan == nil {
-		scan = scanner.NoopScanner{}
+	version := deps.Version
+	if version == "" {
+		version = "0.1"
 	}
 
 	server := &Server{
-		cfg:           deps.Config,
-		store:         deps.Store,
-		scanner:       scan,
-		clock:         clk,
-		limiterCreate: ratelimit.New(deps.Config.RateLimitCreate.Max, deps.Config.RateLimitCreate.Window, clk),
-		limiterRedeem: ratelimit.New(deps.Config.RateLimitRedeem.Max, deps.Config.RateLimitRedeem.Window, clk),
-		logger:        logSink,
+		cfg:     deps.Config,
+		store:   deps.Store,
+		tokens:  deps.Tokens,
+		logger:  logSink,
+		version: version,
 	}
 
 	server.Router = server.routes()
@@ -72,16 +62,7 @@ func (s *Server) routes() http.Handler {
 	r.Use(s.safeLogger)
 
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
-
-	r.Route("/v1", func(r chi.Router) {
-		r.Post("/pairings", s.handleCreatePairing)
-		r.Post("/pairings/{token}/redeem", s.handleRedeemPairing)
-		r.Post("/pairings/{pairingID}/drops", s.handleCreateDrop)
-		r.Post("/drops/{dropID}/approve", s.handleApproveDrop)
-		r.Put("/drops/{dropID}/receiver-copy", s.handleUploadReceiverCopy)
-		r.Get("/drops/{dropID}/receiver-copy", s.handleDownloadReceiverCopy)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": s.version})
 	})
 
 	return r
