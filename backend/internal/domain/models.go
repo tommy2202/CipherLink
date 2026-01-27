@@ -17,6 +17,7 @@ const (
 	ScanStatusPending     ScanStatus = "pending"
 	ScanStatusClean       ScanStatus = "clean"
 	ScanStatusFailed      ScanStatus = "failed"
+	ScanStatusUnavailable ScanStatus = "unavailable"
 )
 
 type TransferMeta struct {
@@ -44,6 +45,8 @@ type SessionClaim struct {
 	UpdatedAt       time.Time          `json:"updated_at"`
 	TransferID      string             `json:"transfer_id,omitempty"`
 	TransferReady   bool               `json:"transfer_ready,omitempty"`
+	ScanRequired    bool               `json:"scan_required,omitempty"`
+	ScanStatus      ScanStatus         `json:"scan_status,omitempty"`
 }
 
 type Session struct {
@@ -63,4 +66,16 @@ type SessionAuthContext struct {
 	SenderPubKeyB64   string    `json:"sender_pubkey_b64"`
 	ReceiverPubKeyB64 string    `json:"receiver_pubkey_b64"`
 	ApprovedAt        time.Time `json:"approved_at"`
+}
+
+type ScanSession struct {
+	ID         string    `json:"id"`
+	SessionID  string    `json:"session_id"`
+	ClaimID    string    `json:"claim_id"`
+	TransferID string    `json:"transfer_id"`
+	CreatedAt  time.Time `json:"created_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	ScanKeyB64 string    `json:"scan_key_b64"`
+	TotalBytes int64     `json:"total_bytes"`
+	ChunkSize  int       `json:"chunk_size"`
 }

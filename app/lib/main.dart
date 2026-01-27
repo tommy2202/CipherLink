@@ -108,6 +108,8 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _senderReceiverPubKeyB64;
   KeyPair? _senderKeyPair;
   String? _senderSessionId;
+  bool _scanRequired = false;
+  String _scanStatus = '';
   Timer? _pollTimer;
   bool _refreshingClaims = false;
   String _claimsStatus = 'No pending claims.';
@@ -139,6 +141,11 @@ class _HomeScreenState extends State<HomeScreen> {
       onState: (state) {
         setState(() {
           _transferStates[state.transferId] = state;
+        });
+      },
+      onScanStatus: (transferId, status) {
+        setState(() {
+          _scanStatus = status;
         });
       },
     );
@@ -303,6 +310,15 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
+    var scanRequired = false;
+    if (approve) {
+      final choice = await _promptScanChoice();
+      if (choice == null) {
+        return;
+      }
+      scanRequired = choice;
+    }
+
     setState(() {
       _claimsStatus = approve ? 'Approving...' : 'Rejecting...';
     });
@@ -316,6 +332,7 @@ class _HomeScreenState extends State<HomeScreen> {
               'session_id': sessionId,
               'claim_id': claim.claimId,
               'approve': approve,
+              if (approve) 'scan_required': scanRequired,
             }),
           )
           .timeout(const Duration(seconds: 8));
@@ -345,6 +362,57 @@ class _HomeScreenState extends State<HomeScreen> {
         _claimsStatus = 'Failed: $err';
       });
     }
+  }
+
+  Future<bool?> _promptScanChoice() {
+    return showDialog<bool>(
+      context: context,
+      builder: (context) {
+        bool scanRequired = false;
+        return StatefulBuilder(
+          builder: (context, setState) {
+            return AlertDialog(
+              title: const Text('Trust decision'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  RadioListTile<bool>(
+                    value: false,
+                    groupValue: scanRequired,
+                    onChanged: (value) {
+                      setState(() {
+                        scanRequired = value ?? false;
+                      });
+                    },
+                    title: const Text('Trust (no scan)'),
+                  ),
+                  RadioListTile<bool>(
+                    value: true,
+                    groupValue: scanRequired,
+                    onChanged: (value) {
+                      setState(() {
+                        scanRequired = value ?? false;
+                      });
+                    },
+                    title: const Text('Don’t trust but accept w/ scan'),
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('Cancel'),
+                ),
+                ElevatedButton(
+                  onPressed: () => Navigator.of(context).pop(scanRequired),
+                  child: const Text('Continue'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
   }
 
   Future<void> _downloadManifest(PendingClaim claim) async {
@@ -699,6 +767,7 @@ class _HomeScreenState extends State<HomeScreen> {
         receiverPublicKey: publicKeyFromBase64(_senderReceiverPubKeyB64!),
         senderKeyPair: _senderKeyPair!,
         chunkSize: 64 * 1024,
+      scanRequired: _scanRequired,
       );
       setState(() {
         _sendStatus = 'Queue started.';
@@ -736,6 +805,7 @@ class _HomeScreenState extends State<HomeScreen> {
         receiverPublicKey: publicKeyFromBase64(_senderReceiverPubKeyB64!),
         senderKeyPair: _senderKeyPair!,
         chunkSize: 64 * 1024,
+        scanRequired: _scanRequired,
       );
       setState(() {
         _sendStatus = 'Package queued.';
@@ -811,6 +881,7 @@ class _HomeScreenState extends State<HomeScreen> {
       receiverPublicKey: publicKeyFromBase64(_senderReceiverPubKeyB64!),
       senderKeyPair: _senderKeyPair!,
       chunkSize: 16 * 1024,
+      scanRequired: _scanRequired,
     );
     setState(() {
       _sendStatus = 'Sending text...';
@@ -1081,6 +1152,8 @@ class _HomeScreenState extends State<HomeScreen> {
       final status = payload['status']?.toString() ?? 'pending';
       final transferToken = payload['transfer_token']?.toString();
       final receiverPubKey = payload['receiver_pubkey_b64']?.toString();
+      final scanRequired = payload['scan_required'] == true;
+      final scanStatus = payload['scan_status']?.toString() ?? '';
       setState(() {
         _claimStatus = status;
         _sendStatus = 'Status: $status';
@@ -1090,6 +1163,8 @@ class _HomeScreenState extends State<HomeScreen> {
         if (transferToken != null && transferToken.isNotEmpty) {
           _senderTransferToken = transferToken;
         }
+        _scanRequired = scanRequired;
+        _scanStatus = scanStatus;
       });
 
       if (status == 'pending') {
@@ -1175,6 +1250,8 @@ class _HomeScreenState extends State<HomeScreen> {
                         Text('Claim ID: ${claim.claimId}'),
                         if (claim.transferId.isNotEmpty)
                           Text('Transfer ID: ${claim.transferId}'),
+                        if (claim.scanRequired)
+                          Text('Scan status: ${claim.scanStatus.isEmpty ? 'pending' : claim.scanStatus}'),
                         if (trusted)
                           const Padding(
                             padding: EdgeInsets.only(top: 4),
@@ -1327,6 +1404,7 @@ class _HomeScreenState extends State<HomeScreen> {
             Text(_sendStatus),
             if (_claimId != null) Text('Claim ID: $_claimId'),
             if (_claimStatus != null) Text('Claim status: $_claimStatus'),
+            if (_scanRequired) Text('Scan required (${_scanStatus.isEmpty ? 'pending' : _scanStatus})'),
             const SizedBox(height: 12),
             Row(
               children: [
@@ -1553,12 +1631,16 @@ class PendingClaim {
     required this.senderLabel,
     required this.shortFingerprint,
     required this.transferId,
+    required this.scanRequired,
+    required this.scanStatus,
   });
 
   final String claimId;
   final String senderLabel;
   final String shortFingerprint;
   final String transferId;
+  final bool scanRequired;
+  final String scanStatus;
 
   factory PendingClaim.fromJson(Map<String, dynamic> json) {
     return PendingClaim(
@@ -1566,6 +1648,8 @@ class PendingClaim {
       senderLabel: json['sender_label']?.toString() ?? '',
       shortFingerprint: json['short_fingerprint']?.toString() ?? '',
       transferId: json['transfer_id']?.toString() ?? '',
+      scanRequired: json['scan_required'] == true,
+      scanStatus: json['scan_status']?.toString() ?? '',
     );
   }
 }

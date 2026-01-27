@@ -20,6 +20,8 @@ type Config struct {
 	ClaimTokenTTL         time.Duration
 	TransferTokenTTL      time.Duration
 	SweepInterval         time.Duration
+	MaxScanBytes          int64
+	MaxScanDuration       time.Duration
 }
 
 const (
@@ -30,6 +32,8 @@ const (
 	MinTransferTokenTTL     = 1 * time.Minute
 	MaxTransferTokenTTL     = 15 * time.Minute
 	DefaultSweepInterval    = 30 * time.Second
+	DefaultMaxScanBytes     = 50 << 20
+	DefaultMaxScanDuration  = 10 * time.Second
 )
 
 func Load() Config {
@@ -51,6 +55,8 @@ func Load() Config {
 		ClaimTokenTTL:    DefaultClaimTokenTTL,
 		TransferTokenTTL: DefaultTransferTokenTTL,
 		SweepInterval:    DefaultSweepInterval,
+		MaxScanBytes:     DefaultMaxScanBytes,
+		MaxScanDuration:  DefaultMaxScanDuration,
 	}
 
 	if value := os.Getenv("UD_ADDRESS"); value != "" {
@@ -92,6 +98,12 @@ func Load() Config {
 	}
 	if value := parseDurationEnv("UD_SWEEP_INTERVAL"); value > 0 {
 		cfg.SweepInterval = value
+	}
+	if value := parseIntEnv("UD_MAX_SCAN_BYTES"); value > 0 {
+		cfg.MaxScanBytes = value
+	}
+	if value := parseDurationEnv("UD_MAX_SCAN_DURATION"); value > 0 {
+		cfg.MaxScanDuration = value
 	}
 
 	return cfg

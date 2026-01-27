@@ -4,17 +4,22 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"testing"
 	"time"
 
 	"universaldrop/internal/config"
 	"universaldrop/internal/domain"
+	"universaldrop/internal/scanner"
 	"universaldrop/internal/storage"
 	"universaldrop/internal/token"
+
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 func TestHealthz(t *testing.T) {
@@ -25,6 +30,8 @@ func TestHealthz(t *testing.T) {
 			RateLimitHealth:       config.RateLimit{Max: 100, Window: time.Minute},
 			RateLimitV1:           config.RateLimit{Max: 100, Window: time.Minute},
 			RateLimitSessionClaim: config.RateLimit{Max: 100, Window: time.Minute},
+			MaxScanBytes:          config.DefaultMaxScanBytes,
+			MaxScanDuration:       config.DefaultMaxScanDuration,
 		},
 		Store:  &stubStorage{},
 		Tokens: token.NewMemoryService(),
@@ -56,6 +63,8 @@ func TestRateLimitTriggers(t *testing.T) {
 			RateLimitHealth:       config.RateLimit{Max: 100, Window: time.Minute},
 			RateLimitV1:           config.RateLimit{Max: 1, Window: time.Minute},
 			RateLimitSessionClaim: config.RateLimit{Max: 100, Window: time.Minute},
+			MaxScanBytes:          config.DefaultMaxScanBytes,
+			MaxScanDuration:       config.DefaultMaxScanDuration,
 		},
 		Store:  &stubStorage{},
 		Tokens: token.NewMemoryService(),
@@ -87,6 +96,8 @@ func TestIndistinguishableErrors(t *testing.T) {
 			RateLimitHealth:       config.RateLimit{Max: 100, Window: time.Minute},
 			RateLimitV1:           config.RateLimit{Max: 100, Window: time.Minute},
 			RateLimitSessionClaim: config.RateLimit{Max: 100, Window: time.Minute},
+			MaxScanBytes:          config.DefaultMaxScanBytes,
+			MaxScanDuration:       config.DefaultMaxScanDuration,
 		},
 		Store:  store,
 		Tokens: tokens,
@@ -489,6 +500,157 @@ func TestSmallPayloadLifecycle(t *testing.T) {
 	}
 }
 
+func TestScannerUnavailableReturnsUnavailable(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID:    createResp.SessionID,
+		ClaimID:      claimResp.ClaimID,
+		Approve:      true,
+		ScanRequired: true,
+	})
+	if approveResp.TransferToken == "" {
+		t.Fatalf("expected transfer token")
+	}
+
+	initResp := initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                4,
+	})
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("data"))
+	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+
+	scanInit := scanInitTransfer(t, server, scanInitRequest{
+		SessionID:     createResp.SessionID,
+		TransferID:    initResp.TransferID,
+		TransferToken: approveResp.TransferToken,
+		TotalBytes:    4,
+		ChunkSize:     4,
+	})
+	encrypted := encryptScanChunk(t, scanInit.ScanKeyB64, 0, []byte("data"))
+	uploadScanChunk(t, server, scanInit.ScanID, approveResp.TransferToken, 0, encrypted)
+	finalize := finalizeScan(t, server, scanFinalizeRequest{
+		ScanID:        scanInit.ScanID,
+		TransferToken: approveResp.TransferToken,
+	})
+	if finalize.Status != string(domain.ScanStatusUnavailable) {
+		t.Fatalf("expected unavailable got %s", finalize.Status)
+	}
+}
+
+func TestScanCopyDeletedAfterScan(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID:    createResp.SessionID,
+		ClaimID:      claimResp.ClaimID,
+		Approve:      true,
+		ScanRequired: true,
+	})
+	initResp := initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                4,
+	})
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("data"))
+	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+
+	scanInit := scanInitTransfer(t, server, scanInitRequest{
+		SessionID:     createResp.SessionID,
+		TransferID:    initResp.TransferID,
+		TransferToken: approveResp.TransferToken,
+		TotalBytes:    4,
+		ChunkSize:     4,
+	})
+	encrypted := encryptScanChunk(t, scanInit.ScanKeyB64, 0, []byte("data"))
+	uploadScanChunk(t, server, scanInit.ScanID, approveResp.TransferToken, 0, encrypted)
+	_ = finalizeScan(t, server, scanFinalizeRequest{
+		ScanID:        scanInit.ScanID,
+		TransferToken: approveResp.TransferToken,
+	})
+
+	if _, err := store.GetScanSession(context.Background(), scanInit.ScanID); err != storage.ErrNotFound {
+		t.Fatalf("expected scan session deleted")
+	}
+	if _, err := store.LoadScanChunk(context.Background(), scanInit.ScanID, 0); err != storage.ErrNotFound {
+		t.Fatalf("expected scan chunk deleted")
+	}
+}
+
+func TestScanDoesNotAffectReceiverKeys(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID:    createResp.SessionID,
+		ClaimID:      claimResp.ClaimID,
+		Approve:      true,
+		ScanRequired: true,
+	})
+	auth, err := store.GetSessionAuthContext(context.Background(), createResp.SessionID, claimResp.ClaimID)
+	if err != nil {
+		t.Fatalf("auth context missing: %v", err)
+	}
+	receiverKey := auth.ReceiverPubKeyB64
+
+	initResp := initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                4,
+	})
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("data"))
+	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+
+	scanInit := scanInitTransfer(t, server, scanInitRequest{
+		SessionID:     createResp.SessionID,
+		TransferID:    initResp.TransferID,
+		TransferToken: approveResp.TransferToken,
+		TotalBytes:    4,
+		ChunkSize:     4,
+	})
+	encrypted := encryptScanChunk(t, scanInit.ScanKeyB64, 0, []byte("data"))
+	uploadScanChunk(t, server, scanInit.ScanID, approveResp.TransferToken, 0, encrypted)
+	_ = finalizeScan(t, server, scanFinalizeRequest{
+		ScanID:        scanInit.ScanID,
+		TransferToken: approveResp.TransferToken,
+	})
+
+	authAfter, err := store.GetSessionAuthContext(context.Background(), createResp.SessionID, claimResp.ClaimID)
+	if err != nil {
+		t.Fatalf("auth context missing: %v", err)
+	}
+	if authAfter.ReceiverPubKeyB64 != receiverKey {
+		t.Fatalf("receiver key changed")
+	}
+}
+
 func newSessionTestServer(store *stubStorage) *Server {
 	return NewServer(Dependencies{
 		Config: config.Config{
@@ -499,9 +661,12 @@ func newSessionTestServer(store *stubStorage) *Server {
 			RateLimitSessionClaim: config.RateLimit{Max: 100, Window: time.Minute},
 			ClaimTokenTTL:         config.DefaultClaimTokenTTL,
 			TransferTokenTTL:      config.DefaultTransferTokenTTL,
+			MaxScanBytes:          config.DefaultMaxScanBytes,
+			MaxScanDuration:       config.DefaultMaxScanDuration,
 		},
-		Store:  store,
-		Tokens: token.NewMemoryService(),
+		Store:   store,
+		Tokens:  token.NewMemoryService(),
+		Scanner: scanner.UnavailableScanner{},
 	})
 }
 
@@ -584,6 +749,78 @@ func initTransfer(t *testing.T, server *Server, reqBody transferInitRequest) tra
 		t.Fatalf("decode init response: %v", err)
 	}
 	return resp
+}
+
+func scanInitTransfer(t *testing.T, server *Server, reqBody scanInitRequest) scanInitResponse {
+	t.Helper()
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		t.Fatalf("marshal scan init request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/transfer/scan_init", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected scan init 200 got %d", rec.Code)
+	}
+	var resp scanInitResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode scan init response: %v", err)
+	}
+	return resp
+}
+
+func uploadScanChunk(t *testing.T, server *Server, scanID string, token string, chunkIndex int, data []byte) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPut, "/v1/transfer/scan_chunk", bytes.NewBuffer(data))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("scan_id", scanID)
+	req.Header.Set("chunk_index", strconv.Itoa(chunkIndex))
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected scan chunk 200 got %d", rec.Code)
+	}
+}
+
+func finalizeScan(t *testing.T, server *Server, reqBody scanFinalizeRequest) scanFinalizeResponse {
+	t.Helper()
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		t.Fatalf("marshal scan finalize request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/transfer/scan_finalize", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected scan finalize 200 got %d", rec.Code)
+	}
+	var resp scanFinalizeResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode scan finalize response: %v", err)
+	}
+	return resp
+}
+
+func encryptScanChunk(t *testing.T, scanKeyB64 string, chunkIndex int, plaintext []byte) []byte {
+	t.Helper()
+	key, err := base64.RawURLEncoding.DecodeString(scanKeyB64)
+	if err != nil {
+		t.Fatalf("decode scan key: %v", err)
+	}
+	if len(key) != 32 {
+		t.Fatalf("invalid scan key length")
+	}
+	aead, err := chacha20poly1305.New(key)
+	if err != nil {
+		t.Fatalf("new aead: %v", err)
+	}
+	nonce := make([]byte, chacha20poly1305.NonceSize)
+	binary.BigEndian.PutUint64(nonce[4:], uint64(chunkIndex))
+	return aead.Seal(nil, nonce, plaintext, nil)
 }
 
 func initTransferRecorder(t *testing.T, server *Server, reqBody transferInitRequest) *httptest.ResponseRecorder {
@@ -684,11 +921,13 @@ func manifestRequestRecorder(t *testing.T, server *Server, sessionID string, tra
 }
 
 type stubStorage struct {
-	manifest map[string][]byte
-	meta     map[string]domain.TransferMeta
-	chunks   map[string][]byte
-	sessions map[string]domain.Session
-	auth     map[string]domain.SessionAuthContext
+	manifest   map[string][]byte
+	meta       map[string]domain.TransferMeta
+	chunks     map[string][]byte
+	sessions   map[string]domain.Session
+	auth       map[string]domain.SessionAuthContext
+	scans      map[string]domain.ScanSession
+	scanChunks map[string]map[int][]byte
 }
 
 func (s *stubStorage) SaveManifest(_ context.Context, transferID string, manifest []byte) error {
@@ -854,4 +1093,85 @@ func (s *stubStorage) GetSessionAuthContext(_ context.Context, sessionID string,
 		return domain.SessionAuthContext{}, storage.ErrNotFound
 	}
 	return auth, nil
+}
+
+func (s *stubStorage) CreateScanSession(_ context.Context, scan domain.ScanSession) error {
+	if s.scans == nil {
+		s.scans = map[string]domain.ScanSession{}
+	}
+	if _, exists := s.scans[scan.ID]; exists {
+		return storage.ErrConflict
+	}
+	s.scans[scan.ID] = scan
+	return nil
+}
+
+func (s *stubStorage) GetScanSession(_ context.Context, scanID string) (domain.ScanSession, error) {
+	if s.scans == nil {
+		return domain.ScanSession{}, storage.ErrNotFound
+	}
+	scan, ok := s.scans[scanID]
+	if !ok {
+		return domain.ScanSession{}, storage.ErrNotFound
+	}
+	return scan, nil
+}
+
+func (s *stubStorage) DeleteScanSession(_ context.Context, scanID string) error {
+	if s.scans == nil {
+		return storage.ErrNotFound
+	}
+	delete(s.scans, scanID)
+	delete(s.scanChunks, scanID)
+	return nil
+}
+
+func (s *stubStorage) StoreScanChunk(_ context.Context, scanID string, chunkIndex int, data []byte) error {
+	if s.scanChunks == nil {
+		s.scanChunks = map[string]map[int][]byte{}
+	}
+	if _, ok := s.scanChunks[scanID]; !ok {
+		s.scanChunks[scanID] = map[int][]byte{}
+	}
+	s.scanChunks[scanID][chunkIndex] = append([]byte(nil), data...)
+	return nil
+}
+
+func (s *stubStorage) ListScanChunks(_ context.Context, scanID string) ([]int, error) {
+	if s.scanChunks == nil {
+		return nil, storage.ErrNotFound
+	}
+	chunks, ok := s.scanChunks[scanID]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	indexes := make([]int, 0, len(chunks))
+	for idx := range chunks {
+		indexes = append(indexes, idx)
+	}
+	sort.Ints(indexes)
+	return indexes, nil
+}
+
+func (s *stubStorage) LoadScanChunk(_ context.Context, scanID string, chunkIndex int) ([]byte, error) {
+	if s.scanChunks == nil {
+		return nil, storage.ErrNotFound
+	}
+	chunks, ok := s.scanChunks[scanID]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	data, ok := chunks[chunkIndex]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	return append([]byte(nil), data...), nil
+}
+
+func (s *stubStorage) DeleteScanChunks(_ context.Context, scanID string) error {
+	if s.scanChunks == nil {
+		return storage.ErrNotFound
+	}
+	delete(s.scanChunks, scanID)
+	return nil
 }

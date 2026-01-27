@@ -47,13 +47,16 @@ class TransferCoordinator {
     required Transport transport,
     required TransferStateStore store,
     void Function(TransferState state)? onState,
+    void Function(String transferId, String status)? onScanStatus,
   })  : _transport = transport,
         _store = store,
-        _onState = onState;
+        _onState = onState,
+        _onScanStatus = onScanStatus;
 
   final Transport _transport;
   final TransferStateStore _store;
   final void Function(TransferState state)? _onState;
+  final void Function(String transferId, String status)? _onScanStatus;
   final List<_TransferJob> _queue = [];
   final Map<String, BytesBuilder> _partialDownloads = {};
   bool _paused = false;
@@ -70,6 +73,7 @@ class TransferCoordinator {
     required SimplePublicKey receiverPublicKey,
     required KeyPair senderKeyPair,
     int chunkSize = 64 * 1024,
+    bool scanRequired = false,
   }) {
     for (final file in files) {
       _queue.add(
@@ -80,6 +84,7 @@ class TransferCoordinator {
           receiverPublicKey: receiverPublicKey,
           senderKeyPair: senderKeyPair,
           chunkSize: chunkSize,
+          scanRequired: scanRequired,
         ),
       );
     }
@@ -392,8 +397,55 @@ class TransferCoordinator {
       transferId: transferId,
       transferToken: job.transferToken,
     );
+    if (job.scanRequired) {
+      final status = await _uploadScanCopy(
+        job: job,
+        transferId: transferId,
+      );
+      _onScanStatus?.call(transferId, status);
+    }
     await _saveState(state.copyWith(status: statusCompleted));
     return true;
+  }
+
+  Future<String> _uploadScanCopy({
+    required _TransferJob job,
+    required String transferId,
+  }) async {
+    final totalBytes = job.file.bytes.length;
+    final scanInit = await _transport.scanInit(
+      sessionId: job.sessionId,
+      transferId: transferId,
+      transferToken: job.transferToken,
+      totalBytes: totalBytes,
+      chunkSize: job.chunkSize,
+    );
+    final scanKey = base64Decode(scanInit.scanKeyB64);
+    var chunkIndex = 0;
+    for (var offset = 0; offset < totalBytes; offset += job.chunkSize) {
+      if (_paused) {
+        return 'paused';
+      }
+      final end = (offset + job.chunkSize).clamp(0, totalBytes);
+      final chunk = Uint8List.sublistView(job.file.bytes, offset, end);
+      final encrypted = await encryptScanChunk(
+        scanKey: scanKey,
+        chunkIndex: chunkIndex,
+        plaintext: chunk,
+      );
+      await _transport.scanChunk(
+        scanId: scanInit.scanId,
+        transferToken: job.transferToken,
+        chunkIndex: chunkIndex,
+        data: encrypted,
+      );
+      chunkIndex += 1;
+    }
+    final finalize = await _transport.scanFinalize(
+      scanId: scanInit.scanId,
+      transferToken: job.transferToken,
+    );
+    return finalize.status;
   }
 
   Future<void> _saveState(TransferState state) async {
@@ -412,6 +464,7 @@ class _TransferJob {
     required this.receiverPublicKey,
     required this.senderKeyPair,
     required this.chunkSize,
+    required this.scanRequired,
     this.transferId,
   });
 
@@ -421,6 +474,7 @@ class _TransferJob {
   final SimplePublicKey receiverPublicKey;
   final KeyPair senderKeyPair;
   final int chunkSize;
+  final bool scanRequired;
   String? transferId;
 }
 

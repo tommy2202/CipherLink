@@ -30,4 +30,12 @@ type Storage interface {
 
 	SaveSessionAuthContext(ctx context.Context, auth domain.SessionAuthContext) error
 	GetSessionAuthContext(ctx context.Context, sessionID string, claimID string) (domain.SessionAuthContext, error)
+
+	CreateScanSession(ctx context.Context, scan domain.ScanSession) error
+	GetScanSession(ctx context.Context, scanID string) (domain.ScanSession, error)
+	DeleteScanSession(ctx context.Context, scanID string) error
+	StoreScanChunk(ctx context.Context, scanID string, chunkIndex int, data []byte) error
+	ListScanChunks(ctx context.Context, scanID string) ([]int, error)
+	LoadScanChunk(ctx context.Context, scanID string, chunkIndex int) ([]byte, error)
+	DeleteScanChunks(ctx context.Context, scanID string) error
 }

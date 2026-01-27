@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +22,7 @@ type Store struct {
 	transfersDir string
 	sessionsDir  string
 	authDir      string
+	scansDir     string
 }
 
 func New(root string) (*Store, error) {
@@ -41,12 +44,17 @@ func New(root string) (*Store, error) {
 	if err := os.MkdirAll(authDir, 0700); err != nil {
 		return nil, err
 	}
+	scansDir := filepath.Join(root, "scans")
+	if err := os.MkdirAll(scansDir, 0700); err != nil {
+		return nil, err
+	}
 
 	return &Store{
 		root:         root,
 		transfersDir: transfersDir,
 		sessionsDir:  sessionsDir,
 		authDir:      authDir,
+		scansDir:     scansDir,
 	}, nil
 }
 
@@ -249,7 +257,139 @@ func (s *Store) SweepExpired(_ context.Context, now time.Time) (int, error) {
 		deleted++
 	}
 
+	scanEntries, err := os.ReadDir(s.scansDir)
+	if err != nil {
+		return deleted, err
+	}
+	for _, entry := range scanEntries {
+		if !entry.IsDir() {
+			continue
+		}
+		metaPath := filepath.Join(s.scansDir, entry.Name(), "meta.json")
+		data, err := os.ReadFile(metaPath)
+		if err != nil {
+			continue
+		}
+		var scan domain.ScanSession
+		if err := json.Unmarshal(data, &scan); err != nil {
+			continue
+		}
+		if now.Before(scan.ExpiresAt) {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(s.scansDir, entry.Name()))
+		deleted++
+	}
+
 	return deleted, nil
+}
+
+func (s *Store) CreateScanSession(_ context.Context, scan domain.ScanSession) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := s.scanMetaPath(scan.ID)
+	if _, err := os.Stat(path); err == nil {
+		return storage.ErrConflict
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return writeJSONAtomic(path, scan)
+}
+
+func (s *Store) GetScanSession(_ context.Context, scanID string) (domain.ScanSession, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := s.scanMetaPath(scanID)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return domain.ScanSession{}, storage.ErrNotFound
+		}
+		return domain.ScanSession{}, err
+	}
+	var scan domain.ScanSession
+	if err := json.Unmarshal(data, &scan); err != nil {
+		return domain.ScanSession{}, err
+	}
+	return scan, nil
+}
+
+func (s *Store) DeleteScanSession(_ context.Context, scanID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := s.scanDir(scanID)
+	if err := os.RemoveAll(path); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) StoreScanChunk(_ context.Context, scanID string, chunkIndex int, data []byte) error {
+	if chunkIndex < 0 {
+		return storage.ErrInvalidRange
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	chunkPath := filepath.Join(s.scanChunksDir(scanID), strconv.Itoa(chunkIndex)+".bin")
+	return writeFileAtomic(chunkPath, data, 0600)
+}
+
+func (s *Store) ListScanChunks(_ context.Context, scanID string) ([]int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	dir := s.scanChunksDir(scanID)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, err
+	}
+	var indexes []int
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".bin") {
+			continue
+		}
+		raw := strings.TrimSuffix(entry.Name(), ".bin")
+		value, err := strconv.Atoi(raw)
+		if err != nil {
+			continue
+		}
+		indexes = append(indexes, value)
+	}
+	sort.Ints(indexes)
+	return indexes, nil
+}
+
+func (s *Store) LoadScanChunk(_ context.Context, scanID string, chunkIndex int) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	chunkPath := filepath.Join(s.scanChunksDir(scanID), strconv.Itoa(chunkIndex)+".bin")
+	data, err := os.ReadFile(chunkPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, err
+	}
+	return data, nil
+}
+
+func (s *Store) DeleteScanChunks(_ context.Context, scanID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	dir := s.scanChunksDir(scanID)
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Store) CreateSession(_ context.Context, session domain.Session) error {
@@ -365,6 +505,18 @@ func (s *Store) sessionPath(sessionID string) string {
 func (s *Store) authPath(sessionID string, claimID string) string {
 	file := sessionID + "_" + claimID + ".json"
 	return filepath.Join(s.authDir, file)
+}
+
+func (s *Store) scanDir(scanID string) string {
+	return filepath.Join(s.scansDir, scanID)
+}
+
+func (s *Store) scanMetaPath(scanID string) string {
+	return filepath.Join(s.scanDir(scanID), "meta.json")
+}
+
+func (s *Store) scanChunksDir(scanID string) string {
+	return filepath.Join(s.scanDir(scanID), "chunks")
 }
 
 func (s *Store) deleteAuthContextsLocked(sessionID string) {

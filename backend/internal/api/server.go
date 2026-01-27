@@ -14,6 +14,7 @@ import (
 	"universaldrop/internal/config"
 	"universaldrop/internal/logging"
 	"universaldrop/internal/ratelimit"
+	"universaldrop/internal/scanner"
 	"universaldrop/internal/storage"
 	"universaldrop/internal/token"
 	"universaldrop/internal/transfer"
@@ -25,6 +26,7 @@ type Dependencies struct {
 	Tokens  token.TokenService
 	Logger  *log.Logger
 	Version string
+	Scanner scanner.Scanner
 }
 
 type Server struct {
@@ -35,6 +37,7 @@ type Server struct {
 	version      string
 	rateLimiters map[string]*ratelimit.Limiter
 	transfers    *transfer.Engine
+	scanner      scanner.Scanner
 	Router       http.Handler
 }
 
@@ -50,6 +53,10 @@ func NewServer(deps Dependencies) *Server {
 	tokenService := deps.Tokens
 	if tokenService == nil {
 		tokenService = token.NewMemoryService()
+	}
+	scanService := deps.Scanner
+	if scanService == nil {
+		scanService = scanner.UnavailableScanner{}
 	}
 
 	rateLimiters := map[string]*ratelimit.Limiter{}
@@ -72,6 +79,7 @@ func NewServer(deps Dependencies) *Server {
 		version:      version,
 		rateLimiters: rateLimiters,
 		transfers:    transfer.New(deps.Store),
+		scanner:      scanService,
 	}
 
 	server.Router = server.routes()
@@ -103,6 +111,9 @@ func (s *Server) routes() http.Handler {
 		r.Get("/transfer/manifest", s.handleGetTransferManifest)
 		r.Get("/transfer/download", s.handleDownloadTransfer)
 		r.Post("/transfer/receipt", s.handleTransferReceipt)
+		r.Post("/transfer/scan_init", s.handleScanInit)
+		r.Put("/transfer/scan_chunk", s.handleScanChunk)
+		r.Post("/transfer/scan_finalize", s.handleScanFinalize)
 	})
 
 	return r

@@ -46,6 +46,8 @@ type sessionPollClaimSummary struct {
 	SenderLabel      string `json:"sender_label"`
 	ShortFingerprint string `json:"short_fingerprint"`
 	TransferID       string `json:"transfer_id,omitempty"`
+	ScanRequired     bool   `json:"scan_required,omitempty"`
+	ScanStatus       string `json:"scan_status,omitempty"`
 }
 
 type sessionPollReceiverResponse struct {
@@ -63,12 +65,15 @@ type sessionPollSenderResponse struct {
 	SASState          string `json:"sas_state"`
 	ReceiverPubKeyB64 string `json:"receiver_pubkey_b64,omitempty"`
 	TransferToken     string `json:"transfer_token,omitempty"`
+	ScanRequired      bool   `json:"scan_required,omitempty"`
+	ScanStatus        string `json:"scan_status,omitempty"`
 }
 
 type sessionApproveRequest struct {
-	SessionID string `json:"session_id"`
-	ClaimID   string `json:"claim_id"`
-	Approve   bool   `json:"approve"`
+	SessionID    string `json:"session_id"`
+	ClaimID      string `json:"claim_id"`
+	Approve      bool   `json:"approve"`
+	ScanRequired bool   `json:"scan_required,omitempty"`
 }
 
 type sessionApproveResponse struct {
@@ -100,6 +105,28 @@ type transferReceiptRequest struct {
 	TransferID    string `json:"transfer_id"`
 	TransferToken string `json:"transfer_token"`
 	Status        string `json:"status"`
+}
+
+type scanInitRequest struct {
+	SessionID     string `json:"session_id"`
+	TransferID    string `json:"transfer_id"`
+	TransferToken string `json:"transfer_token"`
+	TotalBytes    int64  `json:"total_bytes"`
+	ChunkSize     int    `json:"chunk_size"`
+}
+
+type scanInitResponse struct {
+	ScanID     string `json:"scan_id"`
+	ScanKeyB64 string `json:"scan_key_b64"`
+}
+
+type scanFinalizeRequest struct {
+	ScanID        string `json:"scan_id"`
+	TransferToken string `json:"transfer_token"`
+}
+
+type scanFinalizeResponse struct {
+	Status string `json:"status"`
 }
 
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
@@ -298,6 +325,12 @@ func (s *Server) handleApproveSession(w http.ResponseWriter, r *http.Request) {
 	claim := session.Claims[claimIndex]
 	if req.Approve {
 		claim.Status = domain.SessionClaimApproved
+		claim.ScanRequired = req.ScanRequired
+		if req.ScanRequired {
+			claim.ScanStatus = domain.ScanStatusPending
+		} else {
+			claim.ScanStatus = domain.ScanStatusNotRequired
+		}
 	} else {
 		claim.Status = domain.SessionClaimRejected
 	}
@@ -383,6 +416,17 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 			claimID = session.Claims[0].ID
 			status = session.Claims[0].Status
 		}
+		scanRequired := false
+		scanStatus := ""
+		if claimID != "" {
+			claim, ok := findClaim(session, claimID)
+			if ok {
+				scanRequired = claim.ScanRequired
+				if claim.ScanRequired {
+					scanStatus = string(claim.ScanStatus)
+				}
+			}
+		}
 		if claimID != "" {
 			scope := transferScope(session.ID, claimID)
 			if status == domain.SessionClaimApproved {
@@ -399,6 +443,8 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 			SASState:          "not_supported_yet",
 			ReceiverPubKeyB64: session.ReceiverPubKeyB64,
 			TransferToken:     transferToken,
+			ScanRequired:      scanRequired,
+			ScanStatus:        scanStatus,
 		})
 		return
 	}
@@ -406,20 +452,30 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 	claims := make([]sessionPollClaimSummary, 0)
 	for _, claim := range session.Claims {
 		if claim.Status == domain.SessionClaimPending {
-			claims = append(claims, sessionPollClaimSummary{
+			summary := sessionPollClaimSummary{
 				ClaimID:          claim.ID,
 				SenderLabel:      claim.SenderLabel,
 				ShortFingerprint: shortFingerprint(claim.SenderPubKeyB64),
-			})
+				ScanRequired:     claim.ScanRequired,
+			}
+			if claim.ScanRequired {
+				summary.ScanStatus = string(claim.ScanStatus)
+			}
+			claims = append(claims, summary)
 			continue
 		}
 		if claim.Status == domain.SessionClaimApproved && claim.TransferReady {
-			claims = append(claims, sessionPollClaimSummary{
+			summary := sessionPollClaimSummary{
 				ClaimID:          claim.ID,
 				SenderLabel:      claim.SenderLabel,
 				ShortFingerprint: shortFingerprint(claim.SenderPubKeyB64),
 				TransferID:       claim.TransferID,
-			})
+				ScanRequired:     claim.ScanRequired,
+			}
+			if claim.ScanRequired {
+				summary.ScanStatus = string(claim.ScanStatus)
+			}
+			claims = append(claims, summary)
 		}
 	}
 
@@ -691,6 +747,136 @@ func (s *Server) handleTransferReceipt(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (s *Server) handleScanInit(w http.ResponseWriter, r *http.Request) {
+	var req scanInitRequest
+	if err := decodeJSON(w, r, &req, 8<<10); err != nil {
+		writeIndistinguishable(w)
+		return
+	}
+	if req.SessionID == "" || req.TransferID == "" || req.TransferToken == "" || req.TotalBytes < 0 {
+		writeIndistinguishable(w)
+		return
+	}
+
+	session, claimID, ok := s.authorizeTransfer(r.Context(), req.SessionID, req.TransferToken)
+	if !ok {
+		writeIndistinguishable(w)
+		return
+	}
+	claim, ok := findClaim(session, claimID)
+	if !ok || claim.TransferID != req.TransferID || !claim.ScanRequired {
+		writeIndistinguishable(w)
+		return
+	}
+
+	if req.ChunkSize <= 0 {
+		req.ChunkSize = 64 * 1024
+	}
+	scanID, scanKey, err := s.transfers.InitScan(
+		r.Context(),
+		session.ID,
+		claimID,
+		req.TransferID,
+		req.TotalBytes,
+		req.ChunkSize,
+		session.ExpiresAt,
+	)
+	if err != nil {
+		writeIndistinguishable(w)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, scanInitResponse{
+		ScanID:     scanID,
+		ScanKeyB64: scanKey,
+	})
+}
+
+func (s *Server) handleScanChunk(w http.ResponseWriter, r *http.Request) {
+	scanID := headerValue(r, "scan_id")
+	chunkIndexRaw := headerValue(r, "chunk_index")
+	token := bearerToken(r)
+	if scanID == "" || chunkIndexRaw == "" || token == "" {
+		writeIndistinguishable(w)
+		return
+	}
+	chunkIndex, err := strconv.Atoi(chunkIndexRaw)
+	if err != nil || chunkIndex < 0 {
+		writeIndistinguishable(w)
+		return
+	}
+
+	scanSession, err := s.store.GetScanSession(r.Context(), scanID)
+	if err != nil {
+		writeIndistinguishable(w)
+		return
+	}
+	if time.Now().UTC().After(scanSession.ExpiresAt) {
+		writeIndistinguishable(w)
+		return
+	}
+
+	session, claimID, ok := s.authorizeTransfer(r.Context(), scanSession.SessionID, token)
+	if !ok || claimID != scanSession.ClaimID {
+		writeIndistinguishable(w)
+		return
+	}
+	_ = session
+
+	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxScanBytes)
+	data, err := io.ReadAll(r.Body)
+	if err != nil || len(data) == 0 {
+		writeIndistinguishable(w)
+		return
+	}
+	if err := s.transfers.StoreScanChunk(r.Context(), scanID, chunkIndex, data); err != nil {
+		writeIndistinguishable(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleScanFinalize(w http.ResponseWriter, r *http.Request) {
+	var req scanFinalizeRequest
+	if err := decodeJSON(w, r, &req, 8<<10); err != nil {
+		writeIndistinguishable(w)
+		return
+	}
+	if req.ScanID == "" || req.TransferToken == "" {
+		writeIndistinguishable(w)
+		return
+	}
+
+	scanSession, err := s.store.GetScanSession(r.Context(), req.ScanID)
+	if err != nil {
+		writeIndistinguishable(w)
+		return
+	}
+	if time.Now().UTC().After(scanSession.ExpiresAt) {
+		writeIndistinguishable(w)
+		return
+	}
+	session, claimID, ok := s.authorizeTransfer(r.Context(), scanSession.SessionID, req.TransferToken)
+	if !ok || claimID != scanSession.ClaimID {
+		writeIndistinguishable(w)
+		return
+	}
+
+	status, err := s.transfers.FinalizeScan(r.Context(), req.ScanID, s.scanner, s.cfg.MaxScanBytes, s.cfg.MaxScanDuration)
+	if err != nil {
+		writeIndistinguishable(w)
+		return
+	}
+	if err := s.updateClaimScanStatus(r.Context(), session, claimID, status); err != nil {
+		writeIndistinguishable(w)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, scanFinalizeResponse{
+		Status: string(status),
+	})
+}
+
 func (s *Server) authorizeTransfer(ctx context.Context, sessionID string, token string) (domain.Session, string, bool) {
 	if sessionID == "" || token == "" {
 		return domain.Session{}, "", false
@@ -779,6 +965,19 @@ func findClaim(session domain.Session, claimID string) (domain.SessionClaim, boo
 		}
 	}
 	return domain.SessionClaim{}, false
+}
+
+func (s *Server) updateClaimScanStatus(ctx context.Context, session domain.Session, claimID string, status domain.ScanStatus) error {
+	for i, claim := range session.Claims {
+		if claim.ID != claimID {
+			continue
+		}
+		claim.ScanStatus = status
+		claim.UpdatedAt = time.Now().UTC()
+		session.Claims[i] = claim
+		return s.store.UpdateSession(ctx, session)
+	}
+	return storage.ErrNotFound
 }
 
 func headerValue(r *http.Request, key string) string {

@@ -13,6 +13,7 @@ import (
 	"universaldrop/internal/clock"
 	"universaldrop/internal/config"
 	"universaldrop/internal/logging"
+	"universaldrop/internal/scanner"
 	"universaldrop/internal/storage/localfs"
 	"universaldrop/internal/sweeper"
 	"universaldrop/internal/token"
@@ -32,10 +33,11 @@ func main() {
 	tokens := token.NewMemoryService()
 
 	server := api.NewServer(api.Dependencies{
-		Config: cfg,
-		Store:  store,
-		Tokens: tokens,
-		Logger: logger,
+		Config:  cfg,
+		Store:   store,
+		Tokens:  tokens,
+		Logger:  logger,
+		Scanner: scanner.UnavailableScanner{},
 	})
 
 	httpServer := &http.Server{

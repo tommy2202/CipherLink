@@ -9,6 +9,22 @@ class TransferInitResult {
   final String transferId;
 }
 
+class ScanInitResult {
+  const ScanInitResult({
+    required this.scanId,
+    required this.scanKeyB64,
+  });
+
+  final String scanId;
+  final String scanKeyB64;
+}
+
+class ScanFinalizeResult {
+  const ScanFinalizeResult(this.status);
+
+  final String status;
+}
+
 abstract class Transport {
   Future<TransferInitResult> initTransfer({
     required String sessionId,
@@ -49,6 +65,26 @@ abstract class Transport {
   Future<void> sendReceipt({
     required String sessionId,
     required String transferId,
+    required String transferToken,
+  });
+
+  Future<ScanInitResult> scanInit({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+    required int totalBytes,
+    required int chunkSize,
+  });
+
+  Future<void> scanChunk({
+    required String scanId,
+    required String transferToken,
+    required int chunkIndex,
+    required Uint8List data,
+  });
+
+  Future<ScanFinalizeResult> scanFinalize({
+    required String scanId,
     required String transferToken,
   });
 }
@@ -213,6 +249,83 @@ class HttpTransport implements Transport {
     if (response.statusCode >= 400) {
       throw TransportException('sendReceipt failed: ${response.statusCode}');
     }
+  }
+
+  @override
+  Future<ScanInitResult> scanInit({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+    required int totalBytes,
+    required int chunkSize,
+  }) async {
+    final uri = baseUri.resolve('/v1/transfer/scan_init');
+    final response = await _client.post(
+      uri,
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'session_id': sessionId,
+        'transfer_id': transferId,
+        'transfer_token': transferToken,
+        'total_bytes': totalBytes,
+        'chunk_size': chunkSize,
+      }),
+    );
+    if (response.statusCode >= 400) {
+      throw TransportException('scanInit failed: ${response.statusCode}');
+    }
+    final payload = jsonDecode(response.body) as Map<String, dynamic>;
+    final scanId = payload['scan_id']?.toString() ?? '';
+    final scanKey = payload['scan_key_b64']?.toString() ?? '';
+    if (scanId.isEmpty || scanKey.isEmpty) {
+      throw TransportException('scanInit missing fields');
+    }
+    return ScanInitResult(scanId: scanId, scanKeyB64: scanKey);
+  }
+
+  @override
+  Future<void> scanChunk({
+    required String scanId,
+    required String transferToken,
+    required int chunkIndex,
+    required Uint8List data,
+  }) async {
+    final uri = baseUri.resolve('/v1/transfer/scan_chunk');
+    final response = await _client.put(
+      uri,
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Authorization': 'Bearer $transferToken',
+        'scan_id': scanId,
+        'chunk_index': chunkIndex.toString(),
+      },
+      body: data,
+    );
+    if (response.statusCode >= 400) {
+      throw TransportException('scanChunk failed: ${response.statusCode}');
+    }
+  }
+
+  @override
+  Future<ScanFinalizeResult> scanFinalize({
+    required String scanId,
+    required String transferToken,
+  }) async {
+    final uri = baseUri.resolve('/v1/transfer/scan_finalize');
+    final response = await _client.post(
+      uri,
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'scan_id': scanId,
+        'transfer_token': transferToken,
+      }),
+    );
+    if (response.statusCode >= 400) {
+      throw TransportException('scanFinalize failed: ${response.statusCode}');
+    }
+    final payload = jsonDecode(response.body) as Map<String, dynamic>;
+    final status = payload['status']?.toString() ?? '';
+    return ScanFinalizeResult(status);
   }
 }
 

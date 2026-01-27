@@ -32,6 +32,12 @@ class EncryptedPayload {
 const int _nonceLength = 12;
 const int _macLength = 16;
 
+Uint8List scanNonce(int chunkIndex) {
+  final data = ByteData(12);
+  data.setUint64(4, chunkIndex);
+  return data.buffer.asUint8List();
+}
+
 Future<SecretKey> deriveSessionKey({
   required KeyPair localKeyPair,
   required SimplePublicKey peerPublicKey,
@@ -205,6 +211,21 @@ Future<Uint8List> decryptChunk({
     aad: aad,
   );
   return Uint8List.fromList(plaintext);
+}
+
+Future<Uint8List> encryptScanChunk({
+  required Uint8List scanKey,
+  required int chunkIndex,
+  required Uint8List plaintext,
+}) async {
+  final aead = Chacha20.poly1305Aead();
+  final nonce = scanNonce(chunkIndex);
+  final box = await aead.encrypt(
+    plaintext,
+    secretKey: SecretKey(scanKey),
+    nonce: nonce,
+  );
+  return Uint8List.fromList(box.cipherText + box.mac.bytes);
 }
 
 Uint8List serializeEncryptedPayload(EncryptedPayload payload) {
