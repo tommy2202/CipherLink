@@ -36,6 +36,7 @@ func TestSweepExpiredRemovesSessionsAndTransfers(t *testing.T) {
 	meta := domain.TransferMeta{
 		Status:        domain.TransferStatusActive,
 		BytesReceived: 0,
+		TotalBytes:    0,
 		CreatedAt:     now.Add(-2 * time.Hour),
 		ExpiresAt:     now.Add(-time.Hour),
 		ScanStatus:    domain.ScanStatusNotRequired,

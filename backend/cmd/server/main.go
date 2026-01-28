@@ -30,7 +30,14 @@ func main() {
 			"event": "storage_init_failed",
 		})
 	}
-	tokens := token.NewMemoryService()
+	secret, err := token.LoadOrCreateHMACSecret(cfg.DataDir)
+	if err != nil {
+		logging.Fatal(logger, map[string]string{
+			"event": "token_secret_load_failed",
+			"error": "token_secret_load_failed",
+		})
+	}
+	tokens := token.NewHMACService(secret)
 
 	server := api.NewServer(api.Dependencies{
 		Config:  cfg,

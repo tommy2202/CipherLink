@@ -12,14 +12,17 @@ import 'package:mime/mime.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'clipboard_service.dart';
 import 'crypto.dart';
 import 'destination_preferences.dart';
 import 'destination_rules.dart';
 import 'destination_selector.dart';
+import 'key_store.dart';
 import 'packaging_builder.dart';
 import 'save_service.dart';
+import 'transfer_background.dart';
 import 'transfer_manifest.dart';
 import 'transfer_coordinator.dart';
 import 'transfer_state_store.dart';
@@ -27,6 +30,7 @@ import 'transport.dart';
 import 'zip_extract.dart';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
   runApp(const UniversalDropApp());
 }
 
@@ -73,8 +77,16 @@ class _HomeScreenState extends State<HomeScreen> {
   final Map<String, TransferState> _transferStates = {};
   final List<TransferFile> _selectedFiles = [];
   TransferCoordinator? _coordinator;
-  late final InMemoryTransferStateStore _transferStore =
-      InMemoryTransferStateStore();
+  late final SecureTransferStateStore _transferStore =
+      SecureTransferStateStore();
+  final SecureKeyPairStore _keyStore = SecureKeyPairStore();
+  late final TransferBackgroundManager _backgroundManager =
+      TransferBackgroundManager(
+    scheduler: MethodChannelResumeScheduler(),
+    foregroundController: MethodChannelForegroundController(),
+    connectivityMonitor: MethodChannelConnectivityMonitor(),
+    onConnectivityRestored: () => _resumePendingTransfers(),
+  );
   final DestinationPreferenceStore _destinationStore =
       SharedPreferencesDestinationStore();
   final SaveService _saveService = DefaultSaveService();
@@ -106,15 +118,38 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _claimStatus;
   String? _senderTransferToken;
   String? _senderReceiverPubKeyB64;
+  String? _senderPubKeyB64;
+  String? _senderSasCode;
+  String _senderSasState = 'pending';
+  bool _senderSasConfirmed = false;
+  bool _senderSasConfirming = false;
   KeyPair? _senderKeyPair;
   String? _senderSessionId;
+  String? _senderP2PToken;
   bool _scanRequired = false;
   String _scanStatus = '';
   Timer? _pollTimer;
   bool _refreshingClaims = false;
   String _claimsStatus = 'No pending claims.';
   List<PendingClaim> _pendingClaims = [];
+  final Map<String, String> _p2pTokensByClaim = {};
+  bool _preferDirect = true;
+  bool _alwaysRelay = false;
+  bool _p2pDisclosureShown = false;
   final Set<String> _trustedFingerprints = {};
+  final Map<String, String> _receiverSasByClaim = {};
+  final Set<String> _receiverSasConfirming = {};
+
+  static const _p2pPreferDirectKey = 'p2pPreferDirect';
+  static const _p2pAlwaysRelayKey = 'p2pAlwaysRelay';
+  static const _p2pDisclosureKey = 'p2pDirectDisclosureShown';
+
+  @override
+  void initState() {
+    super.initState();
+    _loadP2PSettings();
+    _resumePendingTransfers();
+  }
 
   @override
   void dispose() {
@@ -127,7 +162,84 @@ class _HomeScreenState extends State<HomeScreen> {
     _textContentController.dispose();
     _packageTitleController.dispose();
     _pollTimer?.cancel();
+    _backgroundManager.dispose();
     super.dispose();
+  }
+
+  Future<void> _loadP2PSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    final preferDirect = prefs.getBool(_p2pPreferDirectKey) ?? true;
+    final alwaysRelay = prefs.getBool(_p2pAlwaysRelayKey) ?? false;
+    final disclosureShown = prefs.getBool(_p2pDisclosureKey) ?? false;
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _preferDirect = preferDirect;
+      _alwaysRelay = alwaysRelay;
+      _p2pDisclosureShown = disclosureShown;
+    });
+  }
+
+  Future<void> _persistP2PSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_p2pPreferDirectKey, _preferDirect);
+    await prefs.setBool(_p2pAlwaysRelayKey, _alwaysRelay);
+  }
+
+  Future<void> _setPreferDirect(bool value) async {
+    if (value) {
+      await _maybeShowDirectDisclosure();
+    }
+    setState(() {
+      _preferDirect = value;
+      if (!value) {
+        _alwaysRelay = false;
+      }
+    });
+    await _persistP2PSettings();
+  }
+
+  Future<void> _setAlwaysRelay(bool value) async {
+    if (!_preferDirect) {
+      return;
+    }
+    setState(() {
+      _alwaysRelay = value;
+    });
+    await _persistP2PSettings();
+  }
+
+  Future<void> _maybeShowDirectDisclosure() async {
+    if (_p2pDisclosureShown || !mounted) {
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Direct transfer disclosure'),
+          content: const Text(
+            'Direct transfer may reveal IP address to the other device. '
+            'Use "Always relay" to avoid direct exposure.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_p2pDisclosureKey, true);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _p2pDisclosureShown = true;
+    });
   }
 
   void _ensureCoordinator() {
@@ -135,8 +247,15 @@ class _HomeScreenState extends State<HomeScreen> {
     if (baseUrl.isEmpty) {
       return;
     }
+    final baseUri = Uri.parse(baseUrl);
+    final httpTransport = BackgroundUrlSessionTransport(baseUri);
     _coordinator = TransferCoordinator(
-      transport: HttpTransport(Uri.parse(baseUrl)),
+      transport: httpTransport,
+      p2pTransportFactory: (context) => P2PTransport(
+        baseUri: baseUri,
+        context: context,
+        fallbackTransport: httpTransport,
+      ),
       store: _transferStore,
       onState: (state) {
         setState(() {
@@ -148,6 +267,119 @@ class _HomeScreenState extends State<HomeScreen> {
           _scanStatus = status;
         });
       },
+      backgroundHooks: _backgroundManager,
+    );
+  }
+
+  Future<void> _resumePendingTransfers() async {
+    _ensureCoordinator();
+    final coordinator = _coordinator;
+    if (coordinator == null) {
+      return;
+    }
+    await coordinator.resumePendingDownloads(
+      resolve: _resolveDownloadResumeContext,
+    );
+    await coordinator.resumePendingUploads(
+      resolve: _resolveUploadResumeContext,
+    );
+  }
+
+  Future<DownloadResumeContext?> _resolveDownloadResumeContext(
+    TransferState state,
+  ) async {
+    if (state.sessionId.isEmpty ||
+        state.transferToken.isEmpty ||
+        state.transferId.isEmpty) {
+      return null;
+    }
+    final senderPubKeyB64 = state.peerPublicKeyB64 ?? '';
+    if (senderPubKeyB64.isEmpty) {
+      return null;
+    }
+    final receiverKeyPair = await _keyStore.loadKeyPair(
+      sessionId: state.sessionId,
+      role: KeyRole.receiver,
+    );
+    if (receiverKeyPair == null) {
+      return null;
+    }
+    return DownloadResumeContext(
+      sessionId: state.sessionId,
+      transferToken: state.transferToken,
+      transferId: state.transferId,
+      senderPublicKey: publicKeyFromBase64(senderPubKeyB64),
+      receiverKeyPair: receiverKeyPair,
+    );
+  }
+
+  Future<UploadResumeContext?> _resolveUploadResumeContext(
+    TransferState state,
+  ) async {
+    if (state.sessionId.isEmpty ||
+        state.transferToken.isEmpty ||
+        state.transferId.isEmpty) {
+      return null;
+    }
+    final payloadPath = state.payloadPath ?? '';
+    if (payloadPath.isEmpty) {
+      return null;
+    }
+    final payloadFile = File(payloadPath);
+    if (!await payloadFile.exists()) {
+      return null;
+    }
+    final senderKeyPair = await _keyStore.loadKeyPair(
+      sessionId: state.sessionId,
+      role: KeyRole.sender,
+    );
+    if (senderKeyPair == null) {
+      return null;
+    }
+    final receiverPubKeyB64 = state.peerPublicKeyB64 ?? '';
+    if (receiverPubKeyB64.isEmpty) {
+      return null;
+    }
+    final bytes = await payloadFile.readAsBytes();
+    final transferFile = TransferFile(
+      id: state.transferId,
+      name: p.basename(payloadPath),
+      bytes: bytes,
+      payloadKind: payloadKindFile,
+      mimeType: 'application/octet-stream',
+      packagingMode: packagingModeOriginals,
+      localPath: payloadPath,
+    );
+    return UploadResumeContext(
+      file: transferFile,
+      sessionId: state.sessionId,
+      transferToken: state.transferToken,
+      receiverPublicKey: publicKeyFromBase64(receiverPubKeyB64),
+      senderKeyPair: senderKeyPair,
+      chunkSize: state.chunkSize,
+      scanRequired: state.scanRequired ?? false,
+      transferId: state.transferId,
+    );
+  }
+
+  P2PContext? _buildP2PContext({
+    required String sessionId,
+    required String claimId,
+    required String token,
+    required bool isInitiator,
+  }) {
+    if (!_preferDirect) {
+      return null;
+    }
+    if (sessionId.isEmpty || claimId.isEmpty || token.isEmpty) {
+      return null;
+    }
+    return P2PContext(
+      sessionId: sessionId,
+      claimId: claimId,
+      token: token,
+      isInitiator: isInitiator,
+      iceMode: _alwaysRelay ? P2PIceMode.relay : P2PIceMode.direct,
     );
   }
 
@@ -233,11 +465,18 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final payload = jsonDecode(response.body) as Map<String, dynamic>;
       final sessionResponse = SessionCreateResponse.fromJson(payload);
+      await _keyStore.saveKeyPair(
+        sessionId: sessionResponse.sessionId,
+        role: KeyRole.receiver,
+        keyPair: keyPair,
+      );
       setState(() {
         _sessionResponse = sessionResponse;
         _sessionStatus = 'Session created.';
         _claimsStatus = 'Session created. Refresh to load claims.';
         _pendingClaims = [];
+        _receiverSasByClaim.clear();
+        _receiverSasConfirming.clear();
         _receiverKeyPair = keyPair;
         _receivedText = '';
       });
@@ -289,6 +528,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _pendingClaims = claims;
         _claimsStatus = claims.isEmpty ? 'No pending claims.' : 'Pending claims loaded.';
       });
+      await _updateReceiverSasCodes(claims);
     } catch (err) {
       setState(() {
         _claimsStatus = 'Failed: $err';
@@ -298,6 +538,36 @@ class _HomeScreenState extends State<HomeScreen> {
         _refreshingClaims = false;
       });
     }
+  }
+
+  Future<void> _updateReceiverSasCodes(List<PendingClaim> claims) async {
+    final receiverPubKeyB64 = _sessionResponse?.receiverPubKeyB64 ?? '';
+    final sessionId = _sessionResponse?.sessionId ?? '';
+    if (receiverPubKeyB64.isEmpty || sessionId.isEmpty) {
+      return;
+    }
+    final updates = <String, String>{};
+    for (final claim in claims) {
+      if (claim.senderPubKeyB64.isEmpty) {
+        continue;
+      }
+      if (_receiverSasByClaim.containsKey(claim.claimId)) {
+        continue;
+      }
+      final sas = await deriveSasDigits(
+        sessionId: sessionId,
+        claimId: claim.claimId,
+        receiverPubKeyB64: receiverPubKeyB64,
+        senderPubKeyB64: claim.senderPubKeyB64,
+      );
+      updates[claim.claimId] = sas;
+    }
+    if (updates.isEmpty || !mounted) {
+      return;
+    }
+    setState(() {
+      _receiverSasByClaim.addAll(updates);
+    });
   }
 
   Future<void> _respondToClaim(PendingClaim claim, bool approve) async {
@@ -338,8 +608,12 @@ class _HomeScreenState extends State<HomeScreen> {
           .timeout(const Duration(seconds: 8));
 
       if (response.statusCode != 200) {
+        final payload = jsonDecode(response.body) as Map<String, dynamic>?;
+        final error = payload?['error']?.toString();
         setState(() {
-          _claimsStatus = 'Error: ${response.statusCode}';
+          _claimsStatus = error == 'sas_required'
+              ? 'SAS must be verified by both devices.'
+              : 'Error: ${response.statusCode}';
         });
         return;
       }
@@ -347,9 +621,13 @@ class _HomeScreenState extends State<HomeScreen> {
       if (approve) {
         final payload = jsonDecode(response.body) as Map<String, dynamic>;
         final transferToken = payload['transfer_token']?.toString() ?? '';
+        final p2pToken = payload['p2p_token']?.toString() ?? '';
         final senderPubKey = payload['sender_pubkey_b64']?.toString() ?? '';
         if (transferToken.isNotEmpty) {
           _transferTokensByClaim[claim.claimId] = transferToken;
+        }
+        if (p2pToken.isNotEmpty) {
+          _p2pTokensByClaim[claim.claimId] = p2pToken;
         }
         if (senderPubKey.isNotEmpty) {
           _senderPubKeysByClaim[claim.claimId] = senderPubKey;
@@ -362,6 +640,139 @@ class _HomeScreenState extends State<HomeScreen> {
         _claimsStatus = 'Failed: $err';
       });
     }
+  }
+
+  Future<bool> _commitSas({
+    required String sessionId,
+    required String claimId,
+    required String role,
+  }) async {
+    final baseUrl = _baseUrlController.text.trim();
+    if (baseUrl.isEmpty) {
+      return false;
+    }
+    final response = await http
+        .post(
+          Uri.parse(baseUrl).resolve('/v1/session/sas/commit'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'session_id': sessionId,
+            'claim_id': claimId,
+            'role': role,
+            'sas_confirmed': true,
+          }),
+        )
+        .timeout(const Duration(seconds: 8));
+    return response.statusCode == 200;
+  }
+
+  Future<void> _confirmReceiverSas(PendingClaim claim) async {
+    final sessionId = _sessionResponse?.sessionId ?? '';
+    if (sessionId.isEmpty) {
+      setState(() {
+        _claimsStatus = 'Create a session first.';
+      });
+      return;
+    }
+    if (_receiverSasConfirming.contains(claim.claimId)) {
+      return;
+    }
+    setState(() {
+      _receiverSasConfirming.add(claim.claimId);
+      _claimsStatus = 'Confirming SAS...';
+    });
+    try {
+      final ok = await _commitSas(
+        sessionId: sessionId,
+        claimId: claim.claimId,
+        role: 'receiver',
+      );
+      if (!ok) {
+        setState(() {
+          _claimsStatus = 'Failed to confirm SAS.';
+        });
+        return;
+      }
+      await _refreshClaims();
+      setState(() {
+        _claimsStatus = 'SAS confirmed.';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _receiverSasConfirming.remove(claim.claimId);
+        });
+      }
+    }
+  }
+
+  Future<void> _confirmSenderSas() async {
+    final sessionId = _senderSessionId ?? '';
+    final claimId = _claimId ?? '';
+    if (sessionId.isEmpty || claimId.isEmpty) {
+      setState(() {
+        _sendStatus = 'Claim a session first.';
+      });
+      return;
+    }
+    if (_senderSasConfirming) {
+      return;
+    }
+    setState(() {
+      _senderSasConfirming = true;
+      _sendStatus = 'Confirming SAS...';
+    });
+    try {
+      final ok = await _commitSas(
+        sessionId: sessionId,
+        claimId: claimId,
+        role: 'sender',
+      );
+      if (!ok) {
+        setState(() {
+          _sendStatus = 'Failed to confirm SAS.';
+        });
+        return;
+      }
+      setState(() {
+        _senderSasConfirmed = true;
+        _sendStatus = 'SAS confirmed. Awaiting approval...';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _senderSasConfirming = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _updateSenderSasCode() async {
+    if (_senderSasCode != null) {
+      return;
+    }
+    final sessionId = _senderSessionId ?? '';
+    final claimId = _claimId ?? '';
+    final receiverPubKeyB64 = _senderReceiverPubKeyB64 ?? '';
+    final senderPubKeyB64 = _senderPubKeyB64 ?? '';
+    if (sessionId.isEmpty ||
+        claimId.isEmpty ||
+        receiverPubKeyB64.isEmpty ||
+        senderPubKeyB64.isEmpty) {
+      return;
+    }
+    final sas = await deriveSasDigits(
+      sessionId: sessionId,
+      claimId: claimId,
+      receiverPubKeyB64: receiverPubKeyB64,
+      senderPubKeyB64: senderPubKeyB64,
+    );
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _senderSasCode = sas;
+    });
   }
 
   Future<bool?> _promptScanChoice() {
@@ -441,6 +852,17 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
+    if (_preferDirect) {
+      await _maybeShowDirectDisclosure();
+    }
+    final p2pToken = _p2pTokensByClaim[claim.claimId] ?? transferToken;
+    final p2pContext = _buildP2PContext(
+      sessionId: sessionId,
+      claimId: claim.claimId,
+      token: p2pToken,
+      isInitiator: false,
+    );
+
     setState(() {
       _manifestStatus = 'Downloading manifest...';
     });
@@ -462,6 +884,7 @@ class _HomeScreenState extends State<HomeScreen> {
         senderPublicKey: senderPublicKey,
         receiverKeyPair: _receiverKeyPair!,
         sendReceipt: false,
+        p2pContext: p2pContext,
       );
       if (result == null) {
         setState(() {
@@ -631,6 +1054,11 @@ class _HomeScreenState extends State<HomeScreen> {
         return;
       }
 
+      await _keyStore.saveKeyPair(
+        sessionId: sessionId,
+        role: KeyRole.sender,
+        keyPair: keyPair,
+      );
       final payload = jsonDecode(response.body) as Map<String, dynamic>;
       final claimId = payload['claim_id']?.toString();
       final status = payload['status']?.toString() ?? 'pending';
@@ -639,7 +1067,15 @@ class _HomeScreenState extends State<HomeScreen> {
         _claimStatus = status;
         _sendStatus = 'Claimed. Polling for approval...';
         _senderKeyPair = keyPair;
+        _senderPubKeyB64 = pubKeyB64;
         _senderSessionId = sessionId;
+        _senderReceiverPubKeyB64 = null;
+        _senderTransferToken = null;
+        _senderP2PToken = null;
+        _senderSasCode = null;
+        _senderSasState = 'pending';
+        _senderSasConfirmed = false;
+        _senderSasConfirming = false;
       });
       _startPolling(sessionId, claimToken);
     } catch (err) {
@@ -667,16 +1103,19 @@ class _HomeScreenState extends State<HomeScreen> {
       if (bytes == null) {
         continue;
       }
+      final id = _randomId();
+      final localPath = await _cacheUploadPayload(id, bytes);
       final mimeType = lookupMimeType(file.name, headerBytes: bytes) ??
           'application/octet-stream';
       files.add(
         TransferFile(
-          id: _randomId(),
+          id: id,
           name: file.name,
           bytes: bytes,
           payloadKind: payloadKindFile,
           mimeType: mimeType,
           packagingMode: packagingModeOriginals,
+          localPath: localPath,
         ),
       );
     }
@@ -708,17 +1147,20 @@ class _HomeScreenState extends State<HomeScreen> {
       if (bytes == null) {
         continue;
       }
+      final id = _randomId();
+      final localPath = await _cacheUploadPayload(id, bytes);
       final name = file.name.isNotEmpty ? file.name : 'media';
       final mimeType = lookupMimeType(name, headerBytes: bytes) ??
           'application/octet-stream';
       files.add(
         TransferFile(
-          id: _randomId(),
+          id: id,
           name: name,
           bytes: bytes,
           payloadKind: payloadKindFile,
           mimeType: mimeType,
           packagingMode: packagingModeOriginals,
+          localPath: localPath,
         ),
       );
     }
@@ -733,6 +1175,16 @@ class _HomeScreenState extends State<HomeScreen> {
         ..clear()
         ..addAll(files);
     });
+  }
+
+  Future<String?> _cacheUploadPayload(String id, Uint8List bytes) async {
+    final dir = await getApplicationSupportDirectory();
+    final uploadDir = Directory(p.join(dir.path, 'upload_cache'));
+    await uploadDir.create(recursive: true);
+    final path = p.join(uploadDir.path, id);
+    final file = File(path);
+    await file.writeAsBytes(bytes, flush: true);
+    return path;
   }
 
   Future<void> _startQueue() async {
@@ -751,6 +1203,9 @@ class _HomeScreenState extends State<HomeScreen> {
       });
       return;
     }
+    if (_preferDirect) {
+      await _maybeShowDirectDisclosure();
+    }
     _ensureCoordinator();
     final coordinator = _coordinator;
     if (coordinator == null) {
@@ -759,6 +1214,13 @@ class _HomeScreenState extends State<HomeScreen> {
       });
       return;
     }
+    final p2pToken = _senderP2PToken ?? _senderTransferToken ?? '';
+    final p2pContext = _buildP2PContext(
+      sessionId: _senderSessionId!,
+      claimId: _claimId ?? '',
+      token: p2pToken,
+      isInitiator: true,
+    );
     if (_packagingMode == packagingModeOriginals) {
       coordinator.enqueueUploads(
         files: _selectedFiles,
@@ -767,7 +1229,8 @@ class _HomeScreenState extends State<HomeScreen> {
         receiverPublicKey: publicKeyFromBase64(_senderReceiverPubKeyB64!),
         senderKeyPair: _senderKeyPair!,
         chunkSize: 64 * 1024,
-      scanRequired: _scanRequired,
+        scanRequired: _scanRequired,
+        p2pContext: p2pContext,
       );
       setState(() {
         _sendStatus = 'Queue started.';
@@ -788,8 +1251,10 @@ class _HomeScreenState extends State<HomeScreen> {
       final payloadKind = _packagingMode == packagingModeAlbum
           ? payloadKindAlbum
           : payloadKindZip;
+      final id = _randomId();
+      final localPath = await _cacheUploadPayload(id, package.bytes);
       final transferFile = TransferFile(
-        id: _randomId(),
+        id: id,
         name: package.outputName,
         bytes: package.bytes,
         payloadKind: payloadKind,
@@ -797,6 +1262,7 @@ class _HomeScreenState extends State<HomeScreen> {
         packagingMode: _packagingMode,
         packageTitle: packageTitle,
         entries: package.entries,
+        localPath: localPath,
       );
       coordinator.enqueueUploads(
         files: [transferFile],
@@ -806,6 +1272,7 @@ class _HomeScreenState extends State<HomeScreen> {
         senderKeyPair: _senderKeyPair!,
         chunkSize: 64 * 1024,
         scanRequired: _scanRequired,
+        p2pContext: p2pContext,
       );
       setState(() {
         _sendStatus = 'Package queued.';
@@ -850,6 +1317,9 @@ class _HomeScreenState extends State<HomeScreen> {
       });
       return;
     }
+    if (_preferDirect) {
+      await _maybeShowDirectDisclosure();
+    }
 
     _ensureCoordinator();
     final coordinator = _coordinator;
@@ -860,18 +1330,29 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
+    final textBytes = Uint8List.fromList(utf8.encode(text));
+    final id = _randomId();
+    final localPath = await _cacheUploadPayload(id, textBytes);
     final payload = TransferFile(
-      id: _randomId(),
+      id: id,
       name: _textTitleController.text.trim().isEmpty
           ? 'Text'
           : _textTitleController.text.trim(),
-      bytes: Uint8List.fromList(utf8.encode(text)),
+      bytes: textBytes,
       payloadKind: payloadKindText,
       mimeType: textMimePlain,
       packagingMode: packagingModeOriginals,
       textTitle: _textTitleController.text.trim().isEmpty
           ? null
           : _textTitleController.text.trim(),
+      localPath: localPath,
+    );
+    final p2pToken = _senderP2PToken ?? _senderTransferToken ?? '';
+    final p2pContext = _buildP2PContext(
+      sessionId: _senderSessionId!,
+      claimId: _claimId ?? '',
+      token: p2pToken,
+      isInitiator: true,
     );
 
     coordinator.enqueueUploads(
@@ -882,6 +1363,7 @@ class _HomeScreenState extends State<HomeScreen> {
       senderKeyPair: _senderKeyPair!,
       chunkSize: 16 * 1024,
       scanRequired: _scanRequired,
+      p2pContext: p2pContext,
     );
     setState(() {
       _sendStatus = 'Sending text...';
@@ -1151,9 +1633,11 @@ class _HomeScreenState extends State<HomeScreen> {
       final payload = jsonDecode(response.body) as Map<String, dynamic>;
       final status = payload['status']?.toString() ?? 'pending';
       final transferToken = payload['transfer_token']?.toString();
+      final p2pToken = payload['p2p_token']?.toString();
       final receiverPubKey = payload['receiver_pubkey_b64']?.toString();
       final scanRequired = payload['scan_required'] == true;
       final scanStatus = payload['scan_status']?.toString() ?? '';
+      final sasState = payload['sas_state']?.toString() ?? 'pending';
       setState(() {
         _claimStatus = status;
         _sendStatus = 'Status: $status';
@@ -1163,9 +1647,17 @@ class _HomeScreenState extends State<HomeScreen> {
         if (transferToken != null && transferToken.isNotEmpty) {
           _senderTransferToken = transferToken;
         }
+        if (p2pToken != null && p2pToken.isNotEmpty) {
+          _senderP2PToken = p2pToken;
+        }
         _scanRequired = scanRequired;
         _scanStatus = scanStatus;
+        _senderSasState = sasState;
+        if (sasState == 'sender_confirmed' || sasState == 'verified') {
+          _senderSasConfirmed = true;
+        }
       });
+      await _updateSenderSasCode();
 
       if (status == 'pending') {
         _pollTimer = Timer(const Duration(seconds: 2), () {
@@ -1199,6 +1691,25 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
             const SizedBox(height: 16),
+            const Text(
+              'P2P settings',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Prefer direct'),
+              subtitle: const Text('Use WebRTC when available'),
+              value: _preferDirect,
+              onChanged: (value) => _setPreferDirect(value),
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Always relay'),
+              subtitle: const Text('Force TURN relay (no direct IP exposure)'),
+              value: _alwaysRelay,
+              onChanged: _preferDirect ? (value) => _setAlwaysRelay(value) : null,
+            ),
+            const SizedBox(height: 8),
             ElevatedButton(
               onPressed: _loading ? null : _pingBackend,
               child: Text(_loading ? 'Pinging...' : 'Ping Backend'),
@@ -1238,6 +1749,12 @@ class _HomeScreenState extends State<HomeScreen> {
               const SizedBox(height: 8),
               ..._pendingClaims.map((claim) {
                 final trusted = _trustedFingerprints.contains(claim.shortFingerprint);
+                final sasCode = _receiverSasByClaim[claim.claimId] ?? '';
+                final sasState = claim.sasState;
+                final receiverConfirmed =
+                    sasState == 'receiver_confirmed' || sasState == 'verified';
+                final sasVerified = sasState == 'verified';
+                final sasConfirming = _receiverSasConfirming.contains(claim.claimId);
                 return Card(
                   margin: const EdgeInsets.symmetric(vertical: 6),
                   child: Padding(
@@ -1252,6 +1769,21 @@ class _HomeScreenState extends State<HomeScreen> {
                           Text('Transfer ID: ${claim.transferId}'),
                         if (claim.scanRequired)
                           Text('Scan status: ${claim.scanStatus.isEmpty ? 'pending' : claim.scanStatus}'),
+                        if (sasCode.isNotEmpty) Text('SAS: $sasCode'),
+                        Text('SAS state: ${sasState.isEmpty ? 'pending' : sasState}'),
+                        const SizedBox(height: 4),
+                        ElevatedButton(
+                          onPressed: sasCode.isEmpty || receiverConfirmed || sasConfirming
+                              ? null
+                              : () => _confirmReceiverSas(claim),
+                          child: Text(
+                            sasConfirming
+                                ? 'Confirming...'
+                                : receiverConfirmed
+                                    ? 'SAS confirmed'
+                                    : 'Confirm SAS',
+                          ),
+                        ),
                         if (trusted)
                           const Padding(
                             padding: EdgeInsets.only(top: 4),
@@ -1272,7 +1804,8 @@ class _HomeScreenState extends State<HomeScreen> {
                         Row(
                           children: [
                             ElevatedButton(
-                              onPressed: () => _respondToClaim(claim, true),
+                              onPressed:
+                                  sasVerified ? () => _respondToClaim(claim, true) : null,
                               child: const Text('Approve'),
                             ),
                             const SizedBox(width: 8),
@@ -1357,7 +1890,9 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                   const SizedBox(width: 8),
                   ElevatedButton(
-                    onPressed: _senderTransferToken == null ? null : _sendText,
+                    onPressed: _senderTransferToken == null || !_senderSasConfirmed
+                        ? null
+                        : _sendText,
                     child: const Text('Send Text'),
                   ),
                 ],
@@ -1405,6 +1940,25 @@ class _HomeScreenState extends State<HomeScreen> {
             if (_claimId != null) Text('Claim ID: $_claimId'),
             if (_claimStatus != null) Text('Claim status: $_claimStatus'),
             if (_scanRequired) Text('Scan required (${_scanStatus.isEmpty ? 'pending' : _scanStatus})'),
+            if (_claimId != null) ...[
+              Text('SAS: ${_senderSasCode ?? 'waiting for keys'}'),
+              Text('SAS state: $_senderSasState'),
+              const SizedBox(height: 4),
+              ElevatedButton(
+                onPressed: _senderSasCode == null ||
+                        _senderSasConfirmed ||
+                        _senderSasConfirming
+                    ? null
+                    : _confirmSenderSas,
+                child: Text(
+                  _senderSasConfirming
+                      ? 'Confirming...'
+                      : _senderSasConfirmed
+                          ? 'SAS confirmed'
+                          : 'Confirm SAS',
+                ),
+              ),
+            ],
             const SizedBox(height: 12),
             Row(
               children: [
@@ -1447,7 +2001,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
                 const SizedBox(width: 8),
                 ElevatedButton(
-                  onPressed: _senderTransferToken == null ? null : _startQueue,
+                  onPressed: _senderTransferToken == null || !_senderSasConfirmed
+                      ? null
+                      : _startQueue,
                   child: const Text('Start Queue'),
                 ),
                 const SizedBox(width: 8),
@@ -1630,26 +2186,32 @@ class PendingClaim {
     required this.claimId,
     required this.senderLabel,
     required this.shortFingerprint,
+    required this.senderPubKeyB64,
     required this.transferId,
     required this.scanRequired,
     required this.scanStatus,
+    required this.sasState,
   });
 
   final String claimId;
   final String senderLabel;
   final String shortFingerprint;
+  final String senderPubKeyB64;
   final String transferId;
   final bool scanRequired;
   final String scanStatus;
+  final String sasState;
 
   factory PendingClaim.fromJson(Map<String, dynamic> json) {
     return PendingClaim(
       claimId: json['claim_id']?.toString() ?? '',
       senderLabel: json['sender_label']?.toString() ?? '',
       shortFingerprint: json['short_fingerprint']?.toString() ?? '',
+      senderPubKeyB64: json['sender_pubkey_b64']?.toString() ?? '',
       transferId: json['transfer_id']?.toString() ?? '',
       scanRequired: json['scan_required'] == true,
       scanStatus: json['scan_status']?.toString() ?? '',
+      sasState: json['sas_state']?.toString() ?? 'pending',
     );
   }
 }

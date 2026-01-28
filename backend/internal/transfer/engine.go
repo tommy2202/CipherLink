@@ -51,6 +51,7 @@ func (e *Engine) CreateTransferWithID(ctx context.Context, transferID string, ma
 	meta := domain.TransferMeta{
 		Status:        domain.TransferStatusActive,
 		BytesReceived: 0,
+		TotalBytes:    totalBytes,
 		CreatedAt:     time.Now().UTC(),
 		ExpiresAt:     expiresAt.UTC(),
 		ScanStatus:    domain.ScanStatusNotRequired,

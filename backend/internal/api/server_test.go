@@ -86,6 +86,411 @@ func TestRateLimitTriggers(t *testing.T) {
 	}
 }
 
+func TestQuotaBlocksExtraTransfers(t *testing.T) {
+	store := &stubStorage{}
+	server := NewServer(Dependencies{
+		Config: config.Config{
+			Address:                     ":0",
+			DataDir:                     "data",
+			RateLimitHealth:             config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:                 config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitSessionClaim:       config.RateLimit{Max: 100, Window: time.Minute},
+			ClaimTokenTTL:               config.DefaultClaimTokenTTL,
+			TransferTokenTTL:            config.DefaultTransferTokenTTL,
+			MaxScanBytes:                config.DefaultMaxScanBytes,
+			MaxScanDuration:             config.DefaultMaxScanDuration,
+			QuotaTransfersPerDaySession: 1,
+		},
+		Store:   store,
+		Tokens:  token.NewMemoryService(),
+		Scanner: scanner.UnavailableScanner{},
+	})
+
+	createResp := createSession(t, server)
+	senderPubKey := base64.StdEncoding.EncodeToString([]byte("pubkey"))
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: senderPubKey,
+	})
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+
+	initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                4,
+	})
+
+	rec := initTransferRecorder(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest2")),
+		TotalBytes:                4,
+	})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rec.Code)
+	}
+}
+
+func TestUploadThrottleDelaysResponse(t *testing.T) {
+	store := &stubStorage{}
+	server := NewServer(Dependencies{
+		Config: config.Config{
+			Address:                 ":0",
+			DataDir:                 "data",
+			RateLimitHealth:         config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:             config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitSessionClaim:   config.RateLimit{Max: 100, Window: time.Minute},
+			ClaimTokenTTL:           config.DefaultClaimTokenTTL,
+			TransferTokenTTL:        config.DefaultTransferTokenTTL,
+			MaxScanBytes:            config.DefaultMaxScanBytes,
+			MaxScanDuration:         config.DefaultMaxScanDuration,
+			TransferBandwidthCapBps: 50,
+		},
+		Store:   store,
+		Tokens:  token.NewMemoryService(),
+		Scanner: scanner.UnavailableScanner{},
+	})
+
+	createResp := createSession(t, server)
+	senderPubKey := base64.StdEncoding.EncodeToString([]byte("pubkey"))
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: senderPubKey,
+	})
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	initResp := initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                10,
+	})
+
+	data := bytes.Repeat([]byte("a"), 10)
+	req := httptest.NewRequest(http.MethodPut, "/v1/transfer/chunk", bytes.NewBuffer(data))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Authorization", "Bearer "+approveResp.TransferToken)
+	req.Header.Set("session_id", createResp.SessionID)
+	req.Header.Set("transfer_id", initResp.TransferID)
+	req.Header.Set("offset", "0")
+	rec := httptest.NewRecorder()
+	start := time.Now()
+	server.Router.ServeHTTP(rec, req)
+	elapsed := time.Since(start)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected chunk 200 got %d", rec.Code)
+	}
+	if elapsed < 150*time.Millisecond {
+		t.Fatalf("expected throttle delay, got %v", elapsed)
+	}
+}
+
+func TestRelayQuotaBlocksExtraIssuance(t *testing.T) {
+	store := &stubStorage{}
+	server := NewServer(Dependencies{
+		Config: config.Config{
+			Address:                ":0",
+			DataDir:                "data",
+			RateLimitHealth:        config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:            config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitSessionClaim:  config.RateLimit{Max: 100, Window: time.Minute},
+			ClaimTokenTTL:          config.DefaultClaimTokenTTL,
+			TransferTokenTTL:       config.DefaultTransferTokenTTL,
+			MaxScanBytes:           config.DefaultMaxScanBytes,
+			MaxScanDuration:        config.DefaultMaxScanDuration,
+			TURNURLs:               []string{"turn:relay.example"},
+			TURNSharedSecret:       []byte("secret"),
+			RelayPerIdentityPerDay: 1,
+		},
+		Store:   store,
+		Tokens:  token.NewMemoryService(),
+		Scanner: scanner.UnavailableScanner{},
+	})
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	tokenValue := approveResp.P2PToken
+	if tokenValue == "" {
+		tokenValue = approveResp.TransferToken
+	}
+
+	first := p2pIceConfigRecorder(t, server, tokenValue, createResp.SessionID, claimResp.ClaimID, "relay")
+	if first.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d", first.Code)
+	}
+	second := p2pIceConfigRecorder(t, server, tokenValue, createResp.SessionID, claimResp.ClaimID, "relay")
+	if second.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", second.Code)
+	}
+}
+
+func TestCreateSessionRequiresReceiverPubKey(t *testing.T) {
+	server := newSessionTestServer(&stubStorage{})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/create", nil)
+	server.Router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected create 400 got %d", rec.Code)
+	}
+	var payload map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	if payload["error"] != "invalid_request" {
+		t.Fatalf("expected invalid_request error")
+	}
+}
+
+func TestCreateSessionRejectsInvalidReceiverPubKey(t *testing.T) {
+	server := newSessionTestServer(&stubStorage{})
+
+	tests := []struct {
+		name              string
+		receiverPubKeyB64 string
+	}{
+		{
+			name:              "malformed_base64",
+			receiverPubKeyB64: "not*base64",
+		},
+		{
+			name:              "wrong_length",
+			receiverPubKeyB64: base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x01}, 31)),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := json.Marshal(sessionCreateRequest{ReceiverPubKeyB64: tc.receiverPubKeyB64})
+			if err != nil {
+				t.Fatalf("marshal create request: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/session/create", bytes.NewBuffer(payload))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			server.Router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected create 400 got %d", rec.Code)
+			}
+			var body map[string]string
+			if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+				t.Fatalf("decode create response: %v", err)
+			}
+			if body["error"] != "invalid_request" {
+				t.Fatalf("expected invalid_request error")
+			}
+		})
+	}
+}
+
+func TestApproveRequiresSAS(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	senderPubKey := base64.StdEncoding.EncodeToString([]byte("pubkey"))
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: senderPubKey,
+	})
+
+	rec := approveSessionRecorder(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected approve 409 got %d", rec.Code)
+	}
+	var payload map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode approve response: %v", err)
+	}
+	if payload["error"] != "sas_required" {
+		t.Fatalf("expected sas_required error")
+	}
+}
+
+func TestApproveSucceedsAfterSASConfirmed(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	senderPubKey := base64.StdEncoding.EncodeToString([]byte("pubkey"))
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: senderPubKey,
+	})
+
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
+
+	rec := approveSessionRecorder(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected approve 200 got %d", rec.Code)
+	}
+	var resp sessionApproveResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode approve response: %v", err)
+	}
+	if resp.TransferToken == "" {
+		t.Fatalf("expected transfer token")
+	}
+}
+
+func TestP2PSignalingRejectsWithoutSAS(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	senderPubKey := base64.StdEncoding.EncodeToString([]byte("pubkey"))
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: senderPubKey,
+	})
+
+	session, err := store.GetSession(context.Background(), createResp.SessionID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	for i, claim := range session.Claims {
+		if claim.ID != claimResp.ClaimID {
+			continue
+		}
+		claim.Status = domain.SessionClaimApproved
+		claim.UpdatedAt = time.Now().UTC()
+		session.Claims[i] = claim
+	}
+	if err := store.UpdateSession(context.Background(), session); err != nil {
+		t.Fatalf("update session: %v", err)
+	}
+	if err := store.SaveSessionAuthContext(context.Background(), domain.SessionAuthContext{
+		SessionID:         session.ID,
+		ClaimID:           claimResp.ClaimID,
+		SenderPubKeyB64:   senderPubKey,
+		ReceiverPubKeyB64: session.ReceiverPubKeyB64,
+		ApprovedAt:        time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("save auth: %v", err)
+	}
+	tokenValue, err := server.tokens.Issue(context.Background(), p2pScope(session.ID, claimResp.ClaimID), time.Minute)
+	if err != nil {
+		t.Fatalf("issue token: %v", err)
+	}
+
+	rec := p2pOfferRecorder(t, server, tokenValue, p2pOfferRequest{
+		SessionID: session.ID,
+		ClaimID:   claimResp.ClaimID,
+		SDP:       "v=0",
+	})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rec.Code)
+	}
+}
+
+func TestP2PSignalingRejectsWithoutAuth(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
+
+	approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+
+	rec := p2pOfferRecorder(t, server, "", p2pOfferRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		SDP:       "v=0",
+	})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rec.Code)
+	}
+}
+
+func TestP2PIceConfigRelayRequiresTurn(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
+
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+
+	rec := p2pIceConfigRecorder(t, server, approveResp.TransferToken, createResp.SessionID, claimResp.ClaimID, "relay")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 got %d", rec.Code)
+	}
+	var payload map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload["error"] != "turn_unavailable" {
+		t.Fatalf("expected turn_unavailable")
+	}
+}
+
 func TestIndistinguishableErrors(t *testing.T) {
 	store := &stubStorage{}
 	tokens := token.NewMemoryService()
@@ -401,6 +806,85 @@ func TestRangeResumeWorks(t *testing.T) {
 	}
 }
 
+func TestDownloadRangeContentRangeHeader(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	if approveResp.TransferToken == "" {
+		t.Fatalf("expected transfer token")
+	}
+
+	initResp := initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                8,
+	})
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("abcd"))
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 4, []byte("efgh"))
+	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+
+	rec := downloadRangeRecorder(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, 3)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("expected 206 got %d", rec.Code)
+	}
+	if rec.Header().Get("Content-Range") != "bytes 0-3/8" {
+		t.Fatalf("unexpected content range: %s", rec.Header().Get("Content-Range"))
+	}
+	if rec.Header().Get("Content-Length") != "4" {
+		t.Fatalf("unexpected content length: %s", rec.Header().Get("Content-Length"))
+	}
+}
+
+func TestChunkRetryIdempotent(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	if approveResp.TransferToken == "" {
+		t.Fatalf("expected transfer token")
+	}
+
+	initResp := initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                4,
+	})
+
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("data"))
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("data"))
+	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+
+	downloaded := downloadRange(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, 3)
+	if string(downloaded) != "data" {
+		t.Fatalf("expected data after retry")
+	}
+}
+
 func TestReceiptDeletesTransferArtifacts(t *testing.T) {
 	store := &stubStorage{}
 	server := newSessionTestServer(store)
@@ -673,7 +1157,13 @@ func newSessionTestServer(store *stubStorage) *Server {
 func createSession(t *testing.T, server *Server) sessionCreateResponse {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/session/create", nil)
+	receiverPubKeyB64 := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x01}, 32))
+	requestBody, err := json.Marshal(sessionCreateRequest{ReceiverPubKeyB64: receiverPubKeyB64})
+	if err != nil {
+		t.Fatalf("marshal create request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/create", bytes.NewBuffer(requestBody))
+	req.Header.Set("Content-Type", "application/json")
 	server.Router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected create 200 got %d", rec.Code)
@@ -711,7 +1201,27 @@ func claimSessionSuccess(t *testing.T, server *Server, reqBody sessionClaimReque
 	return payload
 }
 
-func approveSession(t *testing.T, server *Server, reqBody sessionApproveRequest) sessionApproveResponse {
+func commitSAS(t *testing.T, server *Server, sessionID string, claimID string, role string) {
+	t.Helper()
+	payload, err := json.Marshal(sessionSASCommitRequest{
+		SessionID:    sessionID,
+		ClaimID:      claimID,
+		Role:         role,
+		SASConfirmed: true,
+	})
+	if err != nil {
+		t.Fatalf("marshal sas commit request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/sas/commit", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected sas commit 200 got %d", rec.Code)
+	}
+}
+
+func approveSessionRecorder(t *testing.T, server *Server, reqBody sessionApproveRequest) *httptest.ResponseRecorder {
 	t.Helper()
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
@@ -721,6 +1231,16 @@ func approveSession(t *testing.T, server *Server, reqBody sessionApproveRequest)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	server.Router.ServeHTTP(rec, req)
+	return rec
+}
+
+func approveSession(t *testing.T, server *Server, reqBody sessionApproveRequest) sessionApproveResponse {
+	t.Helper()
+	if reqBody.Approve {
+		commitSAS(t, server, reqBody.SessionID, reqBody.ClaimID, "sender")
+		commitSAS(t, server, reqBody.SessionID, reqBody.ClaimID, "receiver")
+	}
+	rec := approveSessionRecorder(t, server, reqBody)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected approve 200 got %d", rec.Code)
 	}
@@ -872,6 +1392,15 @@ func finalizeTransfer(t *testing.T, server *Server, sessionID string, transferID
 
 func downloadRange(t *testing.T, server *Server, sessionID string, transferID string, token string, start int64, end int64) []byte {
 	t.Helper()
+	rec := downloadRangeRecorder(t, server, sessionID, transferID, token, start, end)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("expected 206 got %d", rec.Code)
+	}
+	return rec.Body.Bytes()
+}
+
+func downloadRangeRecorder(t *testing.T, server *Server, sessionID string, transferID string, token string, start int64, end int64) *httptest.ResponseRecorder {
+	t.Helper()
 	req := httptest.NewRequest(
 		http.MethodGet,
 		"/v1/transfer/download?session_id="+sessionID+"&transfer_id="+transferID,
@@ -881,10 +1410,7 @@ func downloadRange(t *testing.T, server *Server, sessionID string, transferID st
 	req.Header.Set("Range", "bytes="+strconv.FormatInt(start, 10)+"-"+strconv.FormatInt(end, 10))
 	rec := httptest.NewRecorder()
 	server.Router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusPartialContent {
-		t.Fatalf("expected 206 got %d", rec.Code)
-	}
-	return rec.Body.Bytes()
+	return rec
 }
 
 func receiptTransfer(t *testing.T, server *Server, reqBody transferReceiptRequest) {
@@ -915,6 +1441,37 @@ func manifestRequestRecorder(t *testing.T, server *Server, sessionID string, tra
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/v1/transfer/manifest?session_id="+sessionID+"&transfer_id="+transferID, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	return rec
+}
+
+func p2pOfferRecorder(t *testing.T, server *Server, token string, reqBody p2pOfferRequest) *httptest.ResponseRecorder {
+	t.Helper()
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		t.Fatalf("marshal p2p offer: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/p2p/offer", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	return rec
+}
+
+func p2pIceConfigRecorder(t *testing.T, server *Server, token string, sessionID string, claimID string, mode string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/v1/p2p/ice_config?session_id="+sessionID+"&claim_id="+claimID+"&mode="+mode,
+		nil,
+	)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	rec := httptest.NewRecorder()
 	server.Router.ServeHTTP(rec, req)
 	return rec

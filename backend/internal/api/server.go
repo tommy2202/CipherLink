@@ -30,15 +30,18 @@ type Dependencies struct {
 }
 
 type Server struct {
-	cfg          config.Config
-	store        storage.Storage
-	tokens       token.TokenService
-	logger       *log.Logger
-	version      string
-	rateLimiters map[string]*ratelimit.Limiter
-	transfers    *transfer.Engine
-	scanner      scanner.Scanner
-	Router       http.Handler
+	cfg            config.Config
+	store          storage.Storage
+	tokens         token.TokenService
+	logger         *log.Logger
+	version        string
+	rateLimiters   map[string]*ratelimit.Limiter
+	transfers      *transfer.Engine
+	scanner        scanner.Scanner
+	quotas         *quotaTracker
+	throttles      *throttleManager
+	downloadTokens *downloadTokenStore
+	Router         http.Handler
 }
 
 func NewServer(deps Dependencies) *Server {
@@ -72,14 +75,17 @@ func NewServer(deps Dependencies) *Server {
 	}
 
 	server := &Server{
-		cfg:          deps.Config,
-		store:        deps.Store,
-		tokens:       tokenService,
-		logger:       logSink,
-		version:      version,
-		rateLimiters: rateLimiters,
-		transfers:    transfer.New(deps.Store),
-		scanner:      scanService,
+		cfg:            deps.Config,
+		store:          deps.Store,
+		tokens:         tokenService,
+		logger:         logSink,
+		version:        version,
+		rateLimiters:   rateLimiters,
+		transfers:      transfer.New(deps.Store),
+		scanner:        scanService,
+		quotas:         newQuotaTracker(),
+		throttles:      newThrottleManager(deps.Config.TransferBandwidthCapBps, deps.Config.GlobalBandwidthCapBps),
+		downloadTokens: newDownloadTokenStore(),
 	}
 
 	server.Router = server.routes()
@@ -103,12 +109,22 @@ func (s *Server) routes() http.Handler {
 		r.Get("/ping", s.handlePing)
 		r.With(s.rateLimit("session-claim")).Post("/session/claim", s.handleClaimSession)
 		r.Post("/session/approve", s.handleApproveSession)
+		r.Post("/session/sas/commit", s.handleCommitSAS)
+		r.Get("/session/sas/status", s.handleSASStatus)
 		r.Get("/session/poll", s.handlePollSession)
 		r.Post("/session/create", s.handleCreateSession)
+		r.Route("/p2p", func(r chi.Router) {
+			r.Post("/offer", s.handleP2POffer)
+			r.Post("/answer", s.handleP2PAnswer)
+			r.Post("/ice", s.handleP2PICE)
+			r.Get("/poll", s.handleP2PPoll)
+			r.Get("/ice_config", s.handleP2PIceConfig)
+		})
 		r.Post("/transfer/init", s.handleInitTransfer)
 		r.Put("/transfer/chunk", s.handleUploadChunk)
 		r.Post("/transfer/finalize", s.handleFinalizeTransfer)
 		r.Get("/transfer/manifest", s.handleGetTransferManifest)
+		r.Post("/transfer/download_token", s.handleDownloadToken)
 		r.Get("/transfer/download", s.handleDownloadTransfer)
 		r.Post("/transfer/receipt", s.handleTransferReceipt)
 		r.Post("/transfer/scan_init", s.handleScanInit)

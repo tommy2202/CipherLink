@@ -263,6 +263,22 @@ String publicKeyToBase64(SimplePublicKey key) {
   return base64Encode(key.bytes);
 }
 
+Future<String> deriveSasDigits({
+  required String sessionId,
+  required String claimId,
+  required String receiverPubKeyB64,
+  required String senderPubKeyB64,
+}) async {
+  final transcript =
+      'session_id=$sessionId|claim_id=$claimId|receiver_pubkey=$receiverPubKeyB64|sender_pubkey=$senderPubKeyB64';
+  final hash = await Sha256().hash(_utf8(transcript));
+  final bytes = hash.bytes;
+  final value =
+      (bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3];
+  final code = value % 1000000;
+  return code.toString().padLeft(6, '0');
+}
+
 Uint8List _aad(String sessionId, String transferId, int chunkIndex) {
   final value =
       'session_id=$sessionId|transfer_id=$transferId|chunk_index=$chunkIndex|direction=$_direction';

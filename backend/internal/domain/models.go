@@ -23,9 +23,16 @@ const (
 type TransferMeta struct {
 	Status        TransferStatus `json:"status"`
 	BytesReceived int64          `json:"bytes_received"`
+	TotalBytes    int64          `json:"total_bytes"`
 	CreatedAt     time.Time      `json:"created_at"`
 	ExpiresAt     time.Time      `json:"expires_at"`
 	ScanStatus    ScanStatus     `json:"scan_status"`
+}
+
+type P2PMessage struct {
+	Type      string `json:"type"`
+	SDP       string `json:"sdp,omitempty"`
+	Candidate string `json:"candidate,omitempty"`
 }
 
 type SessionClaimStatus string
@@ -37,16 +44,19 @@ const (
 )
 
 type SessionClaim struct {
-	ID              string             `json:"id"`
-	SenderLabel     string             `json:"sender_label"`
-	SenderPubKeyB64 string             `json:"sender_pubkey_b64"`
-	Status          SessionClaimStatus `json:"status"`
-	CreatedAt       time.Time          `json:"created_at"`
-	UpdatedAt       time.Time          `json:"updated_at"`
-	TransferID      string             `json:"transfer_id,omitempty"`
-	TransferReady   bool               `json:"transfer_ready,omitempty"`
-	ScanRequired    bool               `json:"scan_required,omitempty"`
-	ScanStatus      ScanStatus         `json:"scan_status,omitempty"`
+	ID                   string             `json:"id"`
+	SenderLabel          string             `json:"sender_label"`
+	SenderPubKeyB64      string             `json:"sender_pubkey_b64"`
+	SASSenderConfirmed   bool               `json:"sas_sender_confirmed,omitempty"`
+	SASReceiverConfirmed bool               `json:"sas_receiver_confirmed,omitempty"`
+	Status               SessionClaimStatus `json:"status"`
+	CreatedAt            time.Time          `json:"created_at"`
+	UpdatedAt            time.Time          `json:"updated_at"`
+	TransferID           string             `json:"transfer_id,omitempty"`
+	TransferReady        bool               `json:"transfer_ready,omitempty"`
+	ScanRequired         bool               `json:"scan_required,omitempty"`
+	ScanStatus           ScanStatus         `json:"scan_status,omitempty"`
+	P2PMessages          []P2PMessage       `json:"p2p_messages,omitempty"`
 }
 
 type Session struct {
