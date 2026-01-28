@@ -26,6 +26,7 @@ Configuration (optional):
 
 - `UD_ADDRESS` (default `:8080`)
 - `UD_DATA_DIR` (default `data`)
+- `UD_TOKEN_HMAC_SECRET_B64` (optional; base64 raw URL without padding or standard, >= 32 bytes). Tokens are stateless HMAC-signed; if unset, the server uses `<UD_DATA_DIR>/secrets/token_hmac.key` and creates it on first start; keep this file to preserve tokens across restarts.
 - `UD_RATE_LIMIT_HEALTH_MAX` (default `60`)
 - `UD_RATE_LIMIT_HEALTH_WINDOW` (default `1m`)
 - `UD_RATE_LIMIT_V1_MAX` (default `30`)
