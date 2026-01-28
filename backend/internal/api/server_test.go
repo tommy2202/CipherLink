@@ -86,6 +86,65 @@ func TestRateLimitTriggers(t *testing.T) {
 	}
 }
 
+func TestCreateSessionRequiresReceiverPubKey(t *testing.T) {
+	server := newSessionTestServer(&stubStorage{})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/create", nil)
+	server.Router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected create 400 got %d", rec.Code)
+	}
+	var payload map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	if payload["error"] != "invalid_request" {
+		t.Fatalf("expected invalid_request error")
+	}
+}
+
+func TestCreateSessionRejectsInvalidReceiverPubKey(t *testing.T) {
+	server := newSessionTestServer(&stubStorage{})
+
+	tests := []struct {
+		name             string
+		receiverPubKeyB64 string
+	}{
+		{
+			name:             "malformed_base64",
+			receiverPubKeyB64: "not*base64",
+		},
+		{
+			name:             "wrong_length",
+			receiverPubKeyB64: base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x01}, 31)),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := json.Marshal(sessionCreateRequest{ReceiverPubKeyB64: tc.receiverPubKeyB64})
+			if err != nil {
+				t.Fatalf("marshal create request: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/session/create", bytes.NewBuffer(payload))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			server.Router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected create 400 got %d", rec.Code)
+			}
+			var body map[string]string
+			if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+				t.Fatalf("decode create response: %v", err)
+			}
+			if body["error"] != "invalid_request" {
+				t.Fatalf("expected invalid_request error")
+			}
+		})
+	}
+}
+
 func TestIndistinguishableErrors(t *testing.T) {
 	store := &stubStorage{}
 	tokens := token.NewMemoryService()
@@ -673,7 +732,13 @@ func newSessionTestServer(store *stubStorage) *Server {
 func createSession(t *testing.T, server *Server) sessionCreateResponse {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/session/create", nil)
+	receiverPubKeyB64 := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x01}, 32))
+	payload, err := json.Marshal(sessionCreateRequest{ReceiverPubKeyB64: receiverPubKeyB64})
+	if err != nil {
+		t.Fatalf("marshal create request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/create", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
 	server.Router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected create 200 got %d", rec.Code)

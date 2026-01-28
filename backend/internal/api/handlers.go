@@ -146,11 +146,13 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if req.ReceiverPubKeyB64 != "" {
-		if keyBytes, err := base64.StdEncoding.DecodeString(req.ReceiverPubKeyB64); err != nil || len(keyBytes) != 32 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
-			return
-		}
+	if req.ReceiverPubKeyB64 == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	if keyBytes, err := base64.StdEncoding.DecodeString(req.ReceiverPubKeyB64); err != nil || len(keyBytes) != 32 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
 	}
 
 	var session domain.Session
@@ -167,12 +169,6 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		receiverPubKey := req.ReceiverPubKeyB64
-		if receiverPubKey == "" {
-			receiverPubKey, err = randomBase64(32)
-			if err != nil {
-				break
-			}
-		}
 
 		now := time.Now().UTC()
 		expiresAt := now.Add(ttl)
