@@ -108,15 +108,15 @@ func TestCreateSessionRejectsInvalidReceiverPubKey(t *testing.T) {
 	server := newSessionTestServer(&stubStorage{})
 
 	tests := []struct {
-		name             string
+		name              string
 		receiverPubKeyB64 string
 	}{
 		{
-			name:             "malformed_base64",
+			name:              "malformed_base64",
 			receiverPubKeyB64: "not*base64",
 		},
 		{
-			name:             "wrong_length",
+			name:              "wrong_length",
 			receiverPubKeyB64: base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x01}, 31)),
 		},
 	}
@@ -142,6 +142,67 @@ func TestCreateSessionRejectsInvalidReceiverPubKey(t *testing.T) {
 				t.Fatalf("expected invalid_request error")
 			}
 		})
+	}
+}
+
+func TestApproveRequiresSAS(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+
+	rec := approveSessionRecorder(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected approve 409 got %d", rec.Code)
+	}
+	var payload map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode approve response: %v", err)
+	}
+	if payload["error"] != "sas_required" {
+		t.Fatalf("expected sas_required error")
+	}
+}
+
+func TestApproveSucceedsAfterSASConfirmed(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
+
+	rec := approveSessionRecorder(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected approve 200 got %d", rec.Code)
+	}
+	var resp sessionApproveResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode approve response: %v", err)
+	}
+	if resp.TransferToken == "" {
+		t.Fatalf("expected transfer token")
 	}
 }
 
@@ -776,7 +837,27 @@ func claimSessionSuccess(t *testing.T, server *Server, reqBody sessionClaimReque
 	return payload
 }
 
-func approveSession(t *testing.T, server *Server, reqBody sessionApproveRequest) sessionApproveResponse {
+func commitSAS(t *testing.T, server *Server, sessionID string, claimID string, role string) {
+	t.Helper()
+	payload, err := json.Marshal(sessionSASCommitRequest{
+		SessionID:    sessionID,
+		ClaimID:      claimID,
+		Role:         role,
+		SASConfirmed: true,
+	})
+	if err != nil {
+		t.Fatalf("marshal sas commit request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/sas/commit", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected sas commit 200 got %d", rec.Code)
+	}
+}
+
+func approveSessionRecorder(t *testing.T, server *Server, reqBody sessionApproveRequest) *httptest.ResponseRecorder {
 	t.Helper()
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
@@ -786,6 +867,16 @@ func approveSession(t *testing.T, server *Server, reqBody sessionApproveRequest)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	server.Router.ServeHTTP(rec, req)
+	return rec
+}
+
+func approveSession(t *testing.T, server *Server, reqBody sessionApproveRequest) sessionApproveResponse {
+	t.Helper()
+	if reqBody.Approve {
+		commitSAS(t, server, reqBody.SessionID, reqBody.ClaimID, "sender")
+		commitSAS(t, server, reqBody.SessionID, reqBody.ClaimID, "receiver")
+	}
+	rec := approveSessionRecorder(t, server, reqBody)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected approve 200 got %d", rec.Code)
 	}

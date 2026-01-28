@@ -103,6 +103,8 @@ func (s *Server) routes() http.Handler {
 		r.Get("/ping", s.handlePing)
 		r.With(s.rateLimit("session-claim")).Post("/session/claim", s.handleClaimSession)
 		r.Post("/session/approve", s.handleApproveSession)
+		r.Post("/session/sas/commit", s.handleCommitSAS)
+		r.Get("/session/sas/status", s.handleSASStatus)
 		r.Get("/session/poll", s.handlePollSession)
 		r.Post("/session/create", s.handleCreateSession)
 		r.Post("/transfer/init", s.handleInitTransfer)

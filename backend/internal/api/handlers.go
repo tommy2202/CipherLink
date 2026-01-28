@@ -45,9 +45,11 @@ type sessionPollClaimSummary struct {
 	ClaimID          string `json:"claim_id"`
 	SenderLabel      string `json:"sender_label"`
 	ShortFingerprint string `json:"short_fingerprint"`
+	SenderPubKeyB64  string `json:"sender_pubkey_b64,omitempty"`
 	TransferID       string `json:"transfer_id,omitempty"`
 	ScanRequired     bool   `json:"scan_required,omitempty"`
 	ScanStatus       string `json:"scan_status,omitempty"`
+	SASState         string `json:"sas_state"`
 }
 
 type sessionPollReceiverResponse struct {
@@ -80,6 +82,17 @@ type sessionApproveResponse struct {
 	Status          string `json:"status"`
 	TransferToken   string `json:"transfer_token,omitempty"`
 	SenderPubKeyB64 string `json:"sender_pubkey_b64,omitempty"`
+}
+
+type sessionSASCommitRequest struct {
+	SessionID    string `json:"session_id"`
+	ClaimID      string `json:"claim_id"`
+	Role         string `json:"role"`
+	SASConfirmed bool   `json:"sas_confirmed"`
+}
+
+type sessionSASStatusResponse struct {
+	SASState string `json:"sas_state"`
 }
 
 type transferInitRequest struct {
@@ -319,6 +332,10 @@ func (s *Server) handleApproveSession(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	claim := session.Claims[claimIndex]
+	if req.Approve && sasStateForClaim(claim) != "verified" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "sas_required"})
+		return
+	}
 	if req.Approve {
 		claim.Status = domain.SessionClaimApproved
 		claim.ScanRequired = req.ScanRequired
@@ -408,6 +425,7 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 		status := domain.SessionClaimPending
 		claimID := ""
 		transferToken := ""
+		sasState := "pending"
 		if len(session.Claims) > 0 {
 			claimID = session.Claims[0].ID
 			status = session.Claims[0].Status
@@ -421,6 +439,7 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 				if claim.ScanRequired {
 					scanStatus = string(claim.ScanStatus)
 				}
+				sasState = sasStateForClaim(claim)
 			}
 		}
 		if claimID != "" {
@@ -436,7 +455,7 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 			ExpiresAt:         session.ExpiresAt.Format(time.RFC3339),
 			ClaimID:           claimID,
 			Status:            string(status),
-			SASState:          "not_supported_yet",
+			SASState:          sasState,
 			ReceiverPubKeyB64: session.ReceiverPubKeyB64,
 			TransferToken:     transferToken,
 			ScanRequired:      scanRequired,
@@ -452,7 +471,9 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 				ClaimID:          claim.ID,
 				SenderLabel:      claim.SenderLabel,
 				ShortFingerprint: shortFingerprint(claim.SenderPubKeyB64),
+				SenderPubKeyB64:  claim.SenderPubKeyB64,
 				ScanRequired:     claim.ScanRequired,
+				SASState:         sasStateForClaim(claim),
 			}
 			if claim.ScanRequired {
 				summary.ScanStatus = string(claim.ScanStatus)
@@ -467,6 +488,7 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 				ShortFingerprint: shortFingerprint(claim.SenderPubKeyB64),
 				TransferID:       claim.TransferID,
 				ScanRequired:     claim.ScanRequired,
+				SASState:         sasStateForClaim(claim),
 			}
 			if claim.ScanRequired {
 				summary.ScanStatus = string(claim.ScanStatus)
@@ -479,8 +501,90 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 		SessionID: session.ID,
 		ExpiresAt: session.ExpiresAt.Format(time.RFC3339),
 		Claims:    claims,
-		SASState:  "not_supported_yet",
+		SASState:  sasStateForClaims(claims),
 	})
+}
+
+func (s *Server) handleCommitSAS(w http.ResponseWriter, r *http.Request) {
+	var req sessionSASCommitRequest
+	if err := decodeJSON(w, r, &req, 8<<10); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	if req.SessionID == "" || req.ClaimID == "" || !req.SASConfirmed {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	if req.Role != "sender" && req.Role != "receiver" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+
+	session, err := s.store.GetSession(r.Context(), req.SessionID)
+	if err != nil {
+		writeIndistinguishable(w)
+		return
+	}
+	if time.Now().UTC().After(session.ExpiresAt) {
+		writeIndistinguishable(w)
+		return
+	}
+
+	claimIndex := -1
+	for i, claim := range session.Claims {
+		if claim.ID == req.ClaimID {
+			claimIndex = i
+			break
+		}
+	}
+	if claimIndex < 0 {
+		writeIndistinguishable(w)
+		return
+	}
+	now := time.Now().UTC()
+	claim := session.Claims[claimIndex]
+	if req.Role == "sender" {
+		claim.SASSenderConfirmed = true
+	} else {
+		claim.SASReceiverConfirmed = true
+	}
+	claim.UpdatedAt = now
+	session.Claims[claimIndex] = claim
+	if err := s.store.UpdateSession(r.Context(), session); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, sessionSASStatusResponse{
+		SASState: sasStateForClaim(claim),
+	})
+}
+
+func (s *Server) handleSASStatus(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.URL.Query().Get("session_id")
+	claimID := r.URL.Query().Get("claim_id")
+	if sessionID == "" || claimID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	session, err := s.store.GetSession(r.Context(), sessionID)
+	if err != nil {
+		writeIndistinguishable(w)
+		return
+	}
+	if time.Now().UTC().After(session.ExpiresAt) {
+		writeIndistinguishable(w)
+		return
+	}
+	for _, claim := range session.Claims {
+		if claim.ID == claimID {
+			writeJSON(w, http.StatusOK, sessionSASStatusResponse{
+				SASState: sasStateForClaim(claim),
+			})
+			return
+		}
+	}
+	writeIndistinguishable(w)
 }
 
 func shortFingerprint(value string) string {
@@ -492,6 +596,32 @@ func shortFingerprint(value string) string {
 		return strings.ToUpper(hash)
 	}
 	return strings.ToUpper(hash[:8])
+}
+
+func sasStateForClaim(claim domain.SessionClaim) string {
+	if claim.SASSenderConfirmed && claim.SASReceiverConfirmed {
+		return "verified"
+	}
+	if claim.SASSenderConfirmed {
+		return "sender_confirmed"
+	}
+	if claim.SASReceiverConfirmed {
+		return "receiver_confirmed"
+	}
+	return "pending"
+}
+
+func sasStateForClaims(claims []sessionPollClaimSummary) string {
+	state := "pending"
+	for _, claim := range claims {
+		switch claim.SASState {
+		case "verified":
+			return "verified"
+		case "sender_confirmed", "receiver_confirmed":
+			state = claim.SASState
+		}
+	}
+	return state
 }
 
 func transferScope(sessionID string, claimID string) string {

@@ -106,6 +106,11 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _claimStatus;
   String? _senderTransferToken;
   String? _senderReceiverPubKeyB64;
+  String? _senderPubKeyB64;
+  String? _senderSasCode;
+  String _senderSasState = 'pending';
+  bool _senderSasConfirmed = false;
+  bool _senderSasConfirming = false;
   KeyPair? _senderKeyPair;
   String? _senderSessionId;
   bool _scanRequired = false;
@@ -115,6 +120,8 @@ class _HomeScreenState extends State<HomeScreen> {
   String _claimsStatus = 'No pending claims.';
   List<PendingClaim> _pendingClaims = [];
   final Set<String> _trustedFingerprints = {};
+  final Map<String, String> _receiverSasByClaim = {};
+  final Set<String> _receiverSasConfirming = {};
 
   @override
   void dispose() {
@@ -238,6 +245,8 @@ class _HomeScreenState extends State<HomeScreen> {
         _sessionStatus = 'Session created.';
         _claimsStatus = 'Session created. Refresh to load claims.';
         _pendingClaims = [];
+        _receiverSasByClaim.clear();
+        _receiverSasConfirming.clear();
         _receiverKeyPair = keyPair;
         _receivedText = '';
       });
@@ -289,6 +298,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _pendingClaims = claims;
         _claimsStatus = claims.isEmpty ? 'No pending claims.' : 'Pending claims loaded.';
       });
+      await _updateReceiverSasCodes(claims);
     } catch (err) {
       setState(() {
         _claimsStatus = 'Failed: $err';
@@ -298,6 +308,36 @@ class _HomeScreenState extends State<HomeScreen> {
         _refreshingClaims = false;
       });
     }
+  }
+
+  Future<void> _updateReceiverSasCodes(List<PendingClaim> claims) async {
+    final receiverPubKeyB64 = _sessionResponse?.receiverPubKeyB64 ?? '';
+    final sessionId = _sessionResponse?.sessionId ?? '';
+    if (receiverPubKeyB64.isEmpty || sessionId.isEmpty) {
+      return;
+    }
+    final updates = <String, String>{};
+    for (final claim in claims) {
+      if (claim.senderPubKeyB64.isEmpty) {
+        continue;
+      }
+      if (_receiverSasByClaim.containsKey(claim.claimId)) {
+        continue;
+      }
+      final sas = await deriveSasDigits(
+        sessionId: sessionId,
+        claimId: claim.claimId,
+        receiverPubKeyB64: receiverPubKeyB64,
+        senderPubKeyB64: claim.senderPubKeyB64,
+      );
+      updates[claim.claimId] = sas;
+    }
+    if (updates.isEmpty || !mounted) {
+      return;
+    }
+    setState(() {
+      _receiverSasByClaim.addAll(updates);
+    });
   }
 
   Future<void> _respondToClaim(PendingClaim claim, bool approve) async {
@@ -338,8 +378,12 @@ class _HomeScreenState extends State<HomeScreen> {
           .timeout(const Duration(seconds: 8));
 
       if (response.statusCode != 200) {
+        final payload = jsonDecode(response.body) as Map<String, dynamic>?;
+        final error = payload?['error']?.toString();
         setState(() {
-          _claimsStatus = 'Error: ${response.statusCode}';
+          _claimsStatus = error == 'sas_required'
+              ? 'SAS must be verified by both devices.'
+              : 'Error: ${response.statusCode}';
         });
         return;
       }
@@ -362,6 +406,139 @@ class _HomeScreenState extends State<HomeScreen> {
         _claimsStatus = 'Failed: $err';
       });
     }
+  }
+
+  Future<bool> _commitSas({
+    required String sessionId,
+    required String claimId,
+    required String role,
+  }) async {
+    final baseUrl = _baseUrlController.text.trim();
+    if (baseUrl.isEmpty) {
+      return false;
+    }
+    final response = await http
+        .post(
+          Uri.parse(baseUrl).resolve('/v1/session/sas/commit'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'session_id': sessionId,
+            'claim_id': claimId,
+            'role': role,
+            'sas_confirmed': true,
+          }),
+        )
+        .timeout(const Duration(seconds: 8));
+    return response.statusCode == 200;
+  }
+
+  Future<void> _confirmReceiverSas(PendingClaim claim) async {
+    final sessionId = _sessionResponse?.sessionId ?? '';
+    if (sessionId.isEmpty) {
+      setState(() {
+        _claimsStatus = 'Create a session first.';
+      });
+      return;
+    }
+    if (_receiverSasConfirming.contains(claim.claimId)) {
+      return;
+    }
+    setState(() {
+      _receiverSasConfirming.add(claim.claimId);
+      _claimsStatus = 'Confirming SAS...';
+    });
+    try {
+      final ok = await _commitSas(
+        sessionId: sessionId,
+        claimId: claim.claimId,
+        role: 'receiver',
+      );
+      if (!ok) {
+        setState(() {
+          _claimsStatus = 'Failed to confirm SAS.';
+        });
+        return;
+      }
+      await _refreshClaims();
+      setState(() {
+        _claimsStatus = 'SAS confirmed.';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _receiverSasConfirming.remove(claim.claimId);
+        });
+      }
+    }
+  }
+
+  Future<void> _confirmSenderSas() async {
+    final sessionId = _senderSessionId ?? '';
+    final claimId = _claimId ?? '';
+    if (sessionId.isEmpty || claimId.isEmpty) {
+      setState(() {
+        _sendStatus = 'Claim a session first.';
+      });
+      return;
+    }
+    if (_senderSasConfirming) {
+      return;
+    }
+    setState(() {
+      _senderSasConfirming = true;
+      _sendStatus = 'Confirming SAS...';
+    });
+    try {
+      final ok = await _commitSas(
+        sessionId: sessionId,
+        claimId: claimId,
+        role: 'sender',
+      );
+      if (!ok) {
+        setState(() {
+          _sendStatus = 'Failed to confirm SAS.';
+        });
+        return;
+      }
+      setState(() {
+        _senderSasConfirmed = true;
+        _sendStatus = 'SAS confirmed. Awaiting approval...';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _senderSasConfirming = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _updateSenderSasCode() async {
+    if (_senderSasCode != null) {
+      return;
+    }
+    final sessionId = _senderSessionId ?? '';
+    final claimId = _claimId ?? '';
+    final receiverPubKeyB64 = _senderReceiverPubKeyB64 ?? '';
+    final senderPubKeyB64 = _senderPubKeyB64 ?? '';
+    if (sessionId.isEmpty ||
+        claimId.isEmpty ||
+        receiverPubKeyB64.isEmpty ||
+        senderPubKeyB64.isEmpty) {
+      return;
+    }
+    final sas = await deriveSasDigits(
+      sessionId: sessionId,
+      claimId: claimId,
+      receiverPubKeyB64: receiverPubKeyB64,
+      senderPubKeyB64: senderPubKeyB64,
+    );
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _senderSasCode = sas;
+    });
   }
 
   Future<bool?> _promptScanChoice() {
@@ -639,7 +816,14 @@ class _HomeScreenState extends State<HomeScreen> {
         _claimStatus = status;
         _sendStatus = 'Claimed. Polling for approval...';
         _senderKeyPair = keyPair;
+        _senderPubKeyB64 = pubKeyB64;
         _senderSessionId = sessionId;
+        _senderReceiverPubKeyB64 = null;
+        _senderTransferToken = null;
+        _senderSasCode = null;
+        _senderSasState = 'pending';
+        _senderSasConfirmed = false;
+        _senderSasConfirming = false;
       });
       _startPolling(sessionId, claimToken);
     } catch (err) {
@@ -1154,6 +1338,7 @@ class _HomeScreenState extends State<HomeScreen> {
       final receiverPubKey = payload['receiver_pubkey_b64']?.toString();
       final scanRequired = payload['scan_required'] == true;
       final scanStatus = payload['scan_status']?.toString() ?? '';
+      final sasState = payload['sas_state']?.toString() ?? 'pending';
       setState(() {
         _claimStatus = status;
         _sendStatus = 'Status: $status';
@@ -1165,7 +1350,12 @@ class _HomeScreenState extends State<HomeScreen> {
         }
         _scanRequired = scanRequired;
         _scanStatus = scanStatus;
+        _senderSasState = sasState;
+        if (sasState == 'sender_confirmed' || sasState == 'verified') {
+          _senderSasConfirmed = true;
+        }
       });
+      await _updateSenderSasCode();
 
       if (status == 'pending') {
         _pollTimer = Timer(const Duration(seconds: 2), () {
@@ -1238,6 +1428,12 @@ class _HomeScreenState extends State<HomeScreen> {
               const SizedBox(height: 8),
               ..._pendingClaims.map((claim) {
                 final trusted = _trustedFingerprints.contains(claim.shortFingerprint);
+                final sasCode = _receiverSasByClaim[claim.claimId] ?? '';
+                final sasState = claim.sasState;
+                final receiverConfirmed =
+                    sasState == 'receiver_confirmed' || sasState == 'verified';
+                final sasVerified = sasState == 'verified';
+                final sasConfirming = _receiverSasConfirming.contains(claim.claimId);
                 return Card(
                   margin: const EdgeInsets.symmetric(vertical: 6),
                   child: Padding(
@@ -1252,6 +1448,21 @@ class _HomeScreenState extends State<HomeScreen> {
                           Text('Transfer ID: ${claim.transferId}'),
                         if (claim.scanRequired)
                           Text('Scan status: ${claim.scanStatus.isEmpty ? 'pending' : claim.scanStatus}'),
+                        if (sasCode.isNotEmpty) Text('SAS: $sasCode'),
+                        Text('SAS state: ${sasState.isEmpty ? 'pending' : sasState}'),
+                        const SizedBox(height: 4),
+                        ElevatedButton(
+                          onPressed: sasCode.isEmpty || receiverConfirmed || sasConfirming
+                              ? null
+                              : () => _confirmReceiverSas(claim),
+                          child: Text(
+                            sasConfirming
+                                ? 'Confirming...'
+                                : receiverConfirmed
+                                    ? 'SAS confirmed'
+                                    : 'Confirm SAS',
+                          ),
+                        ),
                         if (trusted)
                           const Padding(
                             padding: EdgeInsets.only(top: 4),
@@ -1272,7 +1483,8 @@ class _HomeScreenState extends State<HomeScreen> {
                         Row(
                           children: [
                             ElevatedButton(
-                              onPressed: () => _respondToClaim(claim, true),
+                              onPressed:
+                                  sasVerified ? () => _respondToClaim(claim, true) : null,
                               child: const Text('Approve'),
                             ),
                             const SizedBox(width: 8),
@@ -1357,7 +1569,9 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                   const SizedBox(width: 8),
                   ElevatedButton(
-                    onPressed: _senderTransferToken == null ? null : _sendText,
+                    onPressed: _senderTransferToken == null || !_senderSasConfirmed
+                        ? null
+                        : _sendText,
                     child: const Text('Send Text'),
                   ),
                 ],
@@ -1405,6 +1619,25 @@ class _HomeScreenState extends State<HomeScreen> {
             if (_claimId != null) Text('Claim ID: $_claimId'),
             if (_claimStatus != null) Text('Claim status: $_claimStatus'),
             if (_scanRequired) Text('Scan required (${_scanStatus.isEmpty ? 'pending' : _scanStatus})'),
+            if (_claimId != null) ...[
+              Text('SAS: ${_senderSasCode ?? 'waiting for keys'}'),
+              Text('SAS state: $_senderSasState'),
+              const SizedBox(height: 4),
+              ElevatedButton(
+                onPressed: _senderSasCode == null ||
+                        _senderSasConfirmed ||
+                        _senderSasConfirming
+                    ? null
+                    : _confirmSenderSas,
+                child: Text(
+                  _senderSasConfirming
+                      ? 'Confirming...'
+                      : _senderSasConfirmed
+                          ? 'SAS confirmed'
+                          : 'Confirm SAS',
+                ),
+              ),
+            ],
             const SizedBox(height: 12),
             Row(
               children: [
@@ -1447,7 +1680,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
                 const SizedBox(width: 8),
                 ElevatedButton(
-                  onPressed: _senderTransferToken == null ? null : _startQueue,
+                  onPressed: _senderTransferToken == null || !_senderSasConfirmed
+                      ? null
+                      : _startQueue,
                   child: const Text('Start Queue'),
                 ),
                 const SizedBox(width: 8),
@@ -1630,26 +1865,32 @@ class PendingClaim {
     required this.claimId,
     required this.senderLabel,
     required this.shortFingerprint,
+    required this.senderPubKeyB64,
     required this.transferId,
     required this.scanRequired,
     required this.scanStatus,
+    required this.sasState,
   });
 
   final String claimId;
   final String senderLabel;
   final String shortFingerprint;
+  final String senderPubKeyB64;
   final String transferId;
   final bool scanRequired;
   final String scanStatus;
+  final String sasState;
 
   factory PendingClaim.fromJson(Map<String, dynamic> json) {
     return PendingClaim(
       claimId: json['claim_id']?.toString() ?? '',
       senderLabel: json['sender_label']?.toString() ?? '',
       shortFingerprint: json['short_fingerprint']?.toString() ?? '',
+      senderPubKeyB64: json['sender_pubkey_b64']?.toString() ?? '',
       transferId: json['transfer_id']?.toString() ?? '',
       scanRequired: json['scan_required'] == true,
       scanStatus: json['scan_status']?.toString() ?? '',
+      sasState: json['sas_state']?.toString() ?? 'pending',
     );
   }
 }

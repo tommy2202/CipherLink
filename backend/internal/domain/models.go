@@ -37,16 +37,18 @@ const (
 )
 
 type SessionClaim struct {
-	ID              string             `json:"id"`
-	SenderLabel     string             `json:"sender_label"`
-	SenderPubKeyB64 string             `json:"sender_pubkey_b64"`
-	Status          SessionClaimStatus `json:"status"`
-	CreatedAt       time.Time          `json:"created_at"`
-	UpdatedAt       time.Time          `json:"updated_at"`
-	TransferID      string             `json:"transfer_id,omitempty"`
-	TransferReady   bool               `json:"transfer_ready,omitempty"`
-	ScanRequired    bool               `json:"scan_required,omitempty"`
-	ScanStatus      ScanStatus         `json:"scan_status,omitempty"`
+	ID                   string             `json:"id"`
+	SenderLabel          string             `json:"sender_label"`
+	SenderPubKeyB64      string             `json:"sender_pubkey_b64"`
+	SASSenderConfirmed   bool               `json:"sas_sender_confirmed,omitempty"`
+	SASReceiverConfirmed bool               `json:"sas_receiver_confirmed,omitempty"`
+	Status               SessionClaimStatus `json:"status"`
+	CreatedAt            time.Time          `json:"created_at"`
+	UpdatedAt            time.Time          `json:"updated_at"`
+	TransferID           string             `json:"transfer_id,omitempty"`
+	TransferReady        bool               `json:"transfer_ready,omitempty"`
+	ScanRequired         bool               `json:"scan_required,omitempty"`
+	ScanStatus           ScanStatus         `json:"scan_status,omitempty"`
 }
 
 type Session struct {
