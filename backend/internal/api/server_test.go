@@ -150,11 +150,12 @@ func TestApproveRequiresSAS(t *testing.T) {
 	server := newSessionTestServer(store)
 
 	createResp := createSession(t, server)
+	senderPubKey := base64.StdEncoding.EncodeToString([]byte("pubkey"))
 	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
 		SessionID:       createResp.SessionID,
 		ClaimToken:      createResp.ClaimToken,
 		SenderLabel:     "Sender",
-		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+		SenderPubKeyB64: senderPubKey,
 	})
 
 	rec := approveSessionRecorder(t, server, sessionApproveRequest{
@@ -236,7 +237,7 @@ func TestP2PSignalingRejectsWithoutSAS(t *testing.T) {
 	if err := store.SaveSessionAuthContext(context.Background(), domain.SessionAuthContext{
 		SessionID:         session.ID,
 		ClaimID:           claimResp.ClaimID,
-		SenderPubKeyB64:   claimResp.SenderPubKeyB64,
+		SenderPubKeyB64:   senderPubKey,
 		ReceiverPubKeyB64: session.ReceiverPubKeyB64,
 		ApprovedAt:        time.Now().UTC(),
 	}); err != nil {
