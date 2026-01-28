@@ -12,6 +12,7 @@ import 'package:mime/mime.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'clipboard_service.dart';
 import 'crypto.dart';
@@ -124,19 +125,29 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _senderSasConfirming = false;
   KeyPair? _senderKeyPair;
   String? _senderSessionId;
+  String? _senderP2PToken;
   bool _scanRequired = false;
   String _scanStatus = '';
   Timer? _pollTimer;
   bool _refreshingClaims = false;
   String _claimsStatus = 'No pending claims.';
   List<PendingClaim> _pendingClaims = [];
+  final Map<String, String> _p2pTokensByClaim = {};
+  bool _preferDirect = true;
+  bool _alwaysRelay = false;
+  bool _p2pDisclosureShown = false;
   final Set<String> _trustedFingerprints = {};
   final Map<String, String> _receiverSasByClaim = {};
   final Set<String> _receiverSasConfirming = {};
 
+  static const _p2pPreferDirectKey = 'p2pPreferDirect';
+  static const _p2pAlwaysRelayKey = 'p2pAlwaysRelay';
+  static const _p2pDisclosureKey = 'p2pDirectDisclosureShown';
+
   @override
   void initState() {
     super.initState();
+    _loadP2PSettings();
     _resumePendingTransfers();
   }
 
@@ -155,13 +166,96 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 
+  Future<void> _loadP2PSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    final preferDirect = prefs.getBool(_p2pPreferDirectKey) ?? true;
+    final alwaysRelay = prefs.getBool(_p2pAlwaysRelayKey) ?? false;
+    final disclosureShown = prefs.getBool(_p2pDisclosureKey) ?? false;
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _preferDirect = preferDirect;
+      _alwaysRelay = alwaysRelay;
+      _p2pDisclosureShown = disclosureShown;
+    });
+  }
+
+  Future<void> _persistP2PSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_p2pPreferDirectKey, _preferDirect);
+    await prefs.setBool(_p2pAlwaysRelayKey, _alwaysRelay);
+  }
+
+  Future<void> _setPreferDirect(bool value) async {
+    if (value) {
+      await _maybeShowDirectDisclosure();
+    }
+    setState(() {
+      _preferDirect = value;
+      if (!value) {
+        _alwaysRelay = false;
+      }
+    });
+    await _persistP2PSettings();
+  }
+
+  Future<void> _setAlwaysRelay(bool value) async {
+    if (!_preferDirect) {
+      return;
+    }
+    setState(() {
+      _alwaysRelay = value;
+    });
+    await _persistP2PSettings();
+  }
+
+  Future<void> _maybeShowDirectDisclosure() async {
+    if (_p2pDisclosureShown || !mounted) {
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Direct transfer disclosure'),
+          content: const Text(
+            'Direct transfer may reveal IP address to the other device. '
+            'Use "Always relay" to avoid direct exposure.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_p2pDisclosureKey, true);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _p2pDisclosureShown = true;
+    });
+  }
+
   void _ensureCoordinator() {
     final baseUrl = _baseUrlController.text.trim();
     if (baseUrl.isEmpty) {
       return;
     }
+    final baseUri = Uri.parse(baseUrl);
+    final httpTransport = BackgroundUrlSessionTransport(baseUri);
     _coordinator = TransferCoordinator(
-      transport: BackgroundUrlSessionTransport(Uri.parse(baseUrl)),
+      transport: httpTransport,
+      p2pTransportFactory: (context) => P2PTransport(
+        baseUri: baseUri,
+        context: context,
+        fallbackTransport: httpTransport,
+      ),
       store: _transferStore,
       onState: (state) {
         setState(() {
@@ -265,6 +359,27 @@ class _HomeScreenState extends State<HomeScreen> {
       chunkSize: state.chunkSize,
       scanRequired: state.scanRequired ?? false,
       transferId: state.transferId,
+    );
+  }
+
+  P2PContext? _buildP2PContext({
+    required String sessionId,
+    required String claimId,
+    required String token,
+    required bool isInitiator,
+  }) {
+    if (!_preferDirect) {
+      return null;
+    }
+    if (sessionId.isEmpty || claimId.isEmpty || token.isEmpty) {
+      return null;
+    }
+    return P2PContext(
+      sessionId: sessionId,
+      claimId: claimId,
+      token: token,
+      isInitiator: isInitiator,
+      iceMode: _alwaysRelay ? P2PIceMode.relay : P2PIceMode.direct,
     );
   }
 
@@ -506,9 +621,13 @@ class _HomeScreenState extends State<HomeScreen> {
       if (approve) {
         final payload = jsonDecode(response.body) as Map<String, dynamic>;
         final transferToken = payload['transfer_token']?.toString() ?? '';
+        final p2pToken = payload['p2p_token']?.toString() ?? '';
         final senderPubKey = payload['sender_pubkey_b64']?.toString() ?? '';
         if (transferToken.isNotEmpty) {
           _transferTokensByClaim[claim.claimId] = transferToken;
+        }
+        if (p2pToken.isNotEmpty) {
+          _p2pTokensByClaim[claim.claimId] = p2pToken;
         }
         if (senderPubKey.isNotEmpty) {
           _senderPubKeysByClaim[claim.claimId] = senderPubKey;
@@ -733,6 +852,17 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
+    if (_preferDirect) {
+      await _maybeShowDirectDisclosure();
+    }
+    final p2pToken = _p2pTokensByClaim[claim.claimId] ?? transferToken;
+    final p2pContext = _buildP2PContext(
+      sessionId: sessionId,
+      claimId: claim.claimId,
+      token: p2pToken,
+      isInitiator: false,
+    );
+
     setState(() {
       _manifestStatus = 'Downloading manifest...';
     });
@@ -754,6 +884,7 @@ class _HomeScreenState extends State<HomeScreen> {
         senderPublicKey: senderPublicKey,
         receiverKeyPair: _receiverKeyPair!,
         sendReceipt: false,
+        p2pContext: p2pContext,
       );
       if (result == null) {
         setState(() {
@@ -940,6 +1071,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _senderSessionId = sessionId;
         _senderReceiverPubKeyB64 = null;
         _senderTransferToken = null;
+        _senderP2PToken = null;
         _senderSasCode = null;
         _senderSasState = 'pending';
         _senderSasConfirmed = false;
@@ -1071,6 +1203,9 @@ class _HomeScreenState extends State<HomeScreen> {
       });
       return;
     }
+    if (_preferDirect) {
+      await _maybeShowDirectDisclosure();
+    }
     _ensureCoordinator();
     final coordinator = _coordinator;
     if (coordinator == null) {
@@ -1079,6 +1214,13 @@ class _HomeScreenState extends State<HomeScreen> {
       });
       return;
     }
+    final p2pToken = _senderP2PToken ?? _senderTransferToken ?? '';
+    final p2pContext = _buildP2PContext(
+      sessionId: _senderSessionId!,
+      claimId: _claimId ?? '',
+      token: p2pToken,
+      isInitiator: true,
+    );
     if (_packagingMode == packagingModeOriginals) {
       coordinator.enqueueUploads(
         files: _selectedFiles,
@@ -1087,7 +1229,8 @@ class _HomeScreenState extends State<HomeScreen> {
         receiverPublicKey: publicKeyFromBase64(_senderReceiverPubKeyB64!),
         senderKeyPair: _senderKeyPair!,
         chunkSize: 64 * 1024,
-      scanRequired: _scanRequired,
+        scanRequired: _scanRequired,
+        p2pContext: p2pContext,
       );
       setState(() {
         _sendStatus = 'Queue started.';
@@ -1129,6 +1272,7 @@ class _HomeScreenState extends State<HomeScreen> {
         senderKeyPair: _senderKeyPair!,
         chunkSize: 64 * 1024,
         scanRequired: _scanRequired,
+        p2pContext: p2pContext,
       );
       setState(() {
         _sendStatus = 'Package queued.';
@@ -1173,6 +1317,9 @@ class _HomeScreenState extends State<HomeScreen> {
       });
       return;
     }
+    if (_preferDirect) {
+      await _maybeShowDirectDisclosure();
+    }
 
     _ensureCoordinator();
     final coordinator = _coordinator;
@@ -1200,6 +1347,13 @@ class _HomeScreenState extends State<HomeScreen> {
           : _textTitleController.text.trim(),
       localPath: localPath,
     );
+    final p2pToken = _senderP2PToken ?? _senderTransferToken ?? '';
+    final p2pContext = _buildP2PContext(
+      sessionId: _senderSessionId!,
+      claimId: _claimId ?? '',
+      token: p2pToken,
+      isInitiator: true,
+    );
 
     coordinator.enqueueUploads(
       files: [payload],
@@ -1209,6 +1363,7 @@ class _HomeScreenState extends State<HomeScreen> {
       senderKeyPair: _senderKeyPair!,
       chunkSize: 16 * 1024,
       scanRequired: _scanRequired,
+      p2pContext: p2pContext,
     );
     setState(() {
       _sendStatus = 'Sending text...';
@@ -1478,6 +1633,7 @@ class _HomeScreenState extends State<HomeScreen> {
       final payload = jsonDecode(response.body) as Map<String, dynamic>;
       final status = payload['status']?.toString() ?? 'pending';
       final transferToken = payload['transfer_token']?.toString();
+      final p2pToken = payload['p2p_token']?.toString();
       final receiverPubKey = payload['receiver_pubkey_b64']?.toString();
       final scanRequired = payload['scan_required'] == true;
       final scanStatus = payload['scan_status']?.toString() ?? '';
@@ -1490,6 +1646,9 @@ class _HomeScreenState extends State<HomeScreen> {
         }
         if (transferToken != null && transferToken.isNotEmpty) {
           _senderTransferToken = transferToken;
+        }
+        if (p2pToken != null && p2pToken.isNotEmpty) {
+          _senderP2PToken = p2pToken;
         }
         _scanRequired = scanRequired;
         _scanStatus = scanStatus;
@@ -1532,6 +1691,25 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
             const SizedBox(height: 16),
+            const Text(
+              'P2P settings',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Prefer direct'),
+              subtitle: const Text('Use WebRTC when available'),
+              value: _preferDirect,
+              onChanged: (value) => _setPreferDirect(value),
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Always relay'),
+              subtitle: const Text('Force TURN relay (no direct IP exposure)'),
+              value: _alwaysRelay,
+              onChanged: _preferDirect ? (value) => _setAlwaysRelay(value) : null,
+            ),
+            const SizedBox(height: 8),
             ElevatedButton(
               onPressed: _loading ? null : _pingBackend,
               child: Text(_loading ? 'Pinging...' : 'Ping Backend'),

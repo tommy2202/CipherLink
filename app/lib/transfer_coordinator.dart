@@ -22,6 +22,8 @@ const String statusCompleted = 'completed';
 const String statusFailed = 'failed';
 const String statusDownloading = 'downloading';
 
+typedef P2PTransportFactory = P2PFallbackTransport Function(P2PContext context);
+
 class TransferFile {
   TransferFile({
     required this.id,
@@ -55,20 +57,30 @@ class TransferCoordinator {
     void Function(TransferState state)? onState,
     void Function(String transferId, String status)? onScanStatus,
     TransferBackgroundHooks? backgroundHooks,
+    P2PTransportFactory? p2pTransportFactory,
+    Duration stallTimeout = _defaultStallTimeout,
+    int stallFallbackThreshold = _defaultStallFallbackThreshold,
   })  : _transport = transport,
         _store = store,
         _onState = onState,
         _onScanStatus = onScanStatus,
-        _backgroundHooks = backgroundHooks;
+        _backgroundHooks = backgroundHooks,
+        _p2pTransportFactory = p2pTransportFactory,
+        _stallTimeout = stallTimeout,
+        _stallFallbackThreshold = stallFallbackThreshold;
 
   final Transport _transport;
   final TransferStateStore _store;
   final void Function(TransferState state)? _onState;
   final void Function(String transferId, String status)? _onScanStatus;
   final TransferBackgroundHooks? _backgroundHooks;
+  final P2PTransportFactory? _p2pTransportFactory;
+  final Duration _stallTimeout;
+  final int _stallFallbackThreshold;
   final List<_TransferJob> _queue = [];
   final Map<String, BytesBuilder> _partialDownloads = {};
   final Map<String, DateTime> _lastProgressAt = {};
+  final Map<String, P2PFallbackTransport> _p2pTransports = {};
   final Random _jitter = Random();
   bool _paused = false;
   bool _running = false;
@@ -86,6 +98,7 @@ class TransferCoordinator {
     required KeyPair senderKeyPair,
     int chunkSize = 64 * 1024,
     bool scanRequired = false,
+    P2PContext? p2pContext,
   }) {
     for (final file in files) {
       _queue.add(
@@ -97,6 +110,7 @@ class TransferCoordinator {
           senderKeyPair: senderKeyPair,
           chunkSize: chunkSize,
           scanRequired: scanRequired,
+          p2pContext: p2pContext,
         ),
       );
     }
@@ -153,7 +167,9 @@ class TransferCoordinator {
     required SimplePublicKey senderPublicKey,
     required KeyPair receiverKeyPair,
     bool sendReceipt = false,
+    P2PContext? p2pContext,
   }) async {
+    final transport = _resolveTransport(p2pContext);
     final existing = await _store.load(transferId);
     final peerPubKeyB64 = publicKeyToBase64(senderPublicKey);
     final state = existing ??
@@ -174,7 +190,7 @@ class TransferCoordinator {
     try {
       manifestBytes = await _withRetry(
         transferId: transferId,
-        action: () => _transport.fetchManifest(
+        action: () => transport.fetchManifest(
           sessionId: sessionId,
           transferId: transferId,
           transferToken: transferToken,
@@ -227,6 +243,7 @@ class TransferCoordinator {
         ));
         return null;
       }
+      _ensureFallbackSync(transport, transferId);
       final remaining = totalBytes - (nextChunkIndex * chunkSize);
       if (remaining <= 0) {
         break;
@@ -240,6 +257,9 @@ class TransferCoordinator {
           transferId: transferId,
           maxRetries: _maxChunkRetries,
           onStallLimit: () async {
+            if (_triggerFallback(transport, transferId)) {
+              return;
+            }
             nextOffset = _encryptedOffsetForChunk(nextChunkIndex, chunkSize);
             await _saveState(state.copyWith(
               status: statusPaused,
@@ -248,7 +268,7 @@ class TransferCoordinator {
             ));
             _paused = true;
           },
-          action: () => _transport.fetchRange(
+          action: () => transport.fetchRange(
             sessionId: sessionId,
             transferId: transferId,
             transferToken: transferToken,
@@ -257,6 +277,9 @@ class TransferCoordinator {
           ),
         );
       } catch (err) {
+        if (_triggerFallback(transport, transferId)) {
+          continue;
+        }
         final transient = _isTransient(err);
         await _saveState(state.copyWith(
           status: transient ? statusPaused : statusFailed,
@@ -296,7 +319,7 @@ class TransferCoordinator {
       try {
         await _withRetry(
           transferId: transferId,
-          action: () => _transport.sendReceipt(
+          action: () => transport.sendReceipt(
             sessionId: sessionId,
             transferId: transferId,
             transferToken: transferToken,
@@ -318,6 +341,7 @@ class TransferCoordinator {
 
   Future<bool> _uploadJob(_TransferJob job) async {
     var transferId = job.transferId;
+    final transport = _resolveTransport(job.p2pContext);
     final existing = await _store.load(transferId ?? job.file.id);
     if (transferId == null && existing != null && existing.transferId.isNotEmpty) {
       transferId = existing.transferId;
@@ -402,7 +426,7 @@ class TransferCoordinator {
       try {
         initResult = await _withRetry(
           transferId: initKey,
-          action: () => _transport.initTransfer(
+          action: () => transport.initTransfer(
             sessionId: job.sessionId,
             transferToken: job.transferToken,
             manifestCiphertext: manifestBytes,
@@ -446,6 +470,7 @@ class TransferCoordinator {
         ));
         return false;
       }
+      _ensureFallbackSync(transport, transferId);
 
       final remaining =
           job.file.bytes.length - (nextChunkIndex * effectiveChunkSize);
@@ -473,7 +498,10 @@ class TransferCoordinator {
         await _withRetry(
           transferId: transferId,
           maxRetries: _maxChunkRetries,
-          action: () => _transport.sendChunk(
+          onStallLimit: () async {
+            _triggerFallback(transport, transferId);
+          },
+          action: () => transport.sendChunk(
             sessionId: job.sessionId,
             transferId: transferId,
             transferToken: job.transferToken,
@@ -482,6 +510,9 @@ class TransferCoordinator {
           ),
         );
       } catch (err) {
+        if (_triggerFallback(transport, transferId)) {
+          continue;
+        }
         final transient = _isTransient(err);
         await _saveState(state.copyWith(
           status: transient ? statusPaused : statusFailed,
@@ -510,7 +541,7 @@ class TransferCoordinator {
     try {
       await _withRetry(
         transferId: transferId,
-        action: () => _transport.finalizeTransfer(
+        action: () => transport.finalizeTransfer(
           sessionId: job.sessionId,
           transferId: transferId,
           transferToken: job.transferToken,
@@ -531,6 +562,7 @@ class TransferCoordinator {
         job: job,
         transferId: transferId,
         chunkSize: effectiveChunkSize,
+        transport: transport,
       );
       _onScanStatus?.call(transferId, status);
     }
@@ -542,11 +574,12 @@ class TransferCoordinator {
     required _TransferJob job,
     required String transferId,
     required int chunkSize,
+    required Transport transport,
   }) async {
     final totalBytes = job.file.bytes.length;
     final scanInit = await _withRetry(
       transferId: transferId,
-      action: () => _transport.scanInit(
+      action: () => transport.scanInit(
         sessionId: job.sessionId,
         transferId: transferId,
         transferToken: job.transferToken,
@@ -570,7 +603,7 @@ class TransferCoordinator {
       await _withRetry(
         transferId: transferId,
         maxRetries: _maxChunkRetries,
-        action: () => _transport.scanChunk(
+        action: () => transport.scanChunk(
           scanId: scanInit.scanId,
           transferToken: job.transferToken,
           chunkIndex: chunkIndex,
@@ -581,7 +614,7 @@ class TransferCoordinator {
     }
     final finalize = await _withRetry(
       transferId: transferId,
-      action: () => _transport.scanFinalize(
+      action: () => transport.scanFinalize(
         scanId: scanInit.scanId,
         transferToken: job.transferToken,
       ),
@@ -605,16 +638,17 @@ class TransferCoordinator {
     required String transferId,
     required Future<T> Function() action,
     int maxRetries = _maxRequestRetries,
-    Duration timeout = _stallTimeout,
+    Duration? timeout,
     Future<void> Function()? onStallLimit,
   }) async {
     var attempt = 0;
     var stallCount = 0;
     var stallFallbackTriggered = false;
+    final effectiveTimeout = timeout ?? _stallTimeout;
     while (true) {
       final lastProgress = _lastProgressAt[transferId];
       if (lastProgress != null &&
-          DateTime.now().difference(lastProgress) > timeout &&
+          DateTime.now().difference(lastProgress) > effectiveTimeout &&
           onStallLimit != null &&
           !stallFallbackTriggered) {
         stallFallbackTriggered = true;
@@ -622,7 +656,7 @@ class TransferCoordinator {
       }
       attempt += 1;
       try {
-        final result = await action().timeout(timeout);
+        final result = await action().timeout(effectiveTimeout);
         _lastProgressAt[transferId] = DateTime.now();
         return result;
       } on TimeoutException catch (_) {
@@ -713,6 +747,37 @@ class TransferCoordinator {
     return closest;
   }
 
+  Transport _resolveTransport(P2PContext? p2pContext) {
+    if (p2pContext == null || _p2pTransportFactory == null) {
+      return _transport;
+    }
+    return _p2pTransports.putIfAbsent(
+      p2pContext.cacheKey,
+      () => _p2pTransportFactory!(p2pContext),
+    );
+  }
+
+  void _ensureFallbackSync(Transport transport, String transferId) {
+    if (transport is! P2PFallbackTransport) {
+      return;
+    }
+    if (transport.isFallbackRequested(transferId)) {
+      transport.forceFallback();
+    }
+  }
+
+  bool _triggerFallback(Transport transport, String transferId) {
+    if (transport is! P2PFallbackTransport) {
+      return false;
+    }
+    if (transport.usingFallback) {
+      return false;
+    }
+    transport.requestFallback(transferId);
+    transport.forceFallback();
+    return true;
+  }
+
   Future<void> resumePendingDownloads({
     required Future<DownloadResumeContext?> Function(TransferState state) resolve,
     bool sendReceipt = false,
@@ -777,8 +842,8 @@ const int _maxRequestRetries = 4;
 const int _maxChunkRetries = 5;
 const int _baseBackoffMs = 400;
 const int _maxBackoffMs = 8000;
-const int _stallFallbackThreshold = 3;
-const Duration _stallTimeout = Duration(seconds: 15);
+const int _defaultStallFallbackThreshold = 3;
+const Duration _defaultStallTimeout = Duration(seconds: 15);
 
 class _TransferJob {
   _TransferJob({
@@ -790,6 +855,7 @@ class _TransferJob {
     required this.chunkSize,
     required this.scanRequired,
     this.transferId,
+    this.p2pContext,
   });
 
   final TransferFile file;
@@ -800,6 +866,7 @@ class _TransferJob {
   final int chunkSize;
   final bool scanRequired;
   String? transferId;
+  final P2PContext? p2pContext;
 }
 
 class TransferDownloadResult {
