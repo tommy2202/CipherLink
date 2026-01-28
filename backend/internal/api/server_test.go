@@ -213,11 +213,12 @@ func TestP2PSignalingRejectsWithoutSAS(t *testing.T) {
 	server := newSessionTestServer(store)
 
 	createResp := createSession(t, server)
+	senderPubKey := base64.StdEncoding.EncodeToString([]byte("pubkey"))
 	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
 		SessionID:       createResp.SessionID,
 		ClaimToken:      createResp.ClaimToken,
 		SenderLabel:     "Sender",
-		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+		SenderPubKeyB64: senderPubKey,
 	})
 
 	session, err := store.GetSession(context.Background(), createResp.SessionID)
