@@ -1,7 +1,9 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
+import 'package:flutter/services.dart';
 
 class TransferInitResult {
   const TransferInitResult(this.transferId);
@@ -353,6 +355,200 @@ class HttpTransport implements Transport {
     final payload = jsonDecode(response.body) as Map<String, dynamic>;
     final status = payload['status']?.toString() ?? '';
     return ScanFinalizeResult(status);
+  }
+}
+
+class BackgroundUrlSessionTransport implements Transport {
+  BackgroundUrlSessionTransport(
+    this.baseUri, {
+    http.Client? client,
+    MethodChannel? channel,
+  })  : _http = HttpTransport(baseUri, client: client),
+        _channel = channel ??
+            const MethodChannel('universaldrop/background_url_session');
+
+  final Uri baseUri;
+  final HttpTransport _http;
+  final MethodChannel _channel;
+
+  @override
+  Future<TransferInitResult> initTransfer({
+    required String sessionId,
+    required String transferToken,
+    required Uint8List manifestCiphertext,
+    required int totalBytes,
+    String? transferId,
+  }) {
+    return _http.initTransfer(
+      sessionId: sessionId,
+      transferToken: transferToken,
+      manifestCiphertext: manifestCiphertext,
+      totalBytes: totalBytes,
+      transferId: transferId,
+    );
+  }
+
+  @override
+  Future<void> sendChunk({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+    required int offset,
+    required Uint8List data,
+  }) {
+    return _http.sendChunk(
+      sessionId: sessionId,
+      transferId: transferId,
+      transferToken: transferToken,
+      offset: offset,
+      data: data,
+    );
+  }
+
+  @override
+  Future<void> finalizeTransfer({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+  }) {
+    return _http.finalizeTransfer(
+      sessionId: sessionId,
+      transferId: transferId,
+      transferToken: transferToken,
+    );
+  }
+
+  @override
+  Future<Uint8List> fetchManifest({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+  }) async {
+    if (!Platform.isIOS) {
+      return _http.fetchManifest(
+        sessionId: sessionId,
+        transferId: transferId,
+        transferToken: transferToken,
+      );
+    }
+    final uri = baseUri.replace(
+      path: '/v1/transfer/manifest',
+      queryParameters: {
+        'session_id': sessionId,
+        'transfer_id': transferId,
+      },
+    );
+    final bytes = await _channel.invokeMethod<Uint8List>('fetchBytes', {
+      'url': uri.toString(),
+      'headers': {'Authorization': 'Bearer $transferToken'},
+    });
+    if (bytes != null) {
+      return bytes;
+    }
+    return _http.fetchManifest(
+      sessionId: sessionId,
+      transferId: transferId,
+      transferToken: transferToken,
+    );
+  }
+
+  @override
+  Future<Uint8List> fetchRange({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+    required int offset,
+    required int length,
+  }) async {
+    if (!Platform.isIOS) {
+      return _http.fetchRange(
+        sessionId: sessionId,
+        transferId: transferId,
+        transferToken: transferToken,
+        offset: offset,
+        length: length,
+      );
+    }
+    final uri = baseUri.replace(
+      path: '/v1/transfer/download',
+      queryParameters: {
+        'session_id': sessionId,
+        'transfer_id': transferId,
+      },
+    );
+    final bytes = await _channel.invokeMethod<Uint8List>('fetchRange', {
+      'url': uri.toString(),
+      'headers': {
+        'Authorization': 'Bearer $transferToken',
+        'Range': 'bytes=$offset-${offset + length - 1}',
+      },
+    });
+    if (bytes != null) {
+      return bytes;
+    }
+    return _http.fetchRange(
+      sessionId: sessionId,
+      transferId: transferId,
+      transferToken: transferToken,
+      offset: offset,
+      length: length,
+    );
+  }
+
+  @override
+  Future<void> sendReceipt({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+  }) {
+    return _http.sendReceipt(
+      sessionId: sessionId,
+      transferId: transferId,
+      transferToken: transferToken,
+    );
+  }
+
+  @override
+  Future<ScanInitResult> scanInit({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+    required int totalBytes,
+    required int chunkSize,
+  }) {
+    return _http.scanInit(
+      sessionId: sessionId,
+      transferId: transferId,
+      transferToken: transferToken,
+      totalBytes: totalBytes,
+      chunkSize: chunkSize,
+    );
+  }
+
+  @override
+  Future<void> scanChunk({
+    required String scanId,
+    required String transferToken,
+    required int chunkIndex,
+    required Uint8List data,
+  }) {
+    return _http.scanChunk(
+      scanId: scanId,
+      transferToken: transferToken,
+      chunkIndex: chunkIndex,
+      data: data,
+    );
+  }
+
+  @override
+  Future<ScanFinalizeResult> scanFinalize({
+    required String scanId,
+    required String transferToken,
+  }) {
+    return _http.scanFinalize(
+      scanId: scanId,
+      transferToken: transferToken,
+    );
   }
 }
 

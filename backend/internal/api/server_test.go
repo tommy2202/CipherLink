@@ -521,6 +521,48 @@ func TestRangeResumeWorks(t *testing.T) {
 	}
 }
 
+func TestDownloadRangeContentRangeHeader(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	if approveResp.TransferToken == "" {
+		t.Fatalf("expected transfer token")
+	}
+
+	initResp := initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                8,
+	})
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("abcd"))
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 4, []byte("efgh"))
+	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+
+	rec := downloadRangeRecorder(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, 3)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("expected 206 got %d", rec.Code)
+	}
+	if rec.Header().Get("Content-Range") != "bytes 0-3/8" {
+		t.Fatalf("unexpected content range: %s", rec.Header().Get("Content-Range"))
+	}
+	if rec.Header().Get("Content-Length") != "4" {
+		t.Fatalf("unexpected content length: %s", rec.Header().Get("Content-Length"))
+	}
+}
+
 func TestChunkRetryIdempotent(t *testing.T) {
 	store := &stubStorage{}
 	server := newSessionTestServer(store)
@@ -1065,6 +1107,15 @@ func finalizeTransfer(t *testing.T, server *Server, sessionID string, transferID
 
 func downloadRange(t *testing.T, server *Server, sessionID string, transferID string, token string, start int64, end int64) []byte {
 	t.Helper()
+	rec := downloadRangeRecorder(t, server, sessionID, transferID, token, start, end)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("expected 206 got %d", rec.Code)
+	}
+	return rec.Body.Bytes()
+}
+
+func downloadRangeRecorder(t *testing.T, server *Server, sessionID string, transferID string, token string, start int64, end int64) *httptest.ResponseRecorder {
+	t.Helper()
 	req := httptest.NewRequest(
 		http.MethodGet,
 		"/v1/transfer/download?session_id="+sessionID+"&transfer_id="+transferID,
@@ -1074,10 +1125,7 @@ func downloadRange(t *testing.T, server *Server, sessionID string, transferID st
 	req.Header.Set("Range", "bytes="+strconv.FormatInt(start, 10)+"-"+strconv.FormatInt(end, 10))
 	rec := httptest.NewRecorder()
 	server.Router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusPartialContent {
-		t.Fatalf("expected 206 got %d", rec.Code)
-	}
-	return rec.Body.Bytes()
+	return rec
 }
 
 func receiptTransfer(t *testing.T, server *Server, reqBody transferReceiptRequest) {

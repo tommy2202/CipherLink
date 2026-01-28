@@ -7,6 +7,7 @@ import 'dart:typed_data';
 import 'package:cryptography/cryptography.dart';
 
 import 'crypto.dart';
+import 'transfer_background.dart';
 import 'transfer_manifest.dart';
 import 'transfer_state_store.dart';
 import 'transport.dart';
@@ -32,6 +33,7 @@ class TransferFile {
     this.textTitle,
     this.packageTitle,
     this.entries = const [],
+    this.localPath,
   });
 
   final String id;
@@ -43,6 +45,7 @@ class TransferFile {
   final String? textTitle;
   final String? packageTitle;
   final List<TransferManifestFile> entries;
+  final String? localPath;
 }
 
 class TransferCoordinator {
@@ -51,15 +54,18 @@ class TransferCoordinator {
     required TransferStateStore store,
     void Function(TransferState state)? onState,
     void Function(String transferId, String status)? onScanStatus,
+    TransferBackgroundHooks? backgroundHooks,
   })  : _transport = transport,
         _store = store,
         _onState = onState,
-        _onScanStatus = onScanStatus;
+        _onScanStatus = onScanStatus,
+        _backgroundHooks = backgroundHooks;
 
   final Transport _transport;
   final TransferStateStore _store;
   final void Function(TransferState state)? _onState;
   final void Function(String transferId, String status)? _onScanStatus;
+  final TransferBackgroundHooks? _backgroundHooks;
   final List<_TransferJob> _queue = [];
   final Map<String, BytesBuilder> _partialDownloads = {};
   final Map<String, DateTime> _lastProgressAt = {};
@@ -149,6 +155,7 @@ class TransferCoordinator {
     bool sendReceipt = false,
   }) async {
     final existing = await _store.load(transferId);
+    final peerPubKeyB64 = publicKeyToBase64(senderPublicKey);
     final state = existing ??
         TransferState(
           transferId: transferId,
@@ -160,6 +167,7 @@ class TransferCoordinator {
           chunkSize: 0,
           nextOffset: 0,
           nextChunkIndex: 0,
+          peerPublicKeyB64: peerPubKeyB64,
         );
 
     Uint8List manifestBytes;
@@ -200,6 +208,7 @@ class TransferCoordinator {
       totalBytes: totalBytes,
       chunkSize: chunkSize,
       status: statusDownloading,
+      peerPublicKeyB64: state.peerPublicKeyB64 ?? peerPubKeyB64,
     ));
 
     final builder = _partialDownloads.putIfAbsent(
@@ -310,9 +319,14 @@ class TransferCoordinator {
   Future<bool> _uploadJob(_TransferJob job) async {
     var transferId = job.transferId;
     final existing = await _store.load(transferId ?? job.file.id);
+    if (transferId == null && existing != null && existing.transferId.isNotEmpty) {
+      transferId = existing.transferId;
+      job.transferId = transferId;
+    }
     final resumeChunkSize = existing?.chunkSize ?? 0;
     final effectiveChunkSize =
         resumeChunkSize > 0 ? resumeChunkSize : _chooseChunkSize(job.chunkSize);
+    final receiverPubKeyB64 = publicKeyToBase64(job.receiverPublicKey);
     final state = existing ??
         TransferState(
           transferId: transferId ?? job.file.id,
@@ -324,6 +338,9 @@ class TransferCoordinator {
           chunkSize: effectiveChunkSize,
           nextOffset: 0,
           nextChunkIndex: 0,
+          peerPublicKeyB64: receiverPubKeyB64,
+          payloadPath: job.file.localPath,
+          scanRequired: job.scanRequired,
         );
 
     final sessionKey = await deriveSessionKey(
@@ -409,6 +426,9 @@ class TransferCoordinator {
         transferId: transferId,
         status: statusUploading,
         chunkSize: effectiveChunkSize,
+        peerPublicKeyB64: state.peerPublicKeyB64 ?? receiverPubKeyB64,
+        payloadPath: state.payloadPath ?? job.file.localPath,
+        scanRequired: state.scanRequired ?? job.scanRequired,
       ));
     }
 
@@ -481,6 +501,9 @@ class TransferCoordinator {
         nextOffset: nextOffset,
         nextChunkIndex: nextChunkIndex,
         chunkSize: effectiveChunkSize,
+        peerPublicKeyB64: state.peerPublicKeyB64 ?? receiverPubKeyB64,
+        payloadPath: state.payloadPath ?? job.file.localPath,
+        scanRequired: state.scanRequired ?? job.scanRequired,
       ));
     }
 
@@ -569,6 +592,7 @@ class TransferCoordinator {
   Future<void> _saveState(TransferState state) async {
     await _store.save(state);
     _onState?.call(state);
+    await _backgroundHooks?.onStateUpdated(state);
   }
 
   int _cipherOverhead() => 12 + 16;
@@ -688,6 +712,58 @@ class TransferCoordinator {
     }
     return closest;
   }
+
+  Future<void> resumePendingDownloads({
+    required Future<DownloadResumeContext?> Function(TransferState state) resolve,
+    bool sendReceipt = false,
+  }) async {
+    final pending = await _store.listPending(direction: downloadDirection);
+    for (final state in pending) {
+      if (_paused) {
+        break;
+      }
+      final context = await resolve(state);
+      if (context == null) {
+        continue;
+      }
+      await downloadTransfer(
+        sessionId: context.sessionId,
+        transferToken: context.transferToken,
+        transferId: context.transferId,
+        senderPublicKey: context.senderPublicKey,
+        receiverKeyPair: context.receiverKeyPair,
+        sendReceipt: sendReceipt,
+      );
+    }
+  }
+
+  Future<void> resumePendingUploads({
+    required Future<UploadResumeContext?> Function(TransferState state) resolve,
+  }) async {
+    final pending = await _store.listPending(direction: uploadDirection);
+    for (final state in pending) {
+      if (_paused) {
+        break;
+      }
+      final context = await resolve(state);
+      if (context == null) {
+        continue;
+      }
+      _queue.add(_TransferJob(
+        file: context.file,
+        sessionId: context.sessionId,
+        transferToken: context.transferToken,
+        receiverPublicKey: context.receiverPublicKey,
+        senderKeyPair: context.senderKeyPair,
+        chunkSize: context.chunkSize,
+        scanRequired: context.scanRequired,
+        transferId: context.transferId,
+      ));
+    }
+    if (!_running) {
+      await runQueue();
+    }
+  }
 }
 
 const int _defaultChunkSize = 128 * 1024;
@@ -736,4 +812,42 @@ class TransferDownloadResult {
   final TransferManifest manifest;
   final Uint8List bytes;
   final String transferId;
+}
+
+class DownloadResumeContext {
+  DownloadResumeContext({
+    required this.sessionId,
+    required this.transferToken,
+    required this.transferId,
+    required this.senderPublicKey,
+    required this.receiverKeyPair,
+  });
+
+  final String sessionId;
+  final String transferToken;
+  final String transferId;
+  final SimplePublicKey senderPublicKey;
+  final KeyPair receiverKeyPair;
+}
+
+class UploadResumeContext {
+  UploadResumeContext({
+    required this.file,
+    required this.sessionId,
+    required this.transferToken,
+    required this.receiverPublicKey,
+    required this.senderKeyPair,
+    required this.chunkSize,
+    required this.scanRequired,
+    this.transferId,
+  });
+
+  final TransferFile file;
+  final String sessionId;
+  final String transferToken;
+  final SimplePublicKey receiverPublicKey;
+  final KeyPair senderKeyPair;
+  final int chunkSize;
+  final bool scanRequired;
+  final String? transferId;
 }

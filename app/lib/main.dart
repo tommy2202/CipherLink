@@ -18,8 +18,10 @@ import 'crypto.dart';
 import 'destination_preferences.dart';
 import 'destination_rules.dart';
 import 'destination_selector.dart';
+import 'key_store.dart';
 import 'packaging_builder.dart';
 import 'save_service.dart';
+import 'transfer_background.dart';
 import 'transfer_manifest.dart';
 import 'transfer_coordinator.dart';
 import 'transfer_state_store.dart';
@@ -27,6 +29,7 @@ import 'transport.dart';
 import 'zip_extract.dart';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
   runApp(const UniversalDropApp());
 }
 
@@ -73,8 +76,16 @@ class _HomeScreenState extends State<HomeScreen> {
   final Map<String, TransferState> _transferStates = {};
   final List<TransferFile> _selectedFiles = [];
   TransferCoordinator? _coordinator;
-  late final InMemoryTransferStateStore _transferStore =
-      InMemoryTransferStateStore();
+  late final SecureTransferStateStore _transferStore =
+      SecureTransferStateStore();
+  final SecureKeyPairStore _keyStore = SecureKeyPairStore();
+  late final TransferBackgroundManager _backgroundManager =
+      TransferBackgroundManager(
+    scheduler: MethodChannelResumeScheduler(),
+    foregroundController: MethodChannelForegroundController(),
+    connectivityMonitor: MethodChannelConnectivityMonitor(),
+    onConnectivityRestored: () => _resumePendingTransfers(),
+  );
   final DestinationPreferenceStore _destinationStore =
       SharedPreferencesDestinationStore();
   final SaveService _saveService = DefaultSaveService();
@@ -124,6 +135,12 @@ class _HomeScreenState extends State<HomeScreen> {
   final Set<String> _receiverSasConfirming = {};
 
   @override
+  void initState() {
+    super.initState();
+    _resumePendingTransfers();
+  }
+
+  @override
   void dispose() {
     _baseUrlController.dispose();
     _qrPayloadController.dispose();
@@ -134,6 +151,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _textContentController.dispose();
     _packageTitleController.dispose();
     _pollTimer?.cancel();
+    _backgroundManager.dispose();
     super.dispose();
   }
 
@@ -143,7 +161,7 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     _coordinator = TransferCoordinator(
-      transport: HttpTransport(Uri.parse(baseUrl)),
+      transport: BackgroundUrlSessionTransport(Uri.parse(baseUrl)),
       store: _transferStore,
       onState: (state) {
         setState(() {
@@ -155,6 +173,98 @@ class _HomeScreenState extends State<HomeScreen> {
           _scanStatus = status;
         });
       },
+      backgroundHooks: _backgroundManager,
+    );
+  }
+
+  Future<void> _resumePendingTransfers() async {
+    _ensureCoordinator();
+    final coordinator = _coordinator;
+    if (coordinator == null) {
+      return;
+    }
+    await coordinator.resumePendingDownloads(
+      resolve: _resolveDownloadResumeContext,
+    );
+    await coordinator.resumePendingUploads(
+      resolve: _resolveUploadResumeContext,
+    );
+  }
+
+  Future<DownloadResumeContext?> _resolveDownloadResumeContext(
+    TransferState state,
+  ) async {
+    if (state.sessionId.isEmpty ||
+        state.transferToken.isEmpty ||
+        state.transferId.isEmpty) {
+      return null;
+    }
+    final senderPubKeyB64 = state.peerPublicKeyB64 ?? '';
+    if (senderPubKeyB64.isEmpty) {
+      return null;
+    }
+    final receiverKeyPair = await _keyStore.loadKeyPair(
+      sessionId: state.sessionId,
+      role: KeyRole.receiver,
+    );
+    if (receiverKeyPair == null) {
+      return null;
+    }
+    return DownloadResumeContext(
+      sessionId: state.sessionId,
+      transferToken: state.transferToken,
+      transferId: state.transferId,
+      senderPublicKey: publicKeyFromBase64(senderPubKeyB64),
+      receiverKeyPair: receiverKeyPair,
+    );
+  }
+
+  Future<UploadResumeContext?> _resolveUploadResumeContext(
+    TransferState state,
+  ) async {
+    if (state.sessionId.isEmpty ||
+        state.transferToken.isEmpty ||
+        state.transferId.isEmpty) {
+      return null;
+    }
+    final payloadPath = state.payloadPath ?? '';
+    if (payloadPath.isEmpty) {
+      return null;
+    }
+    final payloadFile = File(payloadPath);
+    if (!await payloadFile.exists()) {
+      return null;
+    }
+    final senderKeyPair = await _keyStore.loadKeyPair(
+      sessionId: state.sessionId,
+      role: KeyRole.sender,
+    );
+    if (senderKeyPair == null) {
+      return null;
+    }
+    final receiverPubKeyB64 = state.peerPublicKeyB64 ?? '';
+    if (receiverPubKeyB64.isEmpty) {
+      return null;
+    }
+    final bytes = await payloadFile.readAsBytes();
+    final transferFile = TransferFile(
+      id: state.transferId,
+      name: p.basename(payloadPath),
+      bytes: bytes,
+      payloadKind: payloadKindFile,
+      mimeType: 'application/octet-stream',
+      packagingMode: packagingModeOriginals,
+      localPath: payloadPath,
+    );
+    return UploadResumeContext(
+      file: transferFile,
+      sessionId: state.sessionId,
+      transferToken: state.transferToken,
+      receiverPublicKey: publicKeyFromBase64(receiverPubKeyB64),
+      senderKeyPair: senderKeyPair,
+      chunkSize: state.chunkSize,
+      scanRequired: state.scanRequired ?? false,
+      transferId: state.transferId,
     );
   }
 
@@ -240,6 +350,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final payload = jsonDecode(response.body) as Map<String, dynamic>;
       final sessionResponse = SessionCreateResponse.fromJson(payload);
+      await _keyStore.saveKeyPair(
+        sessionId: sessionResponse.sessionId,
+        role: KeyRole.receiver,
+        keyPair: keyPair,
+      );
       setState(() {
         _sessionResponse = sessionResponse;
         _sessionStatus = 'Session created.';
@@ -808,6 +923,11 @@ class _HomeScreenState extends State<HomeScreen> {
         return;
       }
 
+      await _keyStore.saveKeyPair(
+        sessionId: sessionId,
+        role: KeyRole.sender,
+        keyPair: keyPair,
+      );
       final payload = jsonDecode(response.body) as Map<String, dynamic>;
       final claimId = payload['claim_id']?.toString();
       final status = payload['status']?.toString() ?? 'pending';
@@ -851,16 +971,19 @@ class _HomeScreenState extends State<HomeScreen> {
       if (bytes == null) {
         continue;
       }
+      final id = _randomId();
+      final localPath = await _cacheUploadPayload(id, bytes);
       final mimeType = lookupMimeType(file.name, headerBytes: bytes) ??
           'application/octet-stream';
       files.add(
         TransferFile(
-          id: _randomId(),
+          id: id,
           name: file.name,
           bytes: bytes,
           payloadKind: payloadKindFile,
           mimeType: mimeType,
           packagingMode: packagingModeOriginals,
+          localPath: localPath,
         ),
       );
     }
@@ -892,17 +1015,20 @@ class _HomeScreenState extends State<HomeScreen> {
       if (bytes == null) {
         continue;
       }
+      final id = _randomId();
+      final localPath = await _cacheUploadPayload(id, bytes);
       final name = file.name.isNotEmpty ? file.name : 'media';
       final mimeType = lookupMimeType(name, headerBytes: bytes) ??
           'application/octet-stream';
       files.add(
         TransferFile(
-          id: _randomId(),
+          id: id,
           name: name,
           bytes: bytes,
           payloadKind: payloadKindFile,
           mimeType: mimeType,
           packagingMode: packagingModeOriginals,
+          localPath: localPath,
         ),
       );
     }
@@ -917,6 +1043,16 @@ class _HomeScreenState extends State<HomeScreen> {
         ..clear()
         ..addAll(files);
     });
+  }
+
+  Future<String?> _cacheUploadPayload(String id, Uint8List bytes) async {
+    final dir = await getApplicationSupportDirectory();
+    final uploadDir = Directory(p.join(dir.path, 'upload_cache'));
+    await uploadDir.create(recursive: true);
+    final path = p.join(uploadDir.path, id);
+    final file = File(path);
+    await file.writeAsBytes(bytes, flush: true);
+    return path;
   }
 
   Future<void> _startQueue() async {
@@ -972,8 +1108,10 @@ class _HomeScreenState extends State<HomeScreen> {
       final payloadKind = _packagingMode == packagingModeAlbum
           ? payloadKindAlbum
           : payloadKindZip;
+      final id = _randomId();
+      final localPath = await _cacheUploadPayload(id, package.bytes);
       final transferFile = TransferFile(
-        id: _randomId(),
+        id: id,
         name: package.outputName,
         bytes: package.bytes,
         payloadKind: payloadKind,
@@ -981,6 +1119,7 @@ class _HomeScreenState extends State<HomeScreen> {
         packagingMode: _packagingMode,
         packageTitle: packageTitle,
         entries: package.entries,
+        localPath: localPath,
       );
       coordinator.enqueueUploads(
         files: [transferFile],
@@ -1044,18 +1183,22 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
+    final textBytes = Uint8List.fromList(utf8.encode(text));
+    final id = _randomId();
+    final localPath = await _cacheUploadPayload(id, textBytes);
     final payload = TransferFile(
-      id: _randomId(),
+      id: id,
       name: _textTitleController.text.trim().isEmpty
           ? 'Text'
           : _textTitleController.text.trim(),
-      bytes: Uint8List.fromList(utf8.encode(text)),
+      bytes: textBytes,
       payloadKind: payloadKindText,
       mimeType: textMimePlain,
       packagingMode: packagingModeOriginals,
       textTitle: _textTitleController.text.trim().isEmpty
           ? null
           : _textTitleController.text.trim(),
+      localPath: localPath,
     );
 
     coordinator.enqueueUploads(

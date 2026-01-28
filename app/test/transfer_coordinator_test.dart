@@ -2,6 +2,7 @@ import 'dart:typed_data';
 
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:universaldrop_app/crypto.dart';
 import 'package:universaldrop_app/transfer_coordinator.dart';
 import 'package:universaldrop_app/transfer_manifest.dart';
 import 'package:universaldrop_app/transfer_state_store.dart';
@@ -55,6 +56,56 @@ void main() {
     final state2 = await store.load('file-2');
     expect(state1?.status, equals(statusCompleted));
     expect(state2?.status, equals(statusCompleted));
+  });
+
+  test('coordinator resumes uploads after restart', () async {
+    final transport = RecordingTransport();
+    final store = InMemoryTransferStateStore();
+    final coordinator = TransferCoordinator(
+      transport: transport,
+      store: store,
+    );
+
+    final senderKeyPair = await X25519().newKeyPair();
+    final receiverKeyPair = await X25519().newKeyPair();
+    final receiverPublicKey = await receiverKeyPair.extractPublicKey();
+
+    await store.save(TransferState(
+      transferId: 'transfer-1',
+      sessionId: 'session-1',
+      transferToken: 'token-1',
+      direction: uploadDirection,
+      status: statusPaused,
+      totalBytes: 4,
+      chunkSize: 2,
+      nextOffset: 123,
+      nextChunkIndex: 1,
+      peerPublicKeyB64: publicKeyToBase64(receiverPublicKey),
+    ));
+
+    await coordinator.resumePendingUploads(
+      resolve: (state) async {
+        return UploadResumeContext(
+          file: TransferFile(
+            id: state.transferId,
+            name: 'resume.bin',
+            bytes: Uint8List.fromList([1, 2, 3, 4]),
+            payloadKind: payloadKindFile,
+            mimeType: 'application/octet-stream',
+            packagingMode: packagingModeOriginals,
+          ),
+          sessionId: state.sessionId,
+          transferToken: state.transferToken,
+          receiverPublicKey: receiverPublicKey,
+          senderKeyPair: senderKeyPair,
+          chunkSize: state.chunkSize,
+          scanRequired: false,
+          transferId: state.transferId,
+        );
+      },
+    );
+
+    expect(transport.sentOffsets.first, equals(123));
   });
 }
 
@@ -112,6 +163,55 @@ class FakeTransport implements Transport {
 
   @override
   Future<void> sendReceipt({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+  }) async {}
+
+  @override
+  Future<ScanInitResult> scanInit({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+    required int totalBytes,
+    required int chunkSize,
+  }) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<void> scanChunk({
+    required String scanId,
+    required String transferToken,
+    required int chunkIndex,
+    required Uint8List data,
+  }) async {}
+
+  @override
+  Future<ScanFinalizeResult> scanFinalize({
+    required String scanId,
+    required String transferToken,
+  }) {
+    throw UnimplementedError();
+  }
+}
+
+class RecordingTransport extends FakeTransport {
+  final List<int> sentOffsets = [];
+
+  @override
+  Future<void> sendChunk({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+    required int offset,
+    required Uint8List data,
+  }) async {
+    sentOffsets.add(offset);
+  }
+
+  @override
+  Future<void> finalizeTransfer({
     required String sessionId,
     required String transferId,
     required String transferToken,

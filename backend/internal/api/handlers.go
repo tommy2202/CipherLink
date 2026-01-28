@@ -823,11 +823,21 @@ func (s *Server) handleDownloadTransfer(w http.ResponseWriter, r *http.Request) 
 		writeIndistinguishable(w)
 		return
 	}
+	meta, err := s.store.GetTransferMeta(r.Context(), transferID)
+	if err != nil {
+		writeIndistinguishable(w)
+		return
+	}
 
 	end := start + int64(len(data)) - 1
+	totalBytes := meta.TotalBytes
+	if totalBytes <= 0 {
+		totalBytes = end + 1
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(start, 10)+"-"+strconv.FormatInt(end, 10)+"/*")
+	w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(start, 10)+"-"+strconv.FormatInt(end, 10)+"/"+strconv.FormatInt(totalBytes, 10))
+	w.Header().Set("Content-Length", strconv.FormatInt(int64(len(data)), 10))
 	w.WriteHeader(http.StatusPartialContent)
 	_, _ = w.Write(data)
 }
