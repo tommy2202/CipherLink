@@ -118,7 +118,10 @@ class HttpTransport implements Transport {
     );
 
     if (response.statusCode >= 400) {
-      throw TransportException('initTransfer failed: ${response.statusCode}');
+      throw TransportException(
+        'initTransfer failed: ${response.statusCode}',
+        statusCode: response.statusCode,
+      );
     }
 
     final payload = jsonDecode(response.body) as Map<String, dynamic>;
@@ -151,7 +154,10 @@ class HttpTransport implements Transport {
     );
 
     if (response.statusCode >= 400) {
-      throw TransportException('sendChunk failed: ${response.statusCode}');
+      throw TransportException(
+        'sendChunk failed: ${response.statusCode}',
+        statusCode: response.statusCode,
+      );
     }
   }
 
@@ -173,7 +179,10 @@ class HttpTransport implements Transport {
     );
 
     if (response.statusCode >= 400) {
-      throw TransportException('finalizeTransfer failed: ${response.statusCode}');
+      throw TransportException(
+        'finalizeTransfer failed: ${response.statusCode}',
+        statusCode: response.statusCode,
+      );
     }
   }
 
@@ -195,7 +204,10 @@ class HttpTransport implements Transport {
       headers: {'Authorization': 'Bearer $transferToken'},
     );
     if (response.statusCode >= 400) {
-      throw TransportException('fetchManifest failed: ${response.statusCode}');
+      throw TransportException(
+        'fetchManifest failed: ${response.statusCode}',
+        statusCode: response.statusCode,
+      );
     }
     return response.bodyBytes;
   }
@@ -223,7 +235,10 @@ class HttpTransport implements Transport {
       },
     );
     if (response.statusCode >= 400) {
-      throw TransportException('fetchRange failed: ${response.statusCode}');
+      throw TransportException(
+        'fetchRange failed: ${response.statusCode}',
+        statusCode: response.statusCode,
+      );
     }
     return response.bodyBytes;
   }
@@ -247,7 +262,10 @@ class HttpTransport implements Transport {
     );
 
     if (response.statusCode >= 400) {
-      throw TransportException('sendReceipt failed: ${response.statusCode}');
+      throw TransportException(
+        'sendReceipt failed: ${response.statusCode}',
+        statusCode: response.statusCode,
+      );
     }
   }
 
@@ -272,7 +290,10 @@ class HttpTransport implements Transport {
       }),
     );
     if (response.statusCode >= 400) {
-      throw TransportException('scanInit failed: ${response.statusCode}');
+      throw TransportException(
+        'scanInit failed: ${response.statusCode}',
+        statusCode: response.statusCode,
+      );
     }
     final payload = jsonDecode(response.body) as Map<String, dynamic>;
     final scanId = payload['scan_id']?.toString() ?? '';
@@ -302,7 +323,10 @@ class HttpTransport implements Transport {
       body: data,
     );
     if (response.statusCode >= 400) {
-      throw TransportException('scanChunk failed: ${response.statusCode}');
+      throw TransportException(
+        'scanChunk failed: ${response.statusCode}',
+        statusCode: response.statusCode,
+      );
     }
   }
 
@@ -321,7 +345,10 @@ class HttpTransport implements Transport {
       }),
     );
     if (response.statusCode >= 400) {
-      throw TransportException('scanFinalize failed: ${response.statusCode}');
+      throw TransportException(
+        'scanFinalize failed: ${response.statusCode}',
+        statusCode: response.statusCode,
+      );
     }
     final payload = jsonDecode(response.body) as Map<String, dynamic>;
     final status = payload['status']?.toString() ?? '';
@@ -330,9 +357,15 @@ class HttpTransport implements Transport {
 }
 
 class TransportException implements Exception {
-  TransportException(this.message);
+  TransportException(
+    this.message, {
+    this.statusCode,
+    this.cause,
+  });
 
   final String message;
+  final int? statusCode;
+  final Object? cause;
 
   @override
   String toString() => message;
