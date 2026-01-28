@@ -53,9 +53,9 @@ go test ./...
 ### Run
 
 ```bash
-cd app
-flutter pub get
-flutter run -d chrome
+cd app && flutter pub get
+flutter run -d android
+flutter run -d ios
 ```
 
 ### Verify
