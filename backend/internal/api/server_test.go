@@ -733,11 +733,11 @@ func createSession(t *testing.T, server *Server) sessionCreateResponse {
 	t.Helper()
 	rec := httptest.NewRecorder()
 	receiverPubKeyB64 := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x01}, 32))
-	payload, err := json.Marshal(sessionCreateRequest{ReceiverPubKeyB64: receiverPubKeyB64})
+	requestBody, err := json.Marshal(sessionCreateRequest{ReceiverPubKeyB64: receiverPubKeyB64})
 	if err != nil {
 		t.Fatalf("marshal create request: %v", err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/v1/session/create", bytes.NewBuffer(payload))
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/create", bytes.NewBuffer(requestBody))
 	req.Header.Set("Content-Type", "application/json")
 	server.Router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
