@@ -14,19 +14,32 @@ type RateLimit struct {
 }
 
 type Config struct {
-	Address               string
-	DataDir               string
-	RateLimitHealth       RateLimit
-	RateLimitV1           RateLimit
-	RateLimitSessionClaim RateLimit
-	ClaimTokenTTL         time.Duration
-	TransferTokenTTL      time.Duration
-	SweepInterval         time.Duration
-	MaxScanBytes          int64
-	MaxScanDuration       time.Duration
-	STUNURLs              []string
-	TURNURLs              []string
-	TURNSharedSecret      []byte
+	Address                         string
+	DataDir                         string
+	RateLimitHealth                 RateLimit
+	RateLimitV1                     RateLimit
+	RateLimitSessionClaim           RateLimit
+	ClaimTokenTTL                   time.Duration
+	TransferTokenTTL                time.Duration
+	DownloadTokenTTL                time.Duration
+	SweepInterval                   time.Duration
+	MaxScanBytes                    int64
+	MaxScanDuration                 time.Duration
+	STUNURLs                        []string
+	TURNURLs                        []string
+	TURNSharedSecret                []byte
+	QuotaSessionsPerDayIP           int64
+	QuotaSessionsPerDaySession      int64
+	QuotaTransfersPerDayIP          int64
+	QuotaTransfersPerDaySession     int64
+	QuotaBytesPerDayIP              int64
+	QuotaBytesPerDaySession         int64
+	QuotaConcurrentTransfersIP      int
+	QuotaConcurrentTransfersSession int
+	TransferBandwidthCapBps         int64
+	GlobalBandwidthCapBps           int64
+	RelayPerIdentityPerDay          int64
+	RelayConcurrentPerIdentity      int
 }
 
 const (
@@ -101,6 +114,9 @@ func Load() Config {
 	if cfg.TransferTokenTTL < MinTransferTokenTTL || cfg.TransferTokenTTL > MaxTransferTokenTTL {
 		cfg.TransferTokenTTL = DefaultTransferTokenTTL
 	}
+	if value := parseDurationEnv("UD_DOWNLOAD_TOKEN_TTL"); value > 0 {
+		cfg.DownloadTokenTTL = value
+	}
 	if value := parseDurationEnv("UD_SWEEP_INTERVAL"); value > 0 {
 		cfg.SweepInterval = value
 	}
@@ -118,6 +134,42 @@ func Load() Config {
 	}
 	if secret := parseBase64Env("UD_TURN_SHARED_SECRET_B64"); len(secret) > 0 {
 		cfg.TURNSharedSecret = secret
+	}
+	if value := parseIntEnv("UD_QUOTA_IP_SESSIONS_PER_DAY"); value > 0 {
+		cfg.QuotaSessionsPerDayIP = value
+	}
+	if value := parseIntEnv("UD_QUOTA_SESSION_SESSIONS_PER_DAY"); value > 0 {
+		cfg.QuotaSessionsPerDaySession = value
+	}
+	if value := parseIntEnv("UD_QUOTA_IP_TRANSFERS_PER_DAY"); value > 0 {
+		cfg.QuotaTransfersPerDayIP = value
+	}
+	if value := parseIntEnv("UD_QUOTA_SESSION_TRANSFERS_PER_DAY"); value > 0 {
+		cfg.QuotaTransfersPerDaySession = value
+	}
+	if value := parseIntEnv("UD_QUOTA_IP_BYTES_PER_DAY"); value > 0 {
+		cfg.QuotaBytesPerDayIP = value
+	}
+	if value := parseIntEnv("UD_QUOTA_SESSION_BYTES_PER_DAY"); value > 0 {
+		cfg.QuotaBytesPerDaySession = value
+	}
+	if value := parseIntEnv("UD_QUOTA_IP_CONCURRENT_TRANSFERS"); value > 0 {
+		cfg.QuotaConcurrentTransfersIP = int(value)
+	}
+	if value := parseIntEnv("UD_QUOTA_SESSION_CONCURRENT_TRANSFERS"); value > 0 {
+		cfg.QuotaConcurrentTransfersSession = int(value)
+	}
+	if value := parseIntEnv("UD_TRANSFER_BANDWIDTH_BPS"); value > 0 {
+		cfg.TransferBandwidthCapBps = value
+	}
+	if value := parseIntEnv("UD_GLOBAL_BANDWIDTH_BPS"); value > 0 {
+		cfg.GlobalBandwidthCapBps = value
+	}
+	if value := parseIntEnv("UD_RELAY_ISSUANCE_PER_DAY"); value > 0 {
+		cfg.RelayPerIdentityPerDay = value
+	}
+	if value := parseIntEnv("UD_RELAY_CONCURRENT_SESSIONS"); value > 0 {
+		cfg.RelayConcurrentPerIdentity = int(value)
 	}
 
 	return cfg

@@ -14,6 +14,10 @@ All items use RFC 2119 language.
 - T8: Scanner unavailable misinterpreted
 - T9: Metadata leakage
 - T10: Integrity failure
+- T11: P2P signaling abuse
+- T12: TURN relay cost abuse
+- T13: Resource exhaustion (quota/bandwidth)
+- T14: Download token replay
 
 ## MUST Requirements
 
@@ -29,6 +33,12 @@ All items use RFC 2119 language.
 - R-MUST-10 (T9): Logs MUST use allowlist and MUST NOT include secrets.
 - R-MUST-11 (T7): ZIP extraction MUST prevent path traversal (Zip Slip).
 - R-MUST-12 (T10): AEAD MUST bind session_id, transfer_id, chunk_index, direction.
+- R-MUST-13 (T11): P2P signaling/ICE config MUST require approval + SAS verification.
+- R-MUST-14 (T12): TURN relay issuance MUST be quota-limited per identity/day and concurrent.
+- R-MUST-15 (T13): Per-IP and per-session quotas MUST cap sessions/transfers/bytes/concurrency.
+- R-MUST-16 (T13): Bandwidth caps MUST apply per transfer and globally when configured.
+- R-MUST-17 (T14): Download tokens MUST be short-lived and single-use.
+- R-MUST-18 (T9): Metrics MUST be privacy-safe counters only (no labels or filenames).
 
 ## SHOULD Requirements
 
@@ -36,6 +46,7 @@ All items use RFC 2119 language.
 - R-SHOULD-2 (T4): Scan limits SHOULD cap bytes and time.
 - R-SHOULD-3 (T6): Scan session chunks SHOULD be deleted on TTL sweep.
 - R-SHOULD-4 (T7): Extraction UI SHOULD keep original ZIP on failure.
+- R-SHOULD-5 (T13): Throttling SHOULD favor indistinguishable errors on protected endpoints.
 
 ## MAY Requirements
 

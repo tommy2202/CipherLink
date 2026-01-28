@@ -115,6 +115,17 @@ type transferFinalizeRequest struct {
 	TransferToken string `json:"transfer_token"`
 }
 
+type downloadTokenRequest struct {
+	SessionID     string `json:"session_id"`
+	TransferID    string `json:"transfer_id"`
+	TransferToken string `json:"transfer_token"`
+}
+
+type downloadTokenResponse struct {
+	DownloadToken string `json:"download_token"`
+	ExpiresAt     string `json:"expires_at"`
+}
+
 type transferReceiptRequest struct {
 	SessionID     string `json:"session_id"`
 	TransferID    string `json:"transfer_id"`
@@ -167,6 +178,16 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if keyBytes, err := base64.StdEncoding.DecodeString(req.ReceiverPubKeyB64); err != nil || len(keyBytes) != 32 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	ip := clientIP(r)
+	if !s.quotas.AllowSession(ip, "", s.cfg.QuotaSessionsPerDayIP, s.cfg.QuotaSessionsPerDaySession) {
+		logging.Allowlist(s.logger, map[string]string{
+			"event":   "quota_blocked",
+			"scope":   "session_create",
+			"ip_hash": anonHash(ip),
+		})
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "quota_exceeded"})
 		return
 	}
 
@@ -643,6 +664,17 @@ func p2pScope(sessionID string, claimID string) string {
 	return "p2p:session:" + sessionID + ":claim:" + claimID
 }
 
+func (s *Server) downloadTokenTTL() time.Duration {
+	ttl := s.cfg.DownloadTokenTTL
+	if ttl <= 0 {
+		ttl = s.cfg.TransferTokenTTL
+	}
+	if ttl <= 0 {
+		ttl = config.DefaultTransferTokenTTL
+	}
+	return ttl
+}
+
 func (s *Server) handleGetTransferManifest(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.URL.Query().Get("session_id")
 	transferID := r.URL.Query().Get("transfer_id")
@@ -718,8 +750,31 @@ func (s *Server) handleInitTransfer(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	ip := clientIP(r)
+	if !s.quotas.BeginTransfer(
+		transferID,
+		ip,
+		session.ID,
+		s.cfg.QuotaTransfersPerDayIP,
+		s.cfg.QuotaTransfersPerDaySession,
+		s.cfg.QuotaConcurrentTransfersIP,
+		s.cfg.QuotaConcurrentTransfersSession,
+	) {
+		_ = s.transfers.DeleteOnReceipt(r.Context(), transferID)
+		logging.Allowlist(s.logger, map[string]string{
+			"event":            "quota_blocked",
+			"scope":            "transfer_create",
+			"ip_hash":          anonHash(ip),
+			"session_id_hash":  anonHash(session.ID),
+			"transfer_id_hash": anonHash(transferID),
+		})
+		writeIndistinguishable(w)
+		return
+	}
 
 	if err := s.setTransferID(r.Context(), session, claimID, transferID); err != nil {
+		s.quotas.EndTransfer(transferID)
+		_ = s.transfers.DeleteOnReceipt(r.Context(), transferID)
 		writeIndistinguishable(w)
 		return
 	}
@@ -752,12 +807,29 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 		writeIndistinguishable(w)
 		return
 	}
+	ip := clientIP(r)
 
 	r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
 	data, err := io.ReadAll(r.Body)
 	if err != nil || len(data) == 0 {
 		writeIndistinguishable(w)
 		return
+	}
+	if !s.quotas.AddBytes(ip, session.ID, int64(len(data)), s.cfg.QuotaBytesPerDayIP, s.cfg.QuotaBytesPerDaySession) {
+		logging.Allowlist(s.logger, map[string]string{
+			"event":            "quota_blocked",
+			"scope":            "upload_bytes",
+			"ip_hash":          anonHash(ip),
+			"session_id_hash":  anonHash(session.ID),
+			"transfer_id_hash": anonHash(transferID),
+		})
+		writeIndistinguishable(w)
+		return
+	}
+	waitTransfer := s.throttles.ReserveTransfer(transferID, int64(len(data)))
+	waitGlobal := s.throttles.ReserveGlobal(int64(len(data)))
+	if delay := maxDuration(waitTransfer, waitGlobal); delay > 0 {
+		time.Sleep(delay)
 	}
 
 	if err := s.transfers.AcceptChunk(r.Context(), transferID, offset, data); err != nil {
@@ -802,6 +874,44 @@ func (s *Server) handleFinalizeTransfer(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (s *Server) handleDownloadToken(w http.ResponseWriter, r *http.Request) {
+	var req downloadTokenRequest
+	if err := decodeJSON(w, r, &req, 8<<10); err != nil {
+		writeIndistinguishable(w)
+		return
+	}
+	if req.SessionID == "" || req.TransferID == "" || req.TransferToken == "" {
+		writeIndistinguishable(w)
+		return
+	}
+	session, claimID, ok := s.authorizeTransfer(r.Context(), req.SessionID, req.TransferToken)
+	if !ok {
+		writeIndistinguishable(w)
+		return
+	}
+	claim, ok := findClaim(session, claimID)
+	if !ok || claim.TransferID == "" || claim.TransferID != req.TransferID || !claim.TransferReady {
+		writeIndistinguishable(w)
+		return
+	}
+	ttl := s.downloadTokenTTL()
+	token, expiresAt, err := s.downloadTokens.Issue(session.ID, claimID, req.TransferID, ttl)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+		return
+	}
+	logging.Allowlist(s.logger, map[string]string{
+		"event":            "download_token_issued",
+		"session_id_hash":  anonHash(session.ID),
+		"claim_id_hash":    anonHash(claimID),
+		"transfer_id_hash": anonHash(req.TransferID),
+	})
+	writeJSON(w, http.StatusOK, downloadTokenResponse{
+		DownloadToken: token,
+		ExpiresAt:     expiresAt.Format(time.RFC3339),
+	})
+}
+
 func (s *Server) handleDownloadTransfer(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.URL.Query().Get("session_id")
 	transferID := r.URL.Query().Get("transfer_id")
@@ -817,16 +927,52 @@ func (s *Server) handleDownloadTransfer(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	token := bearerToken(r)
-	session, claimID, ok := s.authorizeTransfer(r.Context(), sessionID, token)
-	if !ok {
-		writeIndistinguishable(w)
-		return
-	}
-	claim, ok := findClaim(session, claimID)
-	if !ok || claim.TransferID == "" || claim.TransferID != transferID || !claim.TransferReady {
-		writeIndistinguishable(w)
-		return
+	ip := clientIP(r)
+	downloadToken := headerValue(r, "download_token")
+	var session domain.Session
+	var claim domain.SessionClaim
+	claimID := ""
+	if downloadToken != "" {
+		var err error
+		session, err = s.store.GetSession(r.Context(), sessionID)
+		if err != nil {
+			writeIndistinguishable(w)
+			return
+		}
+		if time.Now().UTC().After(session.ExpiresAt) {
+			writeIndistinguishable(w)
+			return
+		}
+		claimFound := false
+		for _, candidate := range session.Claims {
+			if candidate.TransferID == transferID {
+				claim = candidate
+				claimFound = true
+				break
+			}
+		}
+		if !claimFound || !claim.TransferReady {
+			writeIndistinguishable(w)
+			return
+		}
+		claimID = claim.ID
+		if !s.downloadTokens.Consume(session.ID, claimID, transferID, downloadToken) {
+			writeIndistinguishable(w)
+			return
+		}
+	} else {
+		token := bearerToken(r)
+		var ok bool
+		session, claimID, ok = s.authorizeTransfer(r.Context(), sessionID, token)
+		if !ok {
+			writeIndistinguishable(w)
+			return
+		}
+		claim, ok = findClaim(session, claimID)
+		if !ok || claim.TransferID == "" || claim.TransferID != transferID || !claim.TransferReady {
+			writeIndistinguishable(w)
+			return
+		}
 	}
 
 	data, err := s.transfers.ReadRange(r.Context(), transferID, start, length)
@@ -838,10 +984,27 @@ func (s *Server) handleDownloadTransfer(w http.ResponseWriter, r *http.Request) 
 		writeIndistinguishable(w)
 		return
 	}
+	if !s.quotas.AddBytes(ip, session.ID, int64(len(data)), s.cfg.QuotaBytesPerDayIP, s.cfg.QuotaBytesPerDaySession) {
+		logging.Allowlist(s.logger, map[string]string{
+			"event":            "quota_blocked",
+			"scope":            "download_bytes",
+			"ip_hash":          anonHash(ip),
+			"session_id_hash":  anonHash(session.ID),
+			"transfer_id_hash": anonHash(transferID),
+		})
+		writeIndistinguishable(w)
+		return
+	}
 	meta, err := s.store.GetTransferMeta(r.Context(), transferID)
 	if err != nil {
 		writeIndistinguishable(w)
 		return
+	}
+
+	waitTransfer := s.throttles.ReserveTransfer(transferID, int64(len(data)))
+	waitGlobal := s.throttles.ReserveGlobal(int64(len(data)))
+	if delay := maxDuration(waitTransfer, waitGlobal); delay > 0 {
+		time.Sleep(delay)
 	}
 
 	end := start + int64(len(data)) - 1
@@ -887,6 +1050,8 @@ func (s *Server) handleTransferReceipt(w http.ResponseWriter, r *http.Request) {
 		writeIndistinguishable(w)
 		return
 	}
+	s.quotas.EndTransfer(req.TransferID)
+	s.throttles.ForgetTransfer(req.TransferID)
 
 	logging.Allowlist(s.logger, map[string]string{
 		"event":            "transfer_receipt",
@@ -977,6 +1142,17 @@ func (s *Server) handleScanChunk(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxScanBytes)
 	data, err := io.ReadAll(r.Body)
 	if err != nil || len(data) == 0 {
+		writeIndistinguishable(w)
+		return
+	}
+	ip := clientIP(r)
+	if !s.quotas.AddBytes(ip, scanSession.SessionID, int64(len(data)), s.cfg.QuotaBytesPerDayIP, s.cfg.QuotaBytesPerDaySession) {
+		logging.Allowlist(s.logger, map[string]string{
+			"event":           "quota_blocked",
+			"scope":           "scan_bytes",
+			"ip_hash":         anonHash(ip),
+			"session_id_hash": anonHash(scanSession.SessionID),
+		})
 		writeIndistinguishable(w)
 		return
 	}
@@ -1162,4 +1338,11 @@ func parseRange(header string) (int64, int64, bool) {
 		return 0, 0, false
 	}
 	return start, end - start + 1, true
+}
+
+func maxDuration(a time.Duration, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
 }

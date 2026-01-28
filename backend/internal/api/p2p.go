@@ -11,6 +11,7 @@ import (
 
 	"universaldrop/internal/config"
 	"universaldrop/internal/domain"
+	"universaldrop/internal/logging"
 	"universaldrop/internal/storage"
 )
 
@@ -162,6 +163,20 @@ func (s *Server) handleP2PIceConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "turn_unavailable"})
 		return
 	}
+	if mode == "relay" {
+		ttl := s.turnCredentialTTL()
+		identity := sessionID + ":" + claimID
+		if !s.quotas.AllowRelay(identity, s.cfg.RelayPerIdentityPerDay, s.cfg.RelayConcurrentPerIdentity, ttl) {
+			logging.Allowlist(s.logger, map[string]string{
+				"event":           "quota_blocked",
+				"scope":           "relay_issue",
+				"session_id_hash": anonHash(sessionID),
+				"claim_id_hash":   anonHash(claimID),
+			})
+			writeIndistinguishable(w)
+			return
+		}
+	}
 
 	response := p2pIceConfigResponse{
 		STUNURLs: s.cfg.STUNURLs,
@@ -248,14 +263,19 @@ func (s *Server) drainP2PMessages(ctx context.Context, session domain.Session, c
 }
 
 func (s *Server) issueTurnCredentials(sessionID string, claimID string) (string, string, int64) {
-	ttl := s.cfg.TransferTokenTTL
-	if ttl <= 0 {
-		ttl = config.DefaultTransferTokenTTL
-	}
+	ttl := s.turnCredentialTTL()
 	expiresAt := time.Now().UTC().Add(ttl).Unix()
 	username := sessionID + ":" + claimID + ":" + strconv.FormatInt(expiresAt, 10)
 	mac := hmac.New(sha1.New, s.cfg.TURNSharedSecret)
 	_, _ = mac.Write([]byte(username))
 	credential := base64.StdEncoding.EncodeToString(mac.Sum(nil))
 	return username, credential, int64(ttl.Seconds())
+}
+
+func (s *Server) turnCredentialTTL() time.Duration {
+	ttl := s.cfg.TransferTokenTTL
+	if ttl <= 0 {
+		ttl = config.DefaultTransferTokenTTL
+	}
+	return ttl
 }

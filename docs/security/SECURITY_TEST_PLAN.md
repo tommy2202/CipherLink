@@ -13,6 +13,11 @@ Validates MUST requirements from SECURITY_REQUIREMENTS_SPEC.md.
 - TP-5 (R-MUST-8): Scanner unavailable => status "unavailable".
 - TP-6 (R-MUST-9): Scan-copy deleted after scan finalize.
 - TP-7 (R-MUST-3): Transfer token scope enforced.
+- TP-12 (R-MUST-15): Transfer/day quota blocks extra transfers (indistinguishable).
+- TP-13 (R-MUST-16): Throttle delay sanity for upload/download.
+- TP-14 (R-MUST-14): TURN relay quota blocks extra relay issuance.
+- TP-15 (R-MUST-17): Download token single-use/short TTL.
+- TP-16 (R-MUST-4/R-MUST-15): Protected endpoints keep indistinguishable errors on quota exceed.
 
 ## App Tests
 

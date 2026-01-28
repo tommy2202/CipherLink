@@ -86,6 +86,172 @@ func TestRateLimitTriggers(t *testing.T) {
 	}
 }
 
+func TestQuotaBlocksExtraTransfers(t *testing.T) {
+	store := &stubStorage{}
+	server := NewServer(Dependencies{
+		Config: config.Config{
+			Address:                     ":0",
+			DataDir:                     "data",
+			RateLimitHealth:             config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:                 config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitSessionClaim:       config.RateLimit{Max: 100, Window: time.Minute},
+			ClaimTokenTTL:               config.DefaultClaimTokenTTL,
+			TransferTokenTTL:            config.DefaultTransferTokenTTL,
+			MaxScanBytes:                config.DefaultMaxScanBytes,
+			MaxScanDuration:             config.DefaultMaxScanDuration,
+			QuotaTransfersPerDaySession: 1,
+		},
+		Store:   store,
+		Tokens:  token.NewMemoryService(),
+		Scanner: scanner.UnavailableScanner{},
+	})
+
+	createResp := createSession(t, server)
+	senderPubKey := base64.StdEncoding.EncodeToString([]byte("pubkey"))
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: senderPubKey,
+	})
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+
+	initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                4,
+	})
+
+	rec := initTransferRecorder(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest2")),
+		TotalBytes:                4,
+	})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rec.Code)
+	}
+}
+
+func TestUploadThrottleDelaysResponse(t *testing.T) {
+	store := &stubStorage{}
+	server := NewServer(Dependencies{
+		Config: config.Config{
+			Address:                 ":0",
+			DataDir:                 "data",
+			RateLimitHealth:         config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:             config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitSessionClaim:   config.RateLimit{Max: 100, Window: time.Minute},
+			ClaimTokenTTL:           config.DefaultClaimTokenTTL,
+			TransferTokenTTL:        config.DefaultTransferTokenTTL,
+			MaxScanBytes:            config.DefaultMaxScanBytes,
+			MaxScanDuration:         config.DefaultMaxScanDuration,
+			TransferBandwidthCapBps: 50,
+		},
+		Store:   store,
+		Tokens:  token.NewMemoryService(),
+		Scanner: scanner.UnavailableScanner{},
+	})
+
+	createResp := createSession(t, server)
+	senderPubKey := base64.StdEncoding.EncodeToString([]byte("pubkey"))
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: senderPubKey,
+	})
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	initResp := initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                10,
+	})
+
+	data := bytes.Repeat([]byte("a"), 10)
+	req := httptest.NewRequest(http.MethodPut, "/v1/transfer/chunk", bytes.NewBuffer(data))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Authorization", "Bearer "+approveResp.TransferToken)
+	req.Header.Set("session_id", createResp.SessionID)
+	req.Header.Set("transfer_id", initResp.TransferID)
+	req.Header.Set("offset", "0")
+	rec := httptest.NewRecorder()
+	start := time.Now()
+	server.Router.ServeHTTP(rec, req)
+	elapsed := time.Since(start)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected chunk 200 got %d", rec.Code)
+	}
+	if elapsed < 150*time.Millisecond {
+		t.Fatalf("expected throttle delay, got %v", elapsed)
+	}
+}
+
+func TestRelayQuotaBlocksExtraIssuance(t *testing.T) {
+	store := &stubStorage{}
+	server := NewServer(Dependencies{
+		Config: config.Config{
+			Address:                ":0",
+			DataDir:                "data",
+			RateLimitHealth:        config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:            config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitSessionClaim:  config.RateLimit{Max: 100, Window: time.Minute},
+			ClaimTokenTTL:          config.DefaultClaimTokenTTL,
+			TransferTokenTTL:       config.DefaultTransferTokenTTL,
+			MaxScanBytes:           config.DefaultMaxScanBytes,
+			MaxScanDuration:        config.DefaultMaxScanDuration,
+			TURNURLs:               []string{"turn:relay.example"},
+			TURNSharedSecret:       []byte("secret"),
+			RelayPerIdentityPerDay: 1,
+		},
+		Store:   store,
+		Tokens:  token.NewMemoryService(),
+		Scanner: scanner.UnavailableScanner{},
+	})
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	tokenValue := approveResp.P2PToken
+	if tokenValue == "" {
+		tokenValue = approveResp.TransferToken
+	}
+
+	first := p2pIceConfigRecorder(t, server, tokenValue, createResp.SessionID, claimResp.ClaimID, "relay")
+	if first.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d", first.Code)
+	}
+	second := p2pIceConfigRecorder(t, server, tokenValue, createResp.SessionID, claimResp.ClaimID, "relay")
+	if second.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", second.Code)
+	}
+}
+
 func TestCreateSessionRequiresReceiverPubKey(t *testing.T) {
 	server := newSessionTestServer(&stubStorage{})
 
