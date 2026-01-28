@@ -206,6 +206,122 @@ func TestApproveSucceedsAfterSASConfirmed(t *testing.T) {
 	}
 }
 
+func TestP2PSignalingRejectsWithoutSAS(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+
+	session, err := store.GetSession(context.Background(), createResp.SessionID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	for i, claim := range session.Claims {
+		if claim.ID != claimResp.ClaimID {
+			continue
+		}
+		claim.Status = domain.SessionClaimApproved
+		claim.UpdatedAt = time.Now().UTC()
+		session.Claims[i] = claim
+	}
+	if err := store.UpdateSession(context.Background(), session); err != nil {
+		t.Fatalf("update session: %v", err)
+	}
+	if err := store.SaveSessionAuthContext(context.Background(), domain.SessionAuthContext{
+		SessionID:         session.ID,
+		ClaimID:           claimResp.ClaimID,
+		SenderPubKeyB64:   claimResp.SenderPubKeyB64,
+		ReceiverPubKeyB64: session.ReceiverPubKeyB64,
+		ApprovedAt:        time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("save auth: %v", err)
+	}
+	tokenValue, err := server.tokens.Issue(context.Background(), p2pScope(session.ID, claimResp.ClaimID), time.Minute)
+	if err != nil {
+		t.Fatalf("issue token: %v", err)
+	}
+
+	rec := p2pOfferRecorder(t, server, tokenValue, p2pOfferRequest{
+		SessionID: session.ID,
+		ClaimID:   claimResp.ClaimID,
+		SDP:       "v=0",
+	})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rec.Code)
+	}
+}
+
+func TestP2PSignalingRejectsWithoutAuth(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
+
+	approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+
+	rec := p2pOfferRecorder(t, server, "", p2pOfferRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		SDP:       "v=0",
+	})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rec.Code)
+	}
+}
+
+func TestP2PIceConfigRelayRequiresTurn(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
+	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
+
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+
+	rec := p2pIceConfigRecorder(t, server, approveResp.TransferToken, createResp.SessionID, claimResp.ClaimID, "relay")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 got %d", rec.Code)
+	}
+	var payload map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload["error"] != "turn_unavailable" {
+		t.Fatalf("expected turn_unavailable")
+	}
+}
+
 func TestIndistinguishableErrors(t *testing.T) {
 	store := &stubStorage{}
 	tokens := token.NewMemoryService()
@@ -1156,6 +1272,37 @@ func manifestRequestRecorder(t *testing.T, server *Server, sessionID string, tra
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/v1/transfer/manifest?session_id="+sessionID+"&transfer_id="+transferID, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	return rec
+}
+
+func p2pOfferRecorder(t *testing.T, server *Server, token string, reqBody p2pOfferRequest) *httptest.ResponseRecorder {
+	t.Helper()
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		t.Fatalf("marshal p2p offer: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/p2p/offer", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	return rec
+}
+
+func p2pIceConfigRecorder(t *testing.T, server *Server, token string, sessionID string, claimID string, mode string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/v1/p2p/ice_config?session_id="+sessionID+"&claim_id="+claimID+"&mode="+mode,
+		nil,
+	)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	rec := httptest.NewRecorder()
 	server.Router.ServeHTTP(rec, req)
 	return rec

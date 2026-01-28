@@ -107,6 +107,13 @@ func (s *Server) routes() http.Handler {
 		r.Get("/session/sas/status", s.handleSASStatus)
 		r.Get("/session/poll", s.handlePollSession)
 		r.Post("/session/create", s.handleCreateSession)
+		r.Route("/p2p", func(r chi.Router) {
+			r.Post("/offer", s.handleP2POffer)
+			r.Post("/answer", s.handleP2PAnswer)
+			r.Post("/ice", s.handleP2PICE)
+			r.Get("/poll", s.handleP2PPoll)
+			r.Get("/ice_config", s.handleP2PIceConfig)
+		})
 		r.Post("/transfer/init", s.handleInitTransfer)
 		r.Put("/transfer/chunk", s.handleUploadChunk)
 		r.Post("/transfer/finalize", s.handleFinalizeTransfer)

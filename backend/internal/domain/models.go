@@ -29,6 +29,12 @@ type TransferMeta struct {
 	ScanStatus    ScanStatus     `json:"scan_status"`
 }
 
+type P2PMessage struct {
+	Type      string `json:"type"`
+	SDP       string `json:"sdp,omitempty"`
+	Candidate string `json:"candidate,omitempty"`
+}
+
 type SessionClaimStatus string
 
 const (
@@ -50,6 +56,7 @@ type SessionClaim struct {
 	TransferReady        bool               `json:"transfer_ready,omitempty"`
 	ScanRequired         bool               `json:"scan_required,omitempty"`
 	ScanStatus           ScanStatus         `json:"scan_status,omitempty"`
+	P2PMessages          []P2PMessage       `json:"p2p_messages,omitempty"`
 }
 
 type Session struct {

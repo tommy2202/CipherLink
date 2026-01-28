@@ -67,6 +67,7 @@ type sessionPollSenderResponse struct {
 	SASState          string `json:"sas_state"`
 	ReceiverPubKeyB64 string `json:"receiver_pubkey_b64,omitempty"`
 	TransferToken     string `json:"transfer_token,omitempty"`
+	P2PToken          string `json:"p2p_token,omitempty"`
 	ScanRequired      bool   `json:"scan_required,omitempty"`
 	ScanStatus        string `json:"scan_status,omitempty"`
 }
@@ -81,6 +82,7 @@ type sessionApproveRequest struct {
 type sessionApproveResponse struct {
 	Status          string `json:"status"`
 	TransferToken   string `json:"transfer_token,omitempty"`
+	P2PToken        string `json:"p2p_token,omitempty"`
 	SenderPubKeyB64 string `json:"sender_pubkey_b64,omitempty"`
 }
 
@@ -385,6 +387,11 @@ func (s *Server) handleApproveSession(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
 		return
 	}
+	p2pToken, err := s.tokens.Issue(r.Context(), p2pScope(session.ID, claim.ID), s.cfg.TransferTokenTTL)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+		return
+	}
 
 	logging.Allowlist(s.logger, map[string]string{
 		"event":           "session_approved",
@@ -395,6 +402,7 @@ func (s *Server) handleApproveSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, sessionApproveResponse{
 		Status:          string(domain.SessionClaimApproved),
 		TransferToken:   transferToken,
+		P2PToken:        p2pToken,
 		SenderPubKeyB64: claim.SenderPubKeyB64,
 	})
 }
@@ -425,6 +433,7 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 		status := domain.SessionClaimPending
 		claimID := ""
 		transferToken := ""
+		p2pToken := ""
 		sasState := "pending"
 		if len(session.Claims) > 0 {
 			claimID = session.Claims[0].ID
@@ -447,6 +456,7 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 			if status == domain.SessionClaimApproved {
 				if _, err := s.store.GetSessionAuthContext(r.Context(), session.ID, claimID); err == nil {
 					transferToken, _ = s.tokens.Issue(r.Context(), scope, s.cfg.TransferTokenTTL)
+					p2pToken, _ = s.tokens.Issue(r.Context(), p2pScope(session.ID, claimID), s.cfg.TransferTokenTTL)
 				}
 			}
 		}
@@ -458,6 +468,7 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 			SASState:          sasState,
 			ReceiverPubKeyB64: session.ReceiverPubKeyB64,
 			TransferToken:     transferToken,
+			P2PToken:          p2pToken,
 			ScanRequired:      scanRequired,
 			ScanStatus:        scanStatus,
 		})
@@ -626,6 +637,10 @@ func sasStateForClaims(claims []sessionPollClaimSummary) string {
 
 func transferScope(sessionID string, claimID string) string {
 	return "transfer:session:" + sessionID + ":claim:" + claimID
+}
+
+func p2pScope(sessionID string, claimID string) string {
+	return "p2p:session:" + sessionID + ":claim:" + claimID
 }
 
 func (s *Server) handleGetTransferManifest(w http.ResponseWriter, r *http.Request) {

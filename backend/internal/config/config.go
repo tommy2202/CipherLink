@@ -1,8 +1,10 @@
 package config
 
 import (
+	"encoding/base64"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -22,6 +24,9 @@ type Config struct {
 	SweepInterval         time.Duration
 	MaxScanBytes          int64
 	MaxScanDuration       time.Duration
+	STUNURLs              []string
+	TURNURLs              []string
+	TURNSharedSecret      []byte
 }
 
 const (
@@ -105,6 +110,15 @@ func Load() Config {
 	if value := parseDurationEnv("UD_MAX_SCAN_DURATION"); value > 0 {
 		cfg.MaxScanDuration = value
 	}
+	if values := parseCSVEnv("UD_STUN_URLS"); len(values) > 0 {
+		cfg.STUNURLs = values
+	}
+	if values := parseCSVEnv("UD_TURN_URLS"); len(values) > 0 {
+		cfg.TURNURLs = values
+	}
+	if secret := parseBase64Env("UD_TURN_SHARED_SECRET_B64"); len(secret) > 0 {
+		cfg.TURNSharedSecret = secret
+	}
 
 	return cfg
 }
@@ -131,4 +145,37 @@ func parseIntEnv(key string) int64 {
 		return 0
 	}
 	return value
+}
+
+func parseCSVEnv(key string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+		values = append(values, trimmed)
+	}
+	return values
+}
+
+func parseBase64Env(key string) []byte {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err == nil {
+		return decoded
+	}
+	decoded, err = base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil
+	}
+	return decoded
 }
