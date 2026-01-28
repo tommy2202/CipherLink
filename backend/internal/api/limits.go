@@ -258,13 +258,14 @@ func (b *bandwidthLimiter) Reserve(bytes int64) time.Duration {
 		return 0
 	}
 	now := time.Now()
-	if b.next.IsZero() || now.After(b.next) {
-		b.next = now
-	}
 	duration := time.Duration(float64(bytes) / float64(b.rateBps) * float64(time.Second))
 	start := b.next
-	b.next = b.next.Add(duration)
-	wait := start.Sub(now)
+	if start.IsZero() || now.After(start) {
+		start = now
+	}
+	end := start.Add(duration)
+	b.next = end
+	wait := end.Sub(now)
 	if wait < 0 {
 		return 0
 	}
