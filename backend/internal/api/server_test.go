@@ -885,6 +885,54 @@ func TestChunkRetryIdempotent(t *testing.T) {
 	}
 }
 
+func TestChunkConflictRejected(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	if approveResp.TransferToken == "" {
+		t.Fatalf("expected transfer token")
+	}
+
+	initResp := initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                4,
+	})
+
+	rec := uploadChunkRecorder(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("data"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected chunk 200 got %d", rec.Code)
+	}
+	rec = uploadChunkRecorder(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("data"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected retry 200 got %d", rec.Code)
+	}
+	rec = uploadChunkRecorder(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("diff"))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected conflict 409 got %d", rec.Code)
+	}
+	var resp map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode conflict response: %v", err)
+	}
+	if resp["error"] != "chunk_conflict" {
+		t.Fatalf("expected chunk_conflict error got %q", resp["error"])
+	}
+}
+
 func TestReceiptDeletesTransferArtifacts(t *testing.T) {
 	store := &stubStorage{}
 	server := newSessionTestServer(store)
@@ -1358,6 +1406,14 @@ func initTransferRecorder(t *testing.T, server *Server, reqBody transferInitRequ
 
 func uploadChunk(t *testing.T, server *Server, sessionID string, transferID string, token string, offset int64, data []byte) {
 	t.Helper()
+	rec := uploadChunkRecorder(t, server, sessionID, transferID, token, offset, data)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected chunk 200 got %d", rec.Code)
+	}
+}
+
+func uploadChunkRecorder(t *testing.T, server *Server, sessionID string, transferID string, token string, offset int64, data []byte) *httptest.ResponseRecorder {
+	t.Helper()
 	req := httptest.NewRequest(http.MethodPut, "/v1/transfer/chunk", bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -1366,9 +1422,7 @@ func uploadChunk(t *testing.T, server *Server, sessionID string, transferID stri
 	req.Header.Set("offset", strconv.FormatInt(offset, 10))
 	rec := httptest.NewRecorder()
 	server.Router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected chunk 200 got %d", rec.Code)
-	}
+	return rec
 }
 
 func finalizeTransfer(t *testing.T, server *Server, sessionID string, transferID string, token string) {
