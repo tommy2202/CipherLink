@@ -27,6 +27,8 @@ import 'transfer_manifest.dart';
 import 'transfer_coordinator.dart';
 import 'transfer_state_store.dart';
 import 'transport.dart';
+import 'trust_store.dart';
+import 'trusted_device_badge.dart';
 import 'zip_extract.dart';
 
 void main() {
@@ -91,6 +93,7 @@ class _HomeScreenState extends State<HomeScreen> {
   final SaveService _saveService = DefaultSaveService();
   late final DestinationSelector _destinationSelector =
       DestinationSelector(_destinationStore);
+  final TrustStore _trustStore = const TrustStore();
   final TextEditingController _textTitleController = TextEditingController();
   final TextEditingController _textContentController = TextEditingController();
   bool _sendTextMode = false;
@@ -176,6 +179,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final disclosureShown = prefs.getBool(_p2pDisclosureKey) ?? false;
     final enableBackground =
         prefs.getBool(_experimentalBackgroundTransportKey) ?? false;
+    final trustedFingerprints = await _trustStore.loadFingerprints();
     if (!mounted) {
       return;
     }
@@ -184,6 +188,9 @@ class _HomeScreenState extends State<HomeScreen> {
       _alwaysRelay = alwaysRelay;
       _p2pDisclosureShown = disclosureShown;
       _enableExperimentalBackgroundTransport = enableBackground;
+      _trustedFingerprints
+        ..clear()
+        ..addAll(trustedFingerprints);
     });
   }
 
@@ -258,6 +265,72 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _p2pDisclosureShown = true;
     });
+  }
+
+  Future<void> _addTrustedFingerprint(String fingerprint) async {
+    final updated = await _trustStore.addFingerprint(fingerprint);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _trustedFingerprints
+        ..clear()
+        ..addAll(updated);
+    });
+  }
+
+  Future<void> _removeTrustedFingerprint(String fingerprint) async {
+    final updated = await _trustStore.removeFingerprint(fingerprint);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _trustedFingerprints
+        ..clear()
+        ..addAll(updated);
+    });
+  }
+
+  String _formatFingerprint(String fingerprint) {
+    final trimmed = fingerprint.trim();
+    if (trimmed.length <= 12) {
+      return trimmed;
+    }
+    return '${trimmed.substring(0, 6)}...${trimmed.substring(trimmed.length - 4)}';
+  }
+
+  List<Widget> _buildTrustedDevicesSection() {
+    final entries = _trustedFingerprints.toList()..sort();
+    if (entries.isEmpty) {
+      return const [
+        Text(
+          'Trusted devices',
+          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+        ),
+        SizedBox(height: 8),
+        Text('No trusted devices yet.'),
+      ];
+    }
+    return [
+      const Text(
+        'Trusted devices',
+        style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+      ),
+      const SizedBox(height: 8),
+      ...entries.map((fingerprint) {
+        return ListTile(
+          contentPadding: EdgeInsets.zero,
+          title: Text(_formatFingerprint(fingerprint)),
+          trailing: IconButton(
+            tooltip: 'Remove',
+            icon: const Icon(Icons.delete_outline),
+            onPressed: () {
+              _removeTrustedFingerprint(fingerprint);
+            },
+          ),
+        );
+      }),
+    ];
   }
 
   void _handleBackgroundTransportUnavailable() {
@@ -672,7 +745,7 @@ class _HomeScreenState extends State<HomeScreen> {
         if (senderPubKey.isNotEmpty) {
           _senderPubKeysByClaim[claim.claimId] = senderPubKey;
         }
-        _trustedFingerprints.add(claim.shortFingerprint);
+        await _addTrustedFingerprint(claim.shortFingerprint);
       }
       await _refreshClaims();
     } catch (err) {
@@ -1768,6 +1841,8 @@ class _HomeScreenState extends State<HomeScreen> {
               value: _enableExperimentalBackgroundTransport,
               onChanged: (value) => _setExperimentalBackgroundTransport(value),
             ),
+            const SizedBox(height: 16),
+            ..._buildTrustedDevicesSection(),
             const SizedBox(height: 32),
             const Divider(),
             const SizedBox(height: 16),
@@ -1800,7 +1875,6 @@ class _HomeScreenState extends State<HomeScreen> {
               Text(_claimsStatus),
               const SizedBox(height: 8),
               ..._pendingClaims.map((claim) {
-                final trusted = _trustedFingerprints.contains(claim.shortFingerprint);
                 final sasCode = _receiverSasByClaim[claim.claimId] ?? '';
                 final sasState = claim.sasState;
                 final receiverConfirmed =
@@ -1836,22 +1910,10 @@ class _HomeScreenState extends State<HomeScreen> {
                                     : 'Confirm SAS',
                           ),
                         ),
-                        if (trusted)
-                          const Padding(
-                            padding: EdgeInsets.only(top: 4),
-                            child: Text(
-                              'Seen before',
-                              style: TextStyle(color: Colors.green),
-                            ),
-                          )
-                        else
-                          const Padding(
-                            padding: EdgeInsets.only(top: 4),
-                            child: Text(
-                              'New device',
-                              style: TextStyle(color: Colors.orange),
-                            ),
-                          ),
+                        TrustedDeviceBadge.forFingerprint(
+                          fingerprint: claim.shortFingerprint,
+                          trustedFingerprints: _trustedFingerprints,
+                        ),
                         const SizedBox(height: 8),
                         Row(
                           children: [
