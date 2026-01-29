@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:universaldrop_app/transfer_background.dart';
 import 'package:universaldrop_app/transfer_state_store.dart';
@@ -35,22 +36,23 @@ void main() {
   });
 
   test('connectivity callback triggers on restore', () async {
-    final monitor = FakeConnectivityMonitor();
+    final controller = StreamController<ConnectivityResult>.broadcast();
     var calls = 0;
     final manager = TransferBackgroundManager(
       scheduler: FakeResumeScheduler(),
       foregroundController: FakeForegroundController(),
-      connectivityMonitor: monitor,
+      connectivityStream: controller.stream,
       onConnectivityRestored: () async {
         calls += 1;
       },
     );
 
-    monitor.emit(ConnectivityStatus.wifi);
+    controller.add(ConnectivityResult.wifi);
     await Future<void>.delayed(Duration.zero);
     expect(calls, equals(1));
 
     manager.dispose();
+    await controller.close();
   });
 }
 
@@ -87,17 +89,5 @@ class FakeForegroundController implements TransferForegroundController {
   @override
   Future<void> stop() async {
     stopped = true;
-  }
-}
-
-class FakeConnectivityMonitor implements ConnectivityMonitor {
-  final StreamController<ConnectivityStatus> _controller =
-      StreamController<ConnectivityStatus>.broadcast();
-
-  @override
-  Stream<ConnectivityStatus> get onStatus => _controller.stream;
-
-  void emit(ConnectivityStatus status) {
-    _controller.add(status);
   }
 }

@@ -84,7 +84,6 @@ class _HomeScreenState extends State<HomeScreen> {
       TransferBackgroundManager(
     scheduler: MethodChannelResumeScheduler(),
     foregroundController: MethodChannelForegroundController(),
-    connectivityMonitor: MethodChannelConnectivityMonitor(),
     onConnectivityRestored: () => _resumePendingTransfers(),
   );
   final DestinationPreferenceStore _destinationStore =
