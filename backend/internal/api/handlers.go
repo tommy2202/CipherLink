@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"net/textproto"
@@ -15,6 +16,7 @@ import (
 	"universaldrop/internal/domain"
 	"universaldrop/internal/logging"
 	"universaldrop/internal/storage"
+	"universaldrop/internal/transfer"
 )
 
 type sessionCreateResponse struct {
@@ -833,6 +835,10 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.transfers.AcceptChunk(r.Context(), transferID, offset, data); err != nil {
+		if errors.Is(err, transfer.ErrChunkConflict) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "chunk_conflict"})
+			return
+		}
 		writeIndistinguishable(w)
 		return
 	}

@@ -1,6 +1,7 @@
 package transfer
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -16,6 +17,7 @@ import (
 )
 
 var ErrInvalidInput = errors.New("invalid input")
+var ErrChunkConflict = errors.New("chunk conflict")
 
 type Engine struct {
 	store storage.Storage
@@ -66,7 +68,25 @@ func (e *Engine) AcceptChunk(ctx context.Context, transferID string, offset int6
 	if transferID == "" || offset < 0 {
 		return ErrInvalidInput
 	}
-	return e.store.WriteChunk(ctx, transferID, offset, data)
+	existing, err := e.store.ReadRange(ctx, transferID, offset, int64(len(data)))
+	if err == nil {
+		if len(existing) == len(data) {
+			if bytes.Equal(existing, data) {
+				return e.updateBytesReceived(ctx, transferID, offset, int64(len(data)))
+			}
+			return ErrChunkConflict
+		}
+		if len(existing) > 0 && !bytes.Equal(existing, data[:len(existing)]) {
+			return ErrChunkConflict
+		}
+	} else if !errors.Is(err, storage.ErrNotFound) && !errors.Is(err, storage.ErrInvalidRange) {
+		return err
+	}
+
+	if err := e.store.WriteChunk(ctx, transferID, offset, data); err != nil {
+		return err
+	}
+	return e.updateBytesReceived(ctx, transferID, offset, int64(len(data)))
 }
 
 func (e *Engine) FinalizeTransfer(_ context.Context, transferID string) error {
@@ -125,6 +145,25 @@ func (e *Engine) InitScan(ctx context.Context, sessionID string, claimID string,
 		return "", "", err
 	}
 	return scanID, keyB64, nil
+}
+
+func (e *Engine) updateBytesReceived(ctx context.Context, transferID string, offset int64, length int64) error {
+	if length <= 0 {
+		return nil
+	}
+	meta, err := e.store.GetTransferMeta(ctx, transferID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	end := offset + length
+	if end <= meta.BytesReceived {
+		return nil
+	}
+	meta.BytesReceived = end
+	return e.store.SaveTransferMeta(ctx, transferID, meta)
 }
 
 func (e *Engine) StoreScanChunk(ctx context.Context, scanID string, chunkIndex int, data []byte) error {

@@ -584,6 +584,199 @@ class BackgroundUrlSessionTransport implements Transport {
   }
 }
 
+class OptionalBackgroundTransport implements Transport {
+  OptionalBackgroundTransport({
+    required BackgroundUrlSessionTransport backgroundTransport,
+    required Transport fallbackTransport,
+    void Function()? onFallback,
+  })  : _background = backgroundTransport,
+        _fallback = fallbackTransport,
+        _onFallback = onFallback;
+
+  final BackgroundUrlSessionTransport _background;
+  final Transport _fallback;
+  final void Function()? _onFallback;
+  bool _usingFallback = false;
+  bool _fallbackNotified = false;
+
+  bool get usingFallback => _usingFallback;
+
+  @override
+  Future<TransferInitResult> initTransfer({
+    required String sessionId,
+    required String transferToken,
+    required Uint8List manifestCiphertext,
+    required int totalBytes,
+    String? transferId,
+  }) {
+    return _run((transport) {
+      return transport.initTransfer(
+        sessionId: sessionId,
+        transferToken: transferToken,
+        manifestCiphertext: manifestCiphertext,
+        totalBytes: totalBytes,
+        transferId: transferId,
+      );
+    });
+  }
+
+  @override
+  Future<void> sendChunk({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+    required int offset,
+    required Uint8List data,
+  }) {
+    return _run((transport) {
+      return transport.sendChunk(
+        sessionId: sessionId,
+        transferId: transferId,
+        transferToken: transferToken,
+        offset: offset,
+        data: data,
+      );
+    });
+  }
+
+  @override
+  Future<void> finalizeTransfer({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+  }) {
+    return _run((transport) {
+      return transport.finalizeTransfer(
+        sessionId: sessionId,
+        transferId: transferId,
+        transferToken: transferToken,
+      );
+    });
+  }
+
+  @override
+  Future<Uint8List> fetchManifest({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+  }) {
+    return _run((transport) {
+      return transport.fetchManifest(
+        sessionId: sessionId,
+        transferId: transferId,
+        transferToken: transferToken,
+      );
+    });
+  }
+
+  @override
+  Future<Uint8List> fetchRange({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+    required int offset,
+    required int length,
+  }) {
+    return _run((transport) {
+      return transport.fetchRange(
+        sessionId: sessionId,
+        transferId: transferId,
+        transferToken: transferToken,
+        offset: offset,
+        length: length,
+      );
+    });
+  }
+
+  @override
+  Future<void> sendReceipt({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+  }) {
+    return _run((transport) {
+      return transport.sendReceipt(
+        sessionId: sessionId,
+        transferId: transferId,
+        transferToken: transferToken,
+      );
+    });
+  }
+
+  @override
+  Future<ScanInitResult> scanInit({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+    required int totalBytes,
+    required int chunkSize,
+  }) {
+    return _run((transport) {
+      return transport.scanInit(
+        sessionId: sessionId,
+        transferId: transferId,
+        transferToken: transferToken,
+        totalBytes: totalBytes,
+        chunkSize: chunkSize,
+      );
+    });
+  }
+
+  @override
+  Future<void> scanChunk({
+    required String scanId,
+    required String transferToken,
+    required int chunkIndex,
+    required Uint8List data,
+  }) {
+    return _run((transport) {
+      return transport.scanChunk(
+        scanId: scanId,
+        transferToken: transferToken,
+        chunkIndex: chunkIndex,
+        data: data,
+      );
+    });
+  }
+
+  @override
+  Future<ScanFinalizeResult> scanFinalize({
+    required String scanId,
+    required String transferToken,
+  }) {
+    return _run((transport) {
+      return transport.scanFinalize(
+        scanId: scanId,
+        transferToken: transferToken,
+      );
+    });
+  }
+
+  Future<T> _run<T>(Future<T> Function(Transport transport) action) async {
+    if (_usingFallback) {
+      return action(_fallback);
+    }
+    try {
+      return await action(_background);
+    } on MissingPluginException {
+      _switchToFallback();
+      return action(_fallback);
+    }
+  }
+
+  void _switchToFallback() {
+    if (_usingFallback) {
+      return;
+    }
+    _usingFallback = true;
+    if (_fallbackNotified) {
+      return;
+    }
+    _fallbackNotified = true;
+    _onFallback?.call();
+  }
+}
+
 class P2PTransport implements P2PFallbackTransport {
   P2PTransport({
     required Uri baseUri,

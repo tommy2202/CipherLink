@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/services.dart';
 
 import 'transfer_state_store.dart';
@@ -12,45 +13,6 @@ abstract class TransferBackgroundHooks {
 class NoopTransferBackgroundHooks implements TransferBackgroundHooks {
   @override
   Future<void> onStateUpdated(TransferState state) async {}
-}
-
-enum ConnectivityStatus {
-  none,
-  wifi,
-  mobile,
-  other,
-}
-
-abstract class ConnectivityMonitor {
-  Stream<ConnectivityStatus> get onStatus;
-}
-
-class MethodChannelConnectivityMonitor implements ConnectivityMonitor {
-  MethodChannelConnectivityMonitor({EventChannel? channel})
-      : _channel = channel ?? const EventChannel('universaldrop/connectivity');
-
-  final EventChannel _channel;
-
-  @override
-  Stream<ConnectivityStatus> get onStatus {
-    return _channel.receiveBroadcastStream().map(_parseStatus);
-  }
-
-  ConnectivityStatus _parseStatus(dynamic value) {
-    final raw = value?.toString().toLowerCase() ?? '';
-    switch (raw) {
-      case 'wifi':
-        return ConnectivityStatus.wifi;
-      case 'cellular':
-      case 'mobile':
-        return ConnectivityStatus.mobile;
-      case 'none':
-      case 'offline':
-        return ConnectivityStatus.none;
-      default:
-        return ConnectivityStatus.other;
-    }
-  }
 }
 
 abstract class TransferResumeScheduler {
@@ -126,16 +88,19 @@ class TransferBackgroundManager implements TransferBackgroundHooks {
   TransferBackgroundManager({
     required TransferResumeScheduler scheduler,
     required TransferForegroundController foregroundController,
-    ConnectivityMonitor? connectivityMonitor,
+    Stream<ConnectivityResult>? connectivityStream,
     Future<void> Function()? onConnectivityRestored,
   })  : _scheduler = scheduler,
         _foregroundController = foregroundController,
         _onConnectivityRestored = onConnectivityRestored {
-    _subscription = connectivityMonitor?.onStatus.listen((status) {
-      if (status != ConnectivityStatus.none) {
-        _onConnectivityRestored?.call();
-      }
-    });
+    if (_onConnectivityRestored != null) {
+      final stream = connectivityStream ?? Connectivity().onConnectivityChanged;
+      _subscription = stream.listen((status) {
+        if (status != ConnectivityResult.none) {
+          _onConnectivityRestored?.call();
+        }
+      });
+    }
   }
 
   final TransferResumeScheduler _scheduler;
@@ -143,7 +108,7 @@ class TransferBackgroundManager implements TransferBackgroundHooks {
   final Future<void> Function()? _onConnectivityRestored;
   final Set<String> _activeDownloads = {};
   final Set<String> _activeUploads = {};
-  StreamSubscription<ConnectivityStatus>? _subscription;
+  StreamSubscription<ConnectivityResult>? _subscription;
 
   @override
   Future<void> onStateUpdated(TransferState state) async {

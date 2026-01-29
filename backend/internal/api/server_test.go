@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -491,6 +492,62 @@ func TestP2PIceConfigRelayRequiresTurn(t *testing.T) {
 	}
 }
 
+func TestP2PIceConfigRelayOmitsStunWhenTurnAvailable(t *testing.T) {
+	store := &stubStorage{}
+	server := NewServer(Dependencies{
+		Config: config.Config{
+			Address:               ":0",
+			DataDir:               "data",
+			RateLimitHealth:       config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:           config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitSessionClaim: config.RateLimit{Max: 100, Window: time.Minute},
+			ClaimTokenTTL:         config.DefaultClaimTokenTTL,
+			TransferTokenTTL:      config.DefaultTransferTokenTTL,
+			MaxScanBytes:          config.DefaultMaxScanBytes,
+			MaxScanDuration:       config.DefaultMaxScanDuration,
+			STUNURLs:              []string{"stun:stun.example"},
+			TURNURLs:              []string{"turn:relay.example?transport=udp"},
+			TURNSharedSecret:      []byte("secret"),
+		},
+		Store:   store,
+		Tokens:  token.NewMemoryService(),
+		Scanner: scanner.UnavailableScanner{},
+	})
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+
+	rec := p2pIceConfigRecorder(t, server, approveResp.P2PToken, createResp.SessionID, claimResp.ClaimID, "relay")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d", rec.Code)
+	}
+	var resp p2pIceConfigResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode relay ice config: %v", err)
+	}
+	if len(resp.STUNURLs) != 0 {
+		t.Fatalf("expected no stun urls, got %v", resp.STUNURLs)
+	}
+	if len(resp.TURNURLs) == 0 {
+		t.Fatalf("expected turn urls to be present")
+	}
+	for _, url := range resp.TURNURLs {
+		if !strings.HasPrefix(url, "turn:") && !strings.HasPrefix(url, "turns:") {
+			t.Fatalf("expected turn url, got %q", url)
+		}
+	}
+}
+
 func TestIndistinguishableErrors(t *testing.T) {
 	store := &stubStorage{}
 	tokens := token.NewMemoryService()
@@ -882,6 +939,54 @@ func TestChunkRetryIdempotent(t *testing.T) {
 	downloaded := downloadRange(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, 3)
 	if string(downloaded) != "data" {
 		t.Fatalf("expected data after retry")
+	}
+}
+
+func TestChunkConflictRejected(t *testing.T) {
+	store := &stubStorage{}
+	server := newSessionTestServer(store)
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+	if approveResp.TransferToken == "" {
+		t.Fatalf("expected transfer token")
+	}
+
+	initResp := initTransfer(t, server, transferInitRequest{
+		SessionID:                 createResp.SessionID,
+		TransferToken:             approveResp.TransferToken,
+		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
+		TotalBytes:                4,
+	})
+
+	rec := uploadChunkRecorder(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("data"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected chunk 200 got %d", rec.Code)
+	}
+	rec = uploadChunkRecorder(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("data"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected retry 200 got %d", rec.Code)
+	}
+	rec = uploadChunkRecorder(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("diff"))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected conflict 409 got %d", rec.Code)
+	}
+	var resp map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode conflict response: %v", err)
+	}
+	if resp["error"] != "chunk_conflict" {
+		t.Fatalf("expected chunk_conflict error got %q", resp["error"])
 	}
 }
 
@@ -1358,6 +1463,14 @@ func initTransferRecorder(t *testing.T, server *Server, reqBody transferInitRequ
 
 func uploadChunk(t *testing.T, server *Server, sessionID string, transferID string, token string, offset int64, data []byte) {
 	t.Helper()
+	rec := uploadChunkRecorder(t, server, sessionID, transferID, token, offset, data)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected chunk 200 got %d", rec.Code)
+	}
+}
+
+func uploadChunkRecorder(t *testing.T, server *Server, sessionID string, transferID string, token string, offset int64, data []byte) *httptest.ResponseRecorder {
+	t.Helper()
 	req := httptest.NewRequest(http.MethodPut, "/v1/transfer/chunk", bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -1366,9 +1479,7 @@ func uploadChunk(t *testing.T, server *Server, sessionID string, transferID stri
 	req.Header.Set("offset", strconv.FormatInt(offset, 10))
 	rec := httptest.NewRecorder()
 	server.Router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected chunk 200 got %d", rec.Code)
-	}
+	return rec
 }
 
 func finalizeTransfer(t *testing.T, server *Server, sessionID string, transferID string, token string) {
