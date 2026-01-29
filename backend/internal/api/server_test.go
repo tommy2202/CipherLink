@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -488,6 +489,62 @@ func TestP2PIceConfigRelayRequiresTurn(t *testing.T) {
 	}
 	if payload["error"] != "turn_unavailable" {
 		t.Fatalf("expected turn_unavailable")
+	}
+}
+
+func TestP2PIceConfigRelayOmitsStunWhenTurnAvailable(t *testing.T) {
+	store := &stubStorage{}
+	server := NewServer(Dependencies{
+		Config: config.Config{
+			Address:               ":0",
+			DataDir:               "data",
+			RateLimitHealth:       config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:           config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitSessionClaim: config.RateLimit{Max: 100, Window: time.Minute},
+			ClaimTokenTTL:         config.DefaultClaimTokenTTL,
+			TransferTokenTTL:      config.DefaultTransferTokenTTL,
+			MaxScanBytes:          config.DefaultMaxScanBytes,
+			MaxScanDuration:       config.DefaultMaxScanDuration,
+			STUNURLs:              []string{"stun:stun.example"},
+			TURNURLs:              []string{"turn:relay.example?transport=udp"},
+			TURNSharedSecret:      []byte("secret"),
+		},
+		Store:   store,
+		Tokens:  token.NewMemoryService(),
+		Scanner: scanner.UnavailableScanner{},
+	})
+
+	createResp := createSession(t, server)
+	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
+		SessionID:       createResp.SessionID,
+		ClaimToken:      createResp.ClaimToken,
+		SenderLabel:     "Sender",
+		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+	})
+	approveResp := approveSession(t, server, sessionApproveRequest{
+		SessionID: createResp.SessionID,
+		ClaimID:   claimResp.ClaimID,
+		Approve:   true,
+	})
+
+	rec := p2pIceConfigRecorder(t, server, approveResp.P2PToken, createResp.SessionID, claimResp.ClaimID, "relay")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d", rec.Code)
+	}
+	var resp p2pIceConfigResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode relay ice config: %v", err)
+	}
+	if len(resp.STUNURLs) != 0 {
+		t.Fatalf("expected no stun urls, got %v", resp.STUNURLs)
+	}
+	if len(resp.TURNURLs) == 0 {
+		t.Fatalf("expected turn urls to be present")
+	}
+	for _, url := range resp.TURNURLs {
+		if !strings.HasPrefix(url, "turn:") && !strings.HasPrefix(url, "turns:") {
+			t.Fatalf("expected turn url, got %q", url)
+		}
 	}
 }
 
