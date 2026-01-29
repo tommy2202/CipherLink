@@ -136,6 +136,8 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _preferDirect = true;
   bool _alwaysRelay = false;
   bool _p2pDisclosureShown = false;
+  bool _enableExperimentalBackgroundTransport = false;
+  bool _backgroundTransportFallbackShown = false;
   final Set<String> _trustedFingerprints = {};
   final Map<String, String> _receiverSasByClaim = {};
   final Set<String> _receiverSasConfirming = {};
@@ -143,11 +145,13 @@ class _HomeScreenState extends State<HomeScreen> {
   static const _p2pPreferDirectKey = 'p2pPreferDirect';
   static const _p2pAlwaysRelayKey = 'p2pAlwaysRelay';
   static const _p2pDisclosureKey = 'p2pDirectDisclosureShown';
+  static const _experimentalBackgroundTransportKey =
+      'enableExperimentalBackgroundTransport';
 
   @override
   void initState() {
     super.initState();
-    _loadP2PSettings();
+    _loadSettings();
     _resumePendingTransfers();
   }
 
@@ -166,11 +170,13 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 
-  Future<void> _loadP2PSettings() async {
+  Future<void> _loadSettings() async {
     final prefs = await SharedPreferences.getInstance();
     final preferDirect = prefs.getBool(_p2pPreferDirectKey) ?? true;
     final alwaysRelay = prefs.getBool(_p2pAlwaysRelayKey) ?? false;
     final disclosureShown = prefs.getBool(_p2pDisclosureKey) ?? false;
+    final enableBackground =
+        prefs.getBool(_experimentalBackgroundTransportKey) ?? false;
     if (!mounted) {
       return;
     }
@@ -178,6 +184,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _preferDirect = preferDirect;
       _alwaysRelay = alwaysRelay;
       _p2pDisclosureShown = disclosureShown;
+      _enableExperimentalBackgroundTransport = enableBackground;
     });
   }
 
@@ -208,6 +215,18 @@ class _HomeScreenState extends State<HomeScreen> {
       _alwaysRelay = value;
     });
     await _persistP2PSettings();
+  }
+
+  Future<void> _setExperimentalBackgroundTransport(bool value) async {
+    setState(() {
+      _enableExperimentalBackgroundTransport = value;
+      if (value) {
+        _backgroundTransportFallbackShown = false;
+      }
+    });
+    _coordinator = null;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_experimentalBackgroundTransportKey, value);
   }
 
   Future<void> _maybeShowDirectDisclosure() async {
@@ -242,19 +261,41 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
+  void _handleBackgroundTransportUnavailable() {
+    if (_backgroundTransportFallbackShown || !mounted) {
+      return;
+    }
+    _backgroundTransportFallbackShown = true;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Background transport unavailable; using standard mode.',
+        ),
+      ),
+    );
+  }
+
   void _ensureCoordinator() {
     final baseUrl = _baseUrlController.text.trim();
     if (baseUrl.isEmpty) {
       return;
     }
     final baseUri = Uri.parse(baseUrl);
-    final httpTransport = BackgroundUrlSessionTransport(baseUri);
+    final httpTransport = HttpTransport(baseUri);
+    Transport transport = httpTransport;
+    if (_enableExperimentalBackgroundTransport) {
+      transport = OptionalBackgroundTransport(
+        backgroundTransport: BackgroundUrlSessionTransport(baseUri),
+        fallbackTransport: httpTransport,
+        onFallback: _handleBackgroundTransportUnavailable,
+      );
+    }
     _coordinator = TransferCoordinator(
-      transport: httpTransport,
+      transport: transport,
       p2pTransportFactory: (context) => P2PTransport(
         baseUri: baseUri,
         context: context,
-        fallbackTransport: httpTransport,
+        fallbackTransport: transport,
       ),
       store: _transferStore,
       onState: (state) {
@@ -1716,6 +1757,18 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 16),
             Text('Status: $_status'),
+            const SizedBox(height: 24),
+            const Text(
+              'Transport settings',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Experimental background transport'),
+              subtitle: const Text('Use native background sessions when available'),
+              value: _enableExperimentalBackgroundTransport,
+              onChanged: (value) => _setExperimentalBackgroundTransport(value),
+            ),
             const SizedBox(height: 32),
             const Divider(),
             const SizedBox(height: 16),
