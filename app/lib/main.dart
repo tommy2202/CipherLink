@@ -16,6 +16,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'clipboard_service.dart';
 import 'crypto.dart';
+import 'diagnostics_screen.dart';
 import 'destination_preferences.dart';
 import 'destination_rules.dart';
 import 'destination_selector.dart';
@@ -388,6 +389,15 @@ class _HomeScreenState extends State<HomeScreen> {
         content: Text(
           'Background services unavailable; using in-app transfers.',
         ),
+      ),
+    );
+  }
+
+  void _openDiagnostics() {
+    final baseUrl = _baseUrlController.text.trim();
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => DiagnosticsScreen(baseUrl: baseUrl),
       ),
     );
   }
@@ -1881,9 +1891,19 @@ class _HomeScreenState extends State<HomeScreen> {
               onChanged: _preferDirect ? (value) => _setAlwaysRelay(value) : null,
             ),
             const SizedBox(height: 8),
-            ElevatedButton(
-              onPressed: _loading ? null : _pingBackend,
-              child: Text(_loading ? 'Pinging...' : 'Ping Backend'),
+            Wrap(
+              spacing: 12,
+              runSpacing: 8,
+              children: [
+                ElevatedButton(
+                  onPressed: _loading ? null : _pingBackend,
+                  child: Text(_loading ? 'Pinging...' : 'Ping Backend'),
+                ),
+                OutlinedButton(
+                  onPressed: _openDiagnostics,
+                  child: const Text('Diagnostics'),
+                ),
+              ],
             ),
             const SizedBox(height: 16),
             Text('Status: $_status'),
