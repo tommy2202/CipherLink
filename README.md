@@ -50,6 +50,14 @@ go test ./...
 
 - Flutter SDK (stable)
 
+### Build & Run
+
+```bash
+cd app
+flutter pub get
+flutter run
+```
+
 ### Run
 
 ```bash
