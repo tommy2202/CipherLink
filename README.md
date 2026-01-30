@@ -58,6 +58,11 @@ flutter pub get
 flutter run
 ```
 
+### Runtime Safety
+
+- Background resume + foreground service is optional and defaults to off; if unavailable, transfers stay in-app.
+- Experimental background transport is optional and defaults to off; it falls back to standard HTTP.
+
 ### Run
 
 ```bash

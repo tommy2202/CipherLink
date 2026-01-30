@@ -40,6 +40,57 @@ class MethodChannelResumeScheduler implements TransferResumeScheduler {
   }
 }
 
+class FeatureFlaggedResumeScheduler implements TransferResumeScheduler {
+  FeatureFlaggedResumeScheduler({
+    required TransferResumeScheduler scheduler,
+    required bool Function() isEnabled,
+    void Function()? onUnavailable,
+  })  : _scheduler = scheduler,
+        _isEnabled = isEnabled,
+        _onUnavailable = onUnavailable;
+
+  final TransferResumeScheduler _scheduler;
+  final bool Function() _isEnabled;
+  final void Function()? _onUnavailable;
+  bool _available = true;
+
+  @override
+  Future<void> scheduleResume(TransferState state) async {
+    if (!_isEnabled() || !_available) {
+      return;
+    }
+    try {
+      await _scheduler.scheduleResume(state);
+    } on MissingPluginException {
+      _disable();
+    } on PlatformException {
+      _disable();
+    }
+  }
+
+  @override
+  Future<void> cancelResume(String transferId) async {
+    if (!_isEnabled() || !_available) {
+      return;
+    }
+    try {
+      await _scheduler.cancelResume(transferId);
+    } on MissingPluginException {
+      _disable();
+    } on PlatformException {
+      _disable();
+    }
+  }
+
+  void _disable() {
+    if (!_available) {
+      return;
+    }
+    _available = false;
+    _onUnavailable?.call();
+  }
+}
+
 abstract class TransferForegroundController {
   Future<void> startReceiving();
   Future<void> startSending();
@@ -81,6 +132,71 @@ class MethodChannelForegroundController implements TransferForegroundController 
       return;
     }
     await _channel.invokeMethod('stop');
+  }
+}
+
+class FeatureFlaggedForegroundController implements TransferForegroundController {
+  FeatureFlaggedForegroundController({
+    required TransferForegroundController controller,
+    required bool Function() isEnabled,
+    void Function()? onUnavailable,
+  })  : _controller = controller,
+        _isEnabled = isEnabled,
+        _onUnavailable = onUnavailable;
+
+  final TransferForegroundController _controller;
+  final bool Function() _isEnabled;
+  final void Function()? _onUnavailable;
+  bool _available = true;
+
+  @override
+  Future<void> startReceiving() async {
+    if (!_isEnabled() || !_available) {
+      return;
+    }
+    try {
+      await _controller.startReceiving();
+    } on MissingPluginException {
+      _disable();
+    } on PlatformException {
+      _disable();
+    }
+  }
+
+  @override
+  Future<void> startSending() async {
+    if (!_isEnabled() || !_available) {
+      return;
+    }
+    try {
+      await _controller.startSending();
+    } on MissingPluginException {
+      _disable();
+    } on PlatformException {
+      _disable();
+    }
+  }
+
+  @override
+  Future<void> stop() async {
+    if (!_isEnabled() || !_available) {
+      return;
+    }
+    try {
+      await _controller.stop();
+    } on MissingPluginException {
+      _disable();
+    } on PlatformException {
+      _disable();
+    }
+  }
+
+  void _disable() {
+    if (!_available) {
+      return;
+    }
+    _available = false;
+    _onUnavailable?.call();
   }
 }
 

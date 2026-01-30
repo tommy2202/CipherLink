@@ -11,7 +11,7 @@ enum KeyRole {
 
 class SecureKeyPairStore {
   SecureKeyPairStore({SecureStore? secureStore})
-      : _secureStore = secureStore ?? MethodChannelSecureStore();
+      : _secureStore = secureStore ?? FlutterSecureStore();
 
   final SecureStore _secureStore;
 
@@ -28,16 +28,40 @@ class SecureKeyPairStore {
     );
   }
 
+  Future<bool> trySaveKeyPair({
+    required String sessionId,
+    required KeyRole role,
+    required KeyPair keyPair,
+  }) async {
+    try {
+      await saveKeyPair(sessionId: sessionId, role: role, keyPair: keyPair);
+      return true;
+    } on SecureStoreUnavailableException {
+      return false;
+    } on Exception {
+      return false;
+    }
+  }
+
   Future<KeyPair?> loadKeyPair({
     required String sessionId,
     required KeyRole role,
   }) async {
-    final encoded = await _secureStore.read(key: _key(sessionId, role));
+    String? encoded;
+    try {
+      encoded = await _secureStore.read(key: _key(sessionId, role));
+    } on SecureStoreUnavailableException {
+      return null;
+    }
     if (encoded == null || encoded.isEmpty) {
       return null;
     }
-    final bytes = base64Decode(encoded);
-    return SimpleKeyPairData(bytes, type: KeyPairType.x25519);
+    try {
+      final bytes = base64Decode(encoded);
+      return SimpleKeyPairData(bytes, type: KeyPairType.x25519);
+    } on FormatException {
+      return null;
+    }
   }
 
   Future<void> deleteKeyPair({
