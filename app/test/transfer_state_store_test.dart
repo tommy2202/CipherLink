@@ -25,6 +25,7 @@ void main() {
     final reloaded = await store.load('transfer-1');
     expect(reloaded, isNotNull);
     expect(reloaded?.sessionId, equals('session-1'));
+    expect(reloaded?.transferToken, equals('token-1'));
     expect(reloaded?.nextChunkIndex, equals(1));
     expect(reloaded?.peerPublicKeyB64, equals('peer'));
 

@@ -16,6 +16,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'clipboard_service.dart';
 import 'crypto.dart';
+import 'diagnostics_screen.dart';
 import 'destination_preferences.dart';
 import 'destination_rules.dart';
 import 'destination_selector.dart';
@@ -84,8 +85,16 @@ class _HomeScreenState extends State<HomeScreen> {
   final SecureKeyPairStore _keyStore = SecureKeyPairStore();
   late final TransferBackgroundManager _backgroundManager =
       TransferBackgroundManager(
-    scheduler: MethodChannelResumeScheduler(),
-    foregroundController: MethodChannelForegroundController(),
+    scheduler: FeatureFlaggedResumeScheduler(
+      scheduler: MethodChannelResumeScheduler(),
+      isEnabled: () => _enableBackgroundServices,
+      onUnavailable: _handleBackgroundServicesUnavailable,
+    ),
+    foregroundController: FeatureFlaggedForegroundController(
+      controller: MethodChannelForegroundController(),
+      isEnabled: () => _enableBackgroundServices,
+      onUnavailable: _handleBackgroundServicesUnavailable,
+    ),
     onConnectivityRestored: () => _resumePendingTransfers(),
   );
   final DestinationPreferenceStore _destinationStore =
@@ -138,6 +147,8 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _preferDirect = true;
   bool _alwaysRelay = false;
   bool _p2pDisclosureShown = false;
+  bool _enableBackgroundServices = false;
+  bool _backgroundServicesUnavailableShown = false;
   bool _enableExperimentalBackgroundTransport = false;
   bool _backgroundTransportFallbackShown = false;
   final Set<String> _trustedFingerprints = {};
@@ -147,6 +158,7 @@ class _HomeScreenState extends State<HomeScreen> {
   static const _p2pPreferDirectKey = 'p2pPreferDirect';
   static const _p2pAlwaysRelayKey = 'p2pAlwaysRelay';
   static const _p2pDisclosureKey = 'p2pDirectDisclosureShown';
+  static const _backgroundServicesKey = 'enableBackgroundServices';
   static const _experimentalBackgroundTransportKey =
       'enableExperimentalBackgroundTransport';
 
@@ -177,6 +189,8 @@ class _HomeScreenState extends State<HomeScreen> {
     final preferDirect = prefs.getBool(_p2pPreferDirectKey) ?? true;
     final alwaysRelay = prefs.getBool(_p2pAlwaysRelayKey) ?? false;
     final disclosureShown = prefs.getBool(_p2pDisclosureKey) ?? false;
+    final enableBackgroundServices =
+        prefs.getBool(_backgroundServicesKey) ?? false;
     final enableBackground =
         prefs.getBool(_experimentalBackgroundTransportKey) ?? false;
     final trustedFingerprints = await _trustStore.loadFingerprints();
@@ -187,6 +201,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _preferDirect = preferDirect;
       _alwaysRelay = alwaysRelay;
       _p2pDisclosureShown = disclosureShown;
+      _enableBackgroundServices = enableBackgroundServices;
       _enableExperimentalBackgroundTransport = enableBackground;
       _trustedFingerprints
         ..clear()
@@ -221,6 +236,17 @@ class _HomeScreenState extends State<HomeScreen> {
       _alwaysRelay = value;
     });
     await _persistP2PSettings();
+  }
+
+  Future<void> _setBackgroundServicesEnabled(bool value) async {
+    setState(() {
+      _enableBackgroundServices = value;
+      if (value) {
+        _backgroundServicesUnavailableShown = false;
+      }
+    });
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_backgroundServicesKey, value);
   }
 
   Future<void> _setExperimentalBackgroundTransport(bool value) async {
@@ -343,6 +369,35 @@ class _HomeScreenState extends State<HomeScreen> {
         content: Text(
           'Background transport unavailable; using standard mode.',
         ),
+      ),
+    );
+  }
+
+  void _handleBackgroundServicesUnavailable() {
+    if (_backgroundServicesUnavailableShown || !mounted) {
+      return;
+    }
+    _backgroundServicesUnavailableShown = true;
+    setState(() {
+      _enableBackgroundServices = false;
+    });
+    SharedPreferences.getInstance().then((prefs) {
+      prefs.setBool(_backgroundServicesKey, false);
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Background services unavailable; using in-app transfers.',
+        ),
+      ),
+    );
+  }
+
+  void _openDiagnostics() {
+    final baseUrl = _baseUrlController.text.trim();
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => DiagnosticsScreen(baseUrl: baseUrl),
       ),
     );
   }
@@ -578,11 +633,18 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final payload = jsonDecode(response.body) as Map<String, dynamic>;
       final sessionResponse = SessionCreateResponse.fromJson(payload);
-      await _keyStore.saveKeyPair(
+      final stored = await _keyStore.trySaveKeyPair(
         sessionId: sessionResponse.sessionId,
         role: KeyRole.receiver,
         keyPair: keyPair,
       );
+      if (!stored) {
+        setState(() {
+          _sessionStatus =
+              'Secure storage unavailable. Cannot persist session keys.';
+        });
+        return;
+      }
       setState(() {
         _sessionResponse = sessionResponse;
         _sessionStatus = 'Session created.';
@@ -1167,11 +1229,17 @@ class _HomeScreenState extends State<HomeScreen> {
         return;
       }
 
-      await _keyStore.saveKeyPair(
+      final stored = await _keyStore.trySaveKeyPair(
         sessionId: sessionId,
         role: KeyRole.sender,
         keyPair: keyPair,
       );
+      if (!stored) {
+        setState(() {
+          _sendStatus = 'Secure storage unavailable. Cannot continue.';
+        });
+        return;
+      }
       final payload = jsonDecode(response.body) as Map<String, dynamic>;
       final claimId = payload['claim_id']?.toString();
       final status = payload['status']?.toString() ?? 'pending';
@@ -1823,9 +1891,19 @@ class _HomeScreenState extends State<HomeScreen> {
               onChanged: _preferDirect ? (value) => _setAlwaysRelay(value) : null,
             ),
             const SizedBox(height: 8),
-            ElevatedButton(
-              onPressed: _loading ? null : _pingBackend,
-              child: Text(_loading ? 'Pinging...' : 'Ping Backend'),
+            Wrap(
+              spacing: 12,
+              runSpacing: 8,
+              children: [
+                ElevatedButton(
+                  onPressed: _loading ? null : _pingBackend,
+                  child: Text(_loading ? 'Pinging...' : 'Ping Backend'),
+                ),
+                OutlinedButton(
+                  onPressed: _openDiagnostics,
+                  child: const Text('Diagnostics'),
+                ),
+              ],
             ),
             const SizedBox(height: 16),
             Text('Status: $_status'),
@@ -1833,6 +1911,13 @@ class _HomeScreenState extends State<HomeScreen> {
             const Text(
               'Transport settings',
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Background resume + foreground service'),
+              subtitle: const Text('Optional; defaults to off'),
+              value: _enableBackgroundServices,
+              onChanged: (value) => _setBackgroundServicesEnabled(value),
             ),
             SwitchListTile(
               contentPadding: EdgeInsets.zero,

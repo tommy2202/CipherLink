@@ -1,6 +1,6 @@
 import 'dart:convert';
 
-import 'package:flutter/services.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 class TransferState {
   const TransferState({
@@ -167,32 +167,52 @@ abstract class SecureStore {
   Future<void> delete({required String key});
 }
 
-class MethodChannelSecureStore implements SecureStore {
-  MethodChannelSecureStore({MethodChannel? channel})
-      : _channel = channel ?? const MethodChannel('universaldrop/secure_storage');
+class SecureStoreUnavailableException implements Exception {
+  SecureStoreUnavailableException([this.cause]);
 
-  final MethodChannel _channel;
+  final Object? cause;
 
   @override
-  Future<void> write({required String key, required String value}) {
-    return _channel.invokeMethod('write', {'key': key, 'value': value});
+  String toString() => 'SecureStoreUnavailableException';
+}
+
+class FlutterSecureStore implements SecureStore {
+  FlutterSecureStore({FlutterSecureStorage? storage})
+      : _storage = storage ?? const FlutterSecureStorage();
+
+  final FlutterSecureStorage _storage;
+
+  @override
+  Future<void> write({required String key, required String value}) async {
+    try {
+      await _storage.write(key: key, value: value);
+    } on Exception catch (err) {
+      throw SecureStoreUnavailableException(err);
+    }
   }
 
   @override
   Future<String?> read({required String key}) async {
-    final result = await _channel.invokeMethod<String>('read', {'key': key});
-    return result;
+    try {
+      return await _storage.read(key: key);
+    } on Exception catch (err) {
+      throw SecureStoreUnavailableException(err);
+    }
   }
 
   @override
-  Future<void> delete({required String key}) {
-    return _channel.invokeMethod('delete', {'key': key});
+  Future<void> delete({required String key}) async {
+    try {
+      await _storage.delete(key: key);
+    } on Exception catch (err) {
+      throw SecureStoreUnavailableException(err);
+    }
   }
 }
 
 class SecureTransferStateStore implements TransferStateStore {
   SecureTransferStateStore({SecureStore? secureStore})
-      : _secureStore = secureStore ?? MethodChannelSecureStore();
+      : _secureStore = secureStore ?? FlutterSecureStore();
 
   final SecureStore _secureStore;
   static const String _indexKey = 'transfer_state_index';
