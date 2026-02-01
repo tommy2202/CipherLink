@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"io"
 	"log"
 	"net/http"
@@ -20,6 +21,14 @@ import (
 	"universaldrop/internal/transfer"
 )
 
+type SweeperStatus interface {
+	LastSweep() time.Time
+}
+
+type StorageHealthChecker interface {
+	HealthCheck(ctx context.Context) error
+}
+
 type Dependencies struct {
 	Config  config.Config
 	Store   storage.Storage
@@ -27,6 +36,8 @@ type Dependencies struct {
 	Logger  *log.Logger
 	Version string
 	Scanner scanner.Scanner
+	Clock   clock.Clock
+	SweeperStatus SweeperStatus
 }
 
 type Server struct {
@@ -41,11 +52,14 @@ type Server struct {
 	quotas         *quotaTracker
 	throttles      *throttleManager
 	downloadTokens *downloadTokenStore
+	clock          clock.Clock
+	sweeperStatus  SweeperStatus
 	Router         http.Handler
 }
 
 var nonTransferTimeout = 2 * time.Minute
 var timeoutMiddleware = middleware.Timeout
+const sweeperStaleThreshold = 10 * time.Minute
 
 func NewServer(deps Dependencies) *Server {
 	logSink := deps.Logger
@@ -64,9 +78,12 @@ func NewServer(deps Dependencies) *Server {
 	if scanService == nil {
 		scanService = scanner.UnavailableScanner{}
 	}
+	clk := deps.Clock
+	if clk == nil {
+		clk = clock.RealClock{}
+	}
 
 	rateLimiters := map[string]*ratelimit.Limiter{}
-	clk := clock.RealClock{}
 	if deps.Config.RateLimitHealth.Max > 0 {
 		rateLimiters["health"] = ratelimit.New(deps.Config.RateLimitHealth.Max, deps.Config.RateLimitHealth.Window, clk)
 	}
@@ -89,6 +106,8 @@ func NewServer(deps Dependencies) *Server {
 		quotas:         newQuotaTracker(),
 		throttles:      newThrottleManager(deps.Config.TransferBandwidthCapBps, deps.Config.GlobalBandwidthCapBps),
 		downloadTokens: newDownloadTokenStore(),
+		clock:          clk,
+		sweeperStatus:  deps.SweeperStatus,
 	}
 
 	server.Router = server.routes()
@@ -102,8 +121,9 @@ func (s *Server) routes() http.Handler {
 	r.Use(middleware.Recoverer)
 
 	r.With(timeoutMiddleware(nonTransferTimeout)).With(s.safeLogger).With(s.rateLimit("health")).Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": s.version})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
+	r.With(timeoutMiddleware(nonTransferTimeout)).With(s.safeLogger).With(s.rateLimit("health")).Get("/readyz", s.handleReadyz)
 
 	r.Route("/v1", func(r chi.Router) {
 		r.Group(func(r chi.Router) {
@@ -183,4 +203,40 @@ func (s *Server) rateLimit(group string) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	storageOK := s.storageOK(r.Context())
+	sweeperOK := s.sweeperOK()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         storageOK && sweeperOK,
+		"storage_ok": storageOK,
+		"sweeper_ok": sweeperOK,
+	})
+}
+
+func (s *Server) storageOK(ctx context.Context) bool {
+	if s.store == nil {
+		return false
+	}
+	checker, ok := s.store.(StorageHealthChecker)
+	if !ok {
+		return true
+	}
+	return checker.HealthCheck(ctx) == nil
+}
+
+func (s *Server) sweeperOK() bool {
+	if s.sweeperStatus == nil {
+		return false
+	}
+	lastSweep := s.sweeperStatus.LastSweep()
+	if lastSweep.IsZero() {
+		return false
+	}
+	now := s.clock.Now()
+	if now.Before(lastSweep) {
+		return true
+	}
+	return now.Sub(lastSweep) <= sweeperStaleThreshold
 }

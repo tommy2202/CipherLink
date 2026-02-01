@@ -58,6 +58,13 @@ func New(root string) (*Store, error) {
 	}, nil
 }
 
+func (s *Store) HealthCheck(_ context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := os.Stat(s.root)
+	return err
+}
+
 func (s *Store) SaveManifest(_ context.Context, transferID string, manifest []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
