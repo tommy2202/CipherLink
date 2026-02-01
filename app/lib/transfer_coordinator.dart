@@ -641,19 +641,12 @@ class TransferCoordinator {
     Duration? timeout,
     Future<void> Function()? onStallLimit,
   }) async {
+    final startedAt = DateTime.now();
     var attempt = 0;
     var stallCount = 0;
     var stallFallbackTriggered = false;
     final effectiveTimeout = timeout ?? _stallTimeout;
     while (true) {
-      final lastProgress = _lastProgressAt[transferId];
-      if (lastProgress != null &&
-          DateTime.now().difference(lastProgress) > effectiveTimeout &&
-          onStallLimit != null &&
-          !stallFallbackTriggered) {
-        stallFallbackTriggered = true;
-        await onStallLimit();
-      }
       attempt += 1;
       try {
         final result = await action().timeout(effectiveTimeout);
@@ -667,11 +660,11 @@ class TransferCoordinator {
           stallFallbackTriggered = true;
           await onStallLimit();
         }
-        if (attempt > maxRetries) {
+        if (!_shouldRetry(const TimeoutException('timeout'), attempt, startedAt, maxRetries)) {
           rethrow;
         }
       } catch (err) {
-        if (!_isTransient(err) || attempt > maxRetries) {
+        if (!_shouldRetry(err, attempt, startedAt, maxRetries)) {
           rethrow;
         }
       }
@@ -687,24 +680,62 @@ class TransferCoordinator {
     return Duration(milliseconds: (capped * jitter).round());
   }
 
+  bool _shouldRetry(
+    Object err,
+    int attempt,
+    DateTime startedAt,
+    int maxRetries,
+  ) {
+    if (_classifyError(err) == _ErrorCategory.permanent) {
+      return false;
+    }
+    if (attempt > maxRetries) {
+      return false;
+    }
+    if (DateTime.now().difference(startedAt) > _maxRetryElapsed) {
+      return false;
+    }
+    return true;
+  }
+
   bool _isTransient(Object err) {
+    return _classifyError(err) == _ErrorCategory.transient;
+  }
+
+  _ErrorCategory _classifyError(Object err) {
     if (err is TimeoutException) {
-      return true;
+      return _ErrorCategory.transient;
     }
     if (err is SocketException) {
-      return true;
+      return _ErrorCategory.transient;
+    }
+    if (_isConnectionReset(err)) {
+      return _ErrorCategory.transient;
     }
     if (err is TransportException) {
       final status = err.statusCode;
       if (status == null) {
-        return true;
+        return _ErrorCategory.transient;
       }
-      if (status == 408 || status == 429) {
-        return true;
+      if (status == 400 || status == 401 || status == 403 || status == 409) {
+        return _ErrorCategory.permanent;
       }
-      return status >= 500;
+      if (status == 429 || status == 503 || status == 408) {
+        return _ErrorCategory.transient;
+      }
+      if (status >= 500) {
+        return _ErrorCategory.transient;
+      }
+      return _ErrorCategory.transient;
     }
-    return true;
+    return _ErrorCategory.transient;
+  }
+
+  bool _isConnectionReset(Object err) {
+    final message = err.toString().toLowerCase();
+    return message.contains('connection reset') ||
+        message.contains('broken pipe') ||
+        message.contains('connection abort');
   }
 
   int _chooseChunkSize(int fallback) {
@@ -831,6 +862,11 @@ class TransferCoordinator {
   }
 }
 
+enum _ErrorCategory {
+  transient,
+  permanent,
+}
+
 const int _defaultChunkSize = 128 * 1024;
 const List<int> _chunkSizeTiers = [
   32 * 1024,
@@ -842,7 +878,9 @@ const int _maxRequestRetries = 4;
 const int _maxChunkRetries = 5;
 const int _baseBackoffMs = 400;
 const int _maxBackoffMs = 8000;
+const Duration _maxRetryElapsed = Duration(minutes: 2);
 const int _defaultStallFallbackThreshold = 3;
+// No progress within this duration is treated as a transient stall.
 const Duration _defaultStallTimeout = Duration(seconds: 15);
 
 class _TransferJob {

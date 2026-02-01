@@ -38,6 +38,7 @@ func main() {
 		})
 	}
 	tokens := token.NewHMACService(secret)
+	liveness := sweeper.NewLiveness()
 
 	server := api.NewServer(api.Dependencies{
 		Config:  cfg,
@@ -45,6 +46,7 @@ func main() {
 		Tokens:  tokens,
 		Logger:  logger,
 		Scanner: scanner.UnavailableScanner{},
+		SweeperStatus: liveness,
 	})
 
 	httpServer := &http.Server{
@@ -56,7 +58,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	sweep := sweeper.New(store, clk, cfg.SweepInterval, logger)
+	sweep := sweeper.New(store, clk, cfg.SweepInterval, logger, liveness)
 	sweep.Start(ctx)
 
 	go func() {

@@ -25,6 +25,7 @@ Validates MUST requirements from SECURITY_REQUIREMENTS_SPEC.md.
 - TP-9 (R-MUST-11): Zip Slip rejection for "../" paths.
 - TP-10 (R-MUST-11/R-SHOULD-4): Extraction leaves ZIP intact on failure.
 - TP-11 (R-MUST-10): No secrets logged in UI flows (manual review).
+- TP-17 (R-SHOULD-5): Retry classification (409 no retry, 503 retry, stall retry).
 
 ## Manual Verification
 

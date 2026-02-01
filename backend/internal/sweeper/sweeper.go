@@ -16,14 +16,16 @@ type Sweeper struct {
 	clock    clock.Clock
 	interval time.Duration
 	logger   *log.Logger
+	liveness *Liveness
 }
 
-func New(store storage.Storage, clk clock.Clock, interval time.Duration, logger *log.Logger) *Sweeper {
+func New(store storage.Storage, clk clock.Clock, interval time.Duration, logger *log.Logger, liveness *Liveness) *Sweeper {
 	return &Sweeper{
 		store:    store,
 		clock:    clk,
 		interval: interval,
 		logger:   logger,
+		liveness: liveness,
 	}
 }
 
@@ -45,6 +47,10 @@ func (s *Sweeper) Start(ctx context.Context) {
 	}()
 }
 
+func (s *Sweeper) SweepOnce(ctx context.Context) {
+	s.sweep(ctx)
+}
+
 func (s *Sweeper) sweep(ctx context.Context) {
 	count, err := s.store.SweepExpired(ctx, s.clock.Now())
 	if err != nil {
@@ -53,6 +59,9 @@ func (s *Sweeper) sweep(ctx context.Context) {
 			"error": "storage_error",
 		})
 		return
+	}
+	if s.liveness != nil {
+		s.liveness.Mark(s.clock.Now())
 	}
 	if count > 0 {
 		logging.Allowlist(s.logger, map[string]string{

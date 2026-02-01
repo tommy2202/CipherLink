@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"io"
 	"log"
 	"net/http"
@@ -20,6 +21,14 @@ import (
 	"universaldrop/internal/transfer"
 )
 
+type SweeperStatus interface {
+	LastSweep() time.Time
+}
+
+type StorageHealthChecker interface {
+	HealthCheck(ctx context.Context) error
+}
+
 type Dependencies struct {
 	Config  config.Config
 	Store   storage.Storage
@@ -27,6 +36,8 @@ type Dependencies struct {
 	Logger  *log.Logger
 	Version string
 	Scanner scanner.Scanner
+	Clock   clock.Clock
+	SweeperStatus SweeperStatus
 }
 
 type Server struct {
@@ -41,8 +52,14 @@ type Server struct {
 	quotas         *quotaTracker
 	throttles      *throttleManager
 	downloadTokens *downloadTokenStore
+	clock          clock.Clock
+	sweeperStatus  SweeperStatus
 	Router         http.Handler
 }
+
+var nonTransferTimeout = 2 * time.Minute
+var timeoutMiddleware = middleware.Timeout
+const sweeperStaleThreshold = 10 * time.Minute
 
 func NewServer(deps Dependencies) *Server {
 	logSink := deps.Logger
@@ -61,9 +78,12 @@ func NewServer(deps Dependencies) *Server {
 	if scanService == nil {
 		scanService = scanner.UnavailableScanner{}
 	}
+	clk := deps.Clock
+	if clk == nil {
+		clk = clock.RealClock{}
+	}
 
 	rateLimiters := map[string]*ratelimit.Limiter{}
-	clk := clock.RealClock{}
 	if deps.Config.RateLimitHealth.Max > 0 {
 		rateLimiters["health"] = ratelimit.New(deps.Config.RateLimitHealth.Max, deps.Config.RateLimitHealth.Window, clk)
 	}
@@ -86,6 +106,8 @@ func NewServer(deps Dependencies) *Server {
 		quotas:         newQuotaTracker(),
 		throttles:      newThrottleManager(deps.Config.TransferBandwidthCapBps, deps.Config.GlobalBandwidthCapBps),
 		downloadTokens: newDownloadTokenStore(),
+		clock:          clk,
+		sweeperStatus:  deps.SweeperStatus,
 	}
 
 	server.Router = server.routes()
@@ -97,39 +119,46 @@ func (s *Server) routes() http.Handler {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(15 * time.Second))
-	r.Use(s.safeLogger)
 
-	r.With(s.rateLimit("health")).Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": s.version})
+	r.With(timeoutMiddleware(nonTransferTimeout)).With(s.safeLogger).With(s.rateLimit("health")).Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
+	r.With(timeoutMiddleware(nonTransferTimeout)).With(s.safeLogger).With(s.rateLimit("health")).Get("/readyz", s.handleReadyz)
 
 	r.Route("/v1", func(r chi.Router) {
-		r.Use(s.rateLimit("v1"))
-		r.Get("/ping", s.handlePing)
-		r.With(s.rateLimit("session-claim")).Post("/session/claim", s.handleClaimSession)
-		r.Post("/session/approve", s.handleApproveSession)
-		r.Post("/session/sas/commit", s.handleCommitSAS)
-		r.Get("/session/sas/status", s.handleSASStatus)
-		r.Get("/session/poll", s.handlePollSession)
-		r.Post("/session/create", s.handleCreateSession)
-		r.Route("/p2p", func(r chi.Router) {
-			r.Post("/offer", s.handleP2POffer)
-			r.Post("/answer", s.handleP2PAnswer)
-			r.Post("/ice", s.handleP2PICE)
-			r.Get("/poll", s.handleP2PPoll)
-			r.Get("/ice_config", s.handleP2PIceConfig)
+		r.Group(func(r chi.Router) {
+			r.Use(timeoutMiddleware(nonTransferTimeout))
+			r.Use(s.safeLogger)
+			r.Use(s.rateLimit("v1"))
+			r.Get("/ping", s.handlePing)
+			r.With(s.rateLimit("session-claim")).Post("/session/claim", s.handleClaimSession)
+			r.Post("/session/approve", s.handleApproveSession)
+			r.Post("/session/sas/commit", s.handleCommitSAS)
+			r.Get("/session/sas/status", s.handleSASStatus)
+			r.Get("/session/poll", s.handlePollSession)
+			r.Post("/session/create", s.handleCreateSession)
+			r.Route("/p2p", func(r chi.Router) {
+				r.Post("/offer", s.handleP2POffer)
+				r.Post("/answer", s.handleP2PAnswer)
+				r.Post("/ice", s.handleP2PICE)
+				r.Get("/poll", s.handleP2PPoll)
+				r.Get("/ice_config", s.handleP2PIceConfig)
+			})
 		})
-		r.Post("/transfer/init", s.handleInitTransfer)
-		r.Put("/transfer/chunk", s.handleUploadChunk)
-		r.Post("/transfer/finalize", s.handleFinalizeTransfer)
-		r.Get("/transfer/manifest", s.handleGetTransferManifest)
-		r.Post("/transfer/download_token", s.handleDownloadToken)
-		r.Get("/transfer/download", s.handleDownloadTransfer)
-		r.Post("/transfer/receipt", s.handleTransferReceipt)
-		r.Post("/transfer/scan_init", s.handleScanInit)
-		r.Put("/transfer/scan_chunk", s.handleScanChunk)
-		r.Post("/transfer/scan_finalize", s.handleScanFinalize)
+		r.Route("/transfer", func(r chi.Router) {
+			r.Use(s.safeLogger)
+			r.Use(s.rateLimit("v1"))
+			r.Post("/init", s.handleInitTransfer)
+			r.Put("/chunk", s.handleUploadChunk)
+			r.Post("/finalize", s.handleFinalizeTransfer)
+			r.Get("/manifest", s.handleGetTransferManifest)
+			r.Post("/download_token", s.handleDownloadToken)
+			r.Get("/download", s.handleDownloadTransfer)
+			r.Post("/receipt", s.handleTransferReceipt)
+			r.Post("/scan_init", s.handleScanInit)
+			r.Put("/scan_chunk", s.handleScanChunk)
+			r.Post("/scan_finalize", s.handleScanFinalize)
+		})
 	})
 
 	return r
@@ -174,4 +203,40 @@ func (s *Server) rateLimit(group string) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	storageOK := s.storageOK(r.Context())
+	sweeperOK := s.sweeperOK()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         storageOK && sweeperOK,
+		"storage_ok": storageOK,
+		"sweeper_ok": sweeperOK,
+	})
+}
+
+func (s *Server) storageOK(ctx context.Context) bool {
+	if s.store == nil {
+		return false
+	}
+	checker, ok := s.store.(StorageHealthChecker)
+	if !ok {
+		return true
+	}
+	return checker.HealthCheck(ctx) == nil
+}
+
+func (s *Server) sweeperOK() bool {
+	if s.sweeperStatus == nil {
+		return false
+	}
+	lastSweep := s.sweeperStatus.LastSweep()
+	if lastSweep.IsZero() {
+		return false
+	}
+	now := s.clock.Now()
+	if now.Before(lastSweep) {
+		return true
+	}
+	return now.Sub(lastSweep) <= sweeperStaleThreshold
 }

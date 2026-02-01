@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -14,10 +16,12 @@ import (
 	"testing"
 	"time"
 
+	"universaldrop/internal/clock"
 	"universaldrop/internal/config"
 	"universaldrop/internal/domain"
 	"universaldrop/internal/scanner"
 	"universaldrop/internal/storage"
+	"universaldrop/internal/sweeper"
 	"universaldrop/internal/token"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -51,9 +55,6 @@ func TestHealthz(t *testing.T) {
 	if payload["ok"] != true {
 		t.Fatalf("expected ok true")
 	}
-	if payload["version"] != "0.1" {
-		t.Fatalf("expected version 0.1 got %v", payload["version"])
-	}
 }
 
 func TestRateLimitTriggers(t *testing.T) {
@@ -84,6 +85,99 @@ func TestRateLimitTriggers(t *testing.T) {
 	server.Router.ServeHTTP(rec2, req)
 	if rec2.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected 429 got %d", rec2.Code)
+	}
+}
+
+func TestReadyzReportsSweeperOkAfterSweep(t *testing.T) {
+	store := &stubStorage{}
+	clk := clock.NewFake(time.Date(2025, 2, 1, 12, 0, 0, 0, time.UTC))
+	liveness := sweeper.NewLiveness()
+	sweep := sweeper.New(store, clk, time.Second, log.New(io.Discard, "", 0), liveness)
+	sweep.SweepOnce(context.Background())
+
+	server := NewServer(Dependencies{
+		Config: config.Config{
+			Address:               ":0",
+			DataDir:               "data",
+			RateLimitHealth:       config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:           config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitSessionClaim: config.RateLimit{Max: 100, Window: time.Minute},
+			MaxScanBytes:          config.DefaultMaxScanBytes,
+			MaxScanDuration:       config.DefaultMaxScanDuration,
+		},
+		Store:         store,
+		Tokens:        token.NewMemoryService(),
+		Clock:         clk,
+		SweeperStatus: liveness,
+	})
+
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d", rec.Code)
+	}
+
+	var payload map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload["ok"] != true {
+		t.Fatalf("expected ok true")
+	}
+	if payload["storage_ok"] != true {
+		t.Fatalf("expected storage_ok true")
+	}
+	if payload["sweeper_ok"] != true {
+		t.Fatalf("expected sweeper_ok true")
+	}
+}
+
+func TestTransferRoutesSkipTimeoutMiddleware(t *testing.T) {
+	originalTimeout := timeoutMiddleware
+	timeoutMiddleware = func(_ time.Duration) func(http.Handler) http.Handler {
+		return func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Timeout-Applied", "true")
+				next.ServeHTTP(w, r)
+			})
+		}
+	}
+	t.Cleanup(func() {
+		timeoutMiddleware = originalTimeout
+	})
+
+	server := NewServer(Dependencies{
+		Config: config.Config{
+			Address:               ":0",
+			DataDir:               "data",
+			RateLimitHealth:       config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:           config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitSessionClaim: config.RateLimit{Max: 100, Window: time.Minute},
+			MaxScanBytes:          config.DefaultMaxScanBytes,
+			MaxScanDuration:       config.DefaultMaxScanDuration,
+		},
+		Store:  &stubStorage{},
+		Tokens: token.NewMemoryService(),
+	})
+
+	pingRec := httptest.NewRecorder()
+	server.Router.ServeHTTP(pingRec, httptest.NewRequest(http.MethodGet, "/v1/ping", nil))
+	if pingRec.Header().Get("X-Timeout-Applied") == "" {
+		t.Fatalf("expected timeout middleware on non-transfer route")
+	}
+
+	chunkRec := httptest.NewRecorder()
+	chunkReq := httptest.NewRequest(http.MethodPut, "/v1/transfer/chunk", bytes.NewBuffer([]byte("data")))
+	server.Router.ServeHTTP(chunkRec, chunkReq)
+	if chunkRec.Header().Get("X-Timeout-Applied") != "" {
+		t.Fatalf("expected no timeout middleware on transfer upload")
+	}
+
+	downloadRec := httptest.NewRecorder()
+	downloadReq := httptest.NewRequest(http.MethodGet, "/v1/transfer/download?session_id=missing&transfer_id=missing", nil)
+	server.Router.ServeHTTP(downloadRec, downloadReq)
+	if downloadRec.Header().Get("X-Timeout-Applied") != "" {
+		t.Fatalf("expected no timeout middleware on transfer download")
 	}
 }
 
