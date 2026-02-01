@@ -36,6 +36,45 @@ void main() {
     expect(await store.load('transfer-1'), isNull);
   });
 
+  test('persists ciphertext download state across restart', () async {
+    final secure = MemorySecureStore();
+    final store = SecureTransferStateStore(secureStore: secure);
+    final state = TransferState(
+      transferId: 'transfer-2',
+      sessionId: 'session-2',
+      transferToken: 'token-2',
+      direction: 'download',
+      status: 'downloading',
+      totalBytes: 64,
+      chunkSize: 32,
+      nextOffset: 32,
+      nextChunkIndex: 1,
+      peerPublicKeyB64: 'peer',
+      ciphertextPath: '/tmp/cipher.bin',
+      ciphertextComplete: false,
+      backgroundTaskId: 'task-2',
+      manifestHashB64: 'hash-b64',
+      destination: 'files',
+      requiresForegroundResume: false,
+      downloadTokenRefreshFailures: 0,
+      notificationLabel: 'Transfer',
+    );
+
+    await store.save(state);
+
+    final restarted = SecureTransferStateStore(secureStore: secure);
+    final reloaded = await restarted.load('transfer-2');
+    expect(reloaded, isNotNull);
+    expect(reloaded?.ciphertextPath, equals('/tmp/cipher.bin'));
+    expect(reloaded?.ciphertextComplete, isFalse);
+    expect(reloaded?.backgroundTaskId, equals('task-2'));
+    expect(reloaded?.manifestHashB64, equals('hash-b64'));
+    expect(reloaded?.destination, equals('files'));
+    expect(reloaded?.requiresForegroundResume, isFalse);
+    expect(reloaded?.downloadTokenRefreshFailures, equals(0));
+    expect(reloaded?.notificationLabel, equals('Transfer'));
+  });
+
   test('listPending excludes terminal transfers', () async {
     final secure = MemorySecureStore();
     final store = SecureTransferStateStore(secureStore: secure);

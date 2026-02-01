@@ -2,40 +2,46 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:universaldrop_app/main.dart';
-import 'package:universaldrop_app/transfer_background.dart';
-import 'package:universaldrop_app/transport.dart';
 
 void main() {
-  testWidgets(
-      'enabling experimental background transfers disables on missing plugin',
-      (tester) async {
+  testWidgets('background toggles default to off', (tester) async {
     SharedPreferences.setMockInitialValues({});
-    final backgroundManager = TransferBackgroundManager(
-      scheduler: _NoopResumeScheduler(),
-      foregroundController: _NoopForegroundController(),
-    );
-    Transport? selectedTransport;
 
     await tester.pumpWidget(
-      MaterialApp(
-        home: HomeScreen(
-          backgroundManager: backgroundManager,
-          runStartupTasks: false,
-          onTransportSelected: (transport) {
-            selectedTransport = transport;
-          },
-        ),
+      const MaterialApp(
+        home: HomeScreen(runStartupTasks: false),
       ),
     );
     await tester.pump();
 
-    final toggleFinder = find.widgetWithText(
+    final preferFinder =
+        find.widgetWithText(SwitchListTile, 'Prefer background downloads');
+    final detailsFinder = find.widgetWithText(
       SwitchListTile,
-      'Experimental: Background transfers',
+      'Show more details in notifications',
     );
-    expect(toggleFinder, findsOneWidget);
 
-    await tester.tap(toggleFinder);
+    final preferToggle = tester.widget<SwitchListTile>(preferFinder);
+    final detailsToggle = tester.widget<SwitchListTile>(detailsFinder);
+
+    expect(preferToggle.value, isFalse);
+    expect(detailsToggle.value, isFalse);
+  });
+
+  testWidgets('prefer background downloads shows disclosure', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: HomeScreen(runStartupTasks: false),
+      ),
+    );
+    await tester.pump();
+
+    final preferFinder =
+        find.widgetWithText(SwitchListTile, 'Prefer background downloads');
+
+    await tester.tap(preferFinder);
     await tester.pump();
 
     expect(
@@ -48,27 +54,7 @@ void main() {
     await tester.tap(find.text('OK'));
     await tester.pumpAndSettle();
 
-    final toggle = tester.widget<SwitchListTile>(toggleFinder);
-    expect(toggle.value, isFalse);
-    expect(selectedTransport, isA<HttpTransport>());
+    final preferToggle = tester.widget<SwitchListTile>(preferFinder);
+    expect(preferToggle.value, isTrue);
   });
-}
-
-class _NoopResumeScheduler implements TransferResumeScheduler {
-  @override
-  Future<void> scheduleResume(TransferState state) async {}
-
-  @override
-  Future<void> cancelResume(String transferId) async {}
-}
-
-class _NoopForegroundController implements TransferForegroundController {
-  @override
-  Future<void> startReceiving() async {}
-
-  @override
-  Future<void> startSending() async {}
-
-  @override
-  Future<void> stop() async {}
 }

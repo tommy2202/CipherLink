@@ -9,6 +9,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  background_downloader: ^9.5.2
   connectivity_plus: ^7.0.0
   http: ^1.2.2
   cryptography: ^2.7.0
