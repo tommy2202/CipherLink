@@ -10,6 +10,18 @@ import 'package:share_plus/share_plus.dart';
 import 'destination_preferences.dart';
 
 typedef PhotoPermissionRequester = Future<PermissionState> Function();
+typedef GallerySaver = Future<SaveOutcome> Function(
+  Uint8List bytes,
+  String name,
+  String mime,
+);
+typedef AppStorageWriter = Future<String> Function(Uint8List bytes, String name);
+typedef TempWriter = Future<String> Function(Uint8List bytes, String name);
+typedef SaveAsHandler = Future<String?> Function(
+  String path,
+  String suggestedName,
+);
+typedef OpenInHandler = Future<void> Function(String path);
 
 PhotoPermissionRequester requestPhotoPermission =
     PhotoManager.requestPermissionExtend;
@@ -44,6 +56,24 @@ abstract class SaveService {
 }
 
 class DefaultSaveService implements SaveService {
+  DefaultSaveService({
+    GallerySaver? gallerySaver,
+    AppStorageWriter? appStorageWriter,
+    TempWriter? tempWriter,
+    SaveAsHandler? saveAsHandler,
+    OpenInHandler? openInHandler,
+  })  : _gallerySaver = gallerySaver,
+        _appStorageWriter = appStorageWriter,
+        _tempWriter = tempWriter,
+        _saveAsHandler = saveAsHandler,
+        _openInHandler = openInHandler;
+
+  final GallerySaver? _gallerySaver;
+  final AppStorageWriter? _appStorageWriter;
+  final TempWriter? _tempWriter;
+  final SaveAsHandler? _saveAsHandler;
+  final OpenInHandler? _openInHandler;
+
   @override
   Future<SaveOutcome> saveBytes({
     required Uint8List bytes,
@@ -53,11 +83,13 @@ class DefaultSaveService implements SaveService {
     required SaveDestination destination,
   }) async {
     if (isMedia && destination == SaveDestination.photos) {
-      final outcome = await _saveToGallery(bytes, name, mime);
+      final outcome =
+          await (_gallerySaver ?? _saveToGallery)(bytes, name, mime);
       if (outcome.success) {
         return outcome;
       }
-      final fallbackPath = await _writeToAppStorage(bytes, name);
+      final fallbackPath =
+          await (_appStorageWriter ?? _writeToAppStorage)(bytes, name);
       return SaveOutcome(
         success: false,
         usedFallback: true,
@@ -67,8 +99,9 @@ class DefaultSaveService implements SaveService {
       );
     }
 
-    final localPath = await _writeToAppStorage(bytes, name);
-    final savedPath = await saveAs(localPath, name);
+    final localPath =
+        await (_appStorageWriter ?? _writeToAppStorage)(bytes, name);
+    final savedPath = await (_saveAsHandler ?? saveAs)(localPath, name);
     return SaveOutcome(
       success: savedPath != null,
       usedFallback: savedPath == null,
@@ -80,6 +113,10 @@ class DefaultSaveService implements SaveService {
 
   @override
   Future<void> openIn(String path) async {
+    if (_openInHandler != null) {
+      await _openInHandler!(path);
+      return;
+    }
     await Share.shareXFiles([XFile(path)]);
   }
 
@@ -122,7 +159,7 @@ class DefaultSaveService implements SaveService {
         );
       }
     } else if (mime.startsWith('video/')) {
-      final path = await _writeToTemp(bytes, name);
+      final path = await (_tempWriter ?? _writeToTemp)(bytes, name);
       final entity = await PhotoManager.editor.saveVideo(path);
       if (entity != null) {
         return SaveOutcome(
