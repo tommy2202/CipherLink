@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:archive/archive.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
+import 'package:universaldrop_app/limits.dart';
 import 'package:universaldrop_app/zip_extract.dart';
 
 void main() {
@@ -28,6 +29,54 @@ void main() {
     expect(result.filesExtracted, 2);
     expect(File(p.join(dir.path, 'folder', 'hello.txt')).existsSync(), isTrue);
     expect(File(p.join(dir.path, 'root.txt')).existsSync(), isTrue);
+  });
+
+  test('zip with too many entries is refused', () async {
+    final archive = Archive()
+      ..addFile(ArchiveFile('one.txt', 1, [1]))
+      ..addFile(ArchiveFile('two.txt', 1, [2]))
+      ..addFile(ArchiveFile('three.txt', 1, [3]));
+    final bytes = Uint8List.fromList(ZipEncoder().encode(archive)!);
+    final dir = Directory.systemTemp.createTempSync();
+    await expectLater(
+      extractZipBytes(
+        bytes: bytes,
+        destinationDir: dir.path,
+        limits: const ZipExtractionLimits(maxEntries: 2),
+      ),
+      throwsA(isA<ZipLimitException>()),
+    );
+  });
+
+  test('zip with total size over limit is refused', () async {
+    final archive = Archive()
+      ..addFile(ArchiveFile('a.txt', 3, [1, 2, 3]))
+      ..addFile(ArchiveFile('b.txt', 3, [4, 5, 6]));
+    final bytes = Uint8List.fromList(ZipEncoder().encode(archive)!);
+    final dir = Directory.systemTemp.createTempSync();
+    await expectLater(
+      extractZipBytes(
+        bytes: bytes,
+        destinationDir: dir.path,
+        limits: const ZipExtractionLimits(maxTotalUncompressedBytes: 5),
+      ),
+      throwsA(isA<ZipLimitException>()),
+    );
+  });
+
+  test('zip with a single file over limit is refused', () async {
+    final archive = Archive()
+      ..addFile(ArchiveFile('big.txt', 6, [1, 2, 3, 4, 5, 6]));
+    final bytes = Uint8List.fromList(ZipEncoder().encode(archive)!);
+    final dir = Directory.systemTemp.createTempSync();
+    await expectLater(
+      extractZipBytes(
+        bytes: bytes,
+        destinationDir: dir.path,
+        limits: const ZipExtractionLimits(maxSingleFileBytes: 5),
+      ),
+      throwsA(isA<ZipLimitException>()),
+    );
   });
 
   test('extraction failure does not delete original zip', () async {

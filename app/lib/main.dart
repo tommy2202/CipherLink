@@ -1739,9 +1739,13 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() {
         _extractStatus = 'Extracted ${result.filesExtracted} files.';
       });
-    } catch (_) {
+    } catch (err) {
       setState(() {
-        _extractStatus = 'Extraction failed.';
+        if (err is ZipLimitException) {
+          _extractStatus = err.message;
+        } else {
+          _extractStatus = 'Extraction failed.';
+        }
       });
     } finally {
       setState(() {
