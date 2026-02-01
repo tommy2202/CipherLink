@@ -127,6 +127,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _showNotificationDetails = false;
   bool _isForeground = true;
   final Set<String> _trustedFingerprints = {};
+  final Map<String, String> _trustedNicknames = {};
   final Map<String, String> _receiverSasByClaim = {};
   final Set<String> _receiverSasConfirming = {};
 
@@ -146,8 +147,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         widget.destinationStore ?? SharedPreferencesDestinationStore();
     _saveService = widget.saveService ?? DefaultSaveService();
     _destinationSelector = DestinationSelector(_destinationStore);
+    _loadSettings();
     if (widget.runStartupTasks) {
-      _loadSettings();
       _resumePendingTransfers();
     }
   }
@@ -194,6 +195,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final showNotificationDetails =
         prefs.getBool(_notificationDetailsKey) ?? false;
     final trustedFingerprints = await _trustStore.loadFingerprints();
+    final trustedNicknames = await _trustStore.loadNicknames();
+    final trustedNicknames = await _trustStore.loadNicknames();
+    final trustedNicknames = await _trustStore.loadNicknames();
     if (!mounted) {
       return;
     }
@@ -207,6 +211,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _trustedFingerprints
         ..clear()
         ..addAll(trustedFingerprints);
+      _trustedNicknames
+        ..clear()
+        ..addAll(trustedNicknames);
+      _trustedNicknames
+        ..clear()
+        ..addAll(trustedNicknames);
+      _trustedNicknames
+        ..clear()
+        ..addAll(trustedNicknames);
     });
   }
 
@@ -324,6 +337,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _addTrustedFingerprint(String fingerprint) async {
     final updated = await _trustStore.addFingerprint(fingerprint);
+    final nicknames = await _trustStore.loadNicknames();
     if (!mounted) {
       return;
     }
@@ -331,11 +345,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _trustedFingerprints
         ..clear()
         ..addAll(updated);
+      _trustedNicknames
+        ..clear()
+        ..addAll(nicknames);
     });
   }
 
   Future<void> _removeTrustedFingerprint(String fingerprint) async {
     final updated = await _trustStore.removeFingerprint(fingerprint);
+    final nicknames = await _trustStore.loadNicknames();
     if (!mounted) {
       return;
     }
@@ -343,7 +361,163 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _trustedFingerprints
         ..clear()
         ..addAll(updated);
+      _trustedNicknames
+        ..clear()
+        ..addAll(nicknames);
     });
+  }
+
+  Future<void> _setTrustedNickname(
+    String fingerprint,
+    String nickname,
+  ) async {
+    final nicknames = await _trustStore.setNickname(fingerprint, nickname);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _trustedNicknames
+        ..clear()
+        ..addAll(nicknames);
+    });
+  }
+
+  Future<void> _promptTrustedNickname(String fingerprint) async {
+    final controller = TextEditingController(
+      text: _trustedNicknames[fingerprint] ?? '',
+    );
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Set nickname'),
+          content: TextField(
+            controller: controller,
+            decoration: const InputDecoration(
+              hintText: 'Optional nickname',
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () =>
+                  Navigator.of(context).pop(controller.text.trim()),
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+    controller.dispose();
+    if (result == null) {
+      return;
+    }
+    await _setTrustedNickname(fingerprint, result);
+  }
+
+  Future<void> _setTrustedNickname(
+    String fingerprint,
+    String nickname,
+  ) async {
+    final nicknames = await _trustStore.setNickname(fingerprint, nickname);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _trustedNicknames
+        ..clear()
+        ..addAll(nicknames);
+    });
+  }
+
+  Future<void> _promptTrustedNickname(String fingerprint) async {
+    final controller = TextEditingController(
+      text: _trustedNicknames[fingerprint] ?? '',
+    );
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Set nickname'),
+          content: TextField(
+            controller: controller,
+            decoration: const InputDecoration(
+              hintText: 'Optional nickname',
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () =>
+                  Navigator.of(context).pop(controller.text.trim()),
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+    controller.dispose();
+    if (result == null) {
+      return;
+    }
+    await _setTrustedNickname(fingerprint, result);
+  }
+
+  Future<void> _setTrustedNickname(
+    String fingerprint,
+    String nickname,
+  ) async {
+    final nicknames = await _trustStore.setNickname(fingerprint, nickname);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _trustedNicknames
+        ..clear()
+        ..addAll(nicknames);
+    });
+  }
+
+  Future<void> _promptTrustedNickname(String fingerprint) async {
+    final controller = TextEditingController(
+      text: _trustedNicknames[fingerprint] ?? '',
+    );
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Set nickname'),
+          content: TextField(
+            controller: controller,
+            decoration: const InputDecoration(
+              hintText: 'Optional nickname',
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () =>
+                  Navigator.of(context).pop(controller.text.trim()),
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+    controller.dispose();
+    if (result == null) {
+      return;
+    }
+    await _setTrustedNickname(fingerprint, result);
   }
 
   String _formatFingerprint(String fingerprint) {
@@ -363,6 +537,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
         ),
         SizedBox(height: 8),
+        Text(
+          'Trusted means you\'ve verified SAS with this device before. '
+          'Always verify SAS if unsure.',
+        ),
+        SizedBox(height: 8),
         Text('No trusted devices yet.'),
       ];
     }
@@ -372,16 +551,34 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
       ),
       const SizedBox(height: 8),
+      const Text(
+        'Trusted means you\'ve verified SAS with this device before. '
+        'Always verify SAS if unsure.',
+      ),
+      const SizedBox(height: 8),
       ...entries.map((fingerprint) {
+        final nickname = _trustedNicknames[fingerprint];
+        final hasNickname = nickname != null && nickname.trim().isNotEmpty;
         return ListTile(
           contentPadding: EdgeInsets.zero,
-          title: Text(_formatFingerprint(fingerprint)),
-          trailing: IconButton(
-            tooltip: 'Remove',
-            icon: const Icon(Icons.delete_outline),
-            onPressed: () {
-              _removeTrustedFingerprint(fingerprint);
-            },
+          title: Text(
+            hasNickname ? nickname : _formatFingerprint(fingerprint),
+          ),
+          subtitle: hasNickname ? Text(_formatFingerprint(fingerprint)) : null,
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                tooltip: 'Edit nickname',
+                icon: const Icon(Icons.edit_outlined),
+                onPressed: () => _promptTrustedNickname(fingerprint),
+              ),
+              IconButton(
+                tooltip: 'Revoke trust',
+                icon: const Icon(Icons.delete_outline),
+                onPressed: () => _removeTrustedFingerprint(fingerprint),
+              ),
+            ],
           ),
         );
       }),
@@ -2817,6 +3014,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _showNotificationDetails = false;
   bool _isForeground = true;
   final Set<String> _trustedFingerprints = {};
+  final Map<String, String> _trustedNicknames = {};
   final Map<String, String> _receiverSasByClaim = {};
   final Set<String> _receiverSasConfirming = {};
 
@@ -2836,8 +3034,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         widget.destinationStore ?? SharedPreferencesDestinationStore();
     _saveService = widget.saveService ?? DefaultSaveService();
     _destinationSelector = DestinationSelector(_destinationStore);
+    _loadSettings();
     if (widget.runStartupTasks) {
-      _loadSettings();
       _resumePendingTransfers();
     }
   }
@@ -3014,6 +3212,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _addTrustedFingerprint(String fingerprint) async {
     final updated = await _trustStore.addFingerprint(fingerprint);
+    final nicknames = await _trustStore.loadNicknames();
     if (!mounted) {
       return;
     }
@@ -3021,11 +3220,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _trustedFingerprints
         ..clear()
         ..addAll(updated);
+      _trustedNicknames
+        ..clear()
+        ..addAll(nicknames);
     });
   }
 
   Future<void> _removeTrustedFingerprint(String fingerprint) async {
     final updated = await _trustStore.removeFingerprint(fingerprint);
+    final nicknames = await _trustStore.loadNicknames();
     if (!mounted) {
       return;
     }
@@ -3033,6 +3236,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _trustedFingerprints
         ..clear()
         ..addAll(updated);
+      _trustedNicknames
+        ..clear()
+        ..addAll(nicknames);
     });
   }
 
@@ -3053,6 +3259,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
         ),
         SizedBox(height: 8),
+        Text(
+          'Trusted means you\'ve verified SAS with this device before. '
+          'Always verify SAS if unsure.',
+        ),
+        SizedBox(height: 8),
         Text('No trusted devices yet.'),
       ];
     }
@@ -3062,16 +3273,34 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
       ),
       const SizedBox(height: 8),
+      const Text(
+        'Trusted means you\'ve verified SAS with this device before. '
+        'Always verify SAS if unsure.',
+      ),
+      const SizedBox(height: 8),
       ...entries.map((fingerprint) {
+        final nickname = _trustedNicknames[fingerprint];
+        final hasNickname = nickname != null && nickname.trim().isNotEmpty;
         return ListTile(
           contentPadding: EdgeInsets.zero,
-          title: Text(_formatFingerprint(fingerprint)),
-          trailing: IconButton(
-            tooltip: 'Remove',
-            icon: const Icon(Icons.delete_outline),
-            onPressed: () {
-              _removeTrustedFingerprint(fingerprint);
-            },
+          title: Text(
+            hasNickname ? nickname : _formatFingerprint(fingerprint),
+          ),
+          subtitle: hasNickname ? Text(_formatFingerprint(fingerprint)) : null,
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                tooltip: 'Edit nickname',
+                icon: const Icon(Icons.edit_outlined),
+                onPressed: () => _promptTrustedNickname(fingerprint),
+              ),
+              IconButton(
+                tooltip: 'Revoke trust',
+                icon: const Icon(Icons.delete_outline),
+                onPressed: () => _removeTrustedFingerprint(fingerprint),
+              ),
+            ],
           ),
         );
       }),
@@ -5469,6 +5698,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _showNotificationDetails = false;
   bool _isForeground = true;
   final Set<String> _trustedFingerprints = {};
+  final Map<String, String> _trustedNicknames = {};
   final Map<String, String> _receiverSasByClaim = {};
   final Set<String> _receiverSasConfirming = {};
 
@@ -5495,8 +5725,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         widget.destinationStore ?? SharedPreferencesDestinationStore();
     _saveService = widget.saveService ?? DefaultSaveService();
     _destinationSelector = DestinationSelector(_destinationStore);
+    _loadSettings();
     if (widget.runStartupTasks) {
-      _loadSettings();
       _resumePendingTransfers();
     }
   }
@@ -5673,6 +5903,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _addTrustedFingerprint(String fingerprint) async {
     final updated = await _trustStore.addFingerprint(fingerprint);
+    final nicknames = await _trustStore.loadNicknames();
     if (!mounted) {
       return;
     }
@@ -5680,11 +5911,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _trustedFingerprints
         ..clear()
         ..addAll(updated);
+      _trustedNicknames
+        ..clear()
+        ..addAll(nicknames);
     });
   }
 
   Future<void> _removeTrustedFingerprint(String fingerprint) async {
     final updated = await _trustStore.removeFingerprint(fingerprint);
+    final nicknames = await _trustStore.loadNicknames();
     if (!mounted) {
       return;
     }
@@ -5692,6 +5927,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _trustedFingerprints
         ..clear()
         ..addAll(updated);
+      _trustedNicknames
+        ..clear()
+        ..addAll(nicknames);
     });
   }
 
@@ -5712,6 +5950,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
         ),
         SizedBox(height: 8),
+        Text(
+          'Trusted means you\'ve verified SAS with this device before. '
+          'Always verify SAS if unsure.',
+        ),
+        SizedBox(height: 8),
         Text('No trusted devices yet.'),
       ];
     }
@@ -5721,16 +5964,34 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
       ),
       const SizedBox(height: 8),
+      const Text(
+        'Trusted means you\'ve verified SAS with this device before. '
+        'Always verify SAS if unsure.',
+      ),
+      const SizedBox(height: 8),
       ...entries.map((fingerprint) {
+        final nickname = _trustedNicknames[fingerprint];
+        final hasNickname = nickname != null && nickname.trim().isNotEmpty;
         return ListTile(
           contentPadding: EdgeInsets.zero,
-          title: Text(_formatFingerprint(fingerprint)),
-          trailing: IconButton(
-            tooltip: 'Remove',
-            icon: const Icon(Icons.delete_outline),
-            onPressed: () {
-              _removeTrustedFingerprint(fingerprint);
-            },
+          title: Text(
+            hasNickname ? nickname : _formatFingerprint(fingerprint),
+          ),
+          subtitle: hasNickname ? Text(_formatFingerprint(fingerprint)) : null,
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                tooltip: 'Edit nickname',
+                icon: const Icon(Icons.edit_outlined),
+                onPressed: () => _promptTrustedNickname(fingerprint),
+              ),
+              IconButton(
+                tooltip: 'Revoke trust',
+                icon: const Icon(Icons.delete_outline),
+                onPressed: () => _removeTrustedFingerprint(fingerprint),
+              ),
+            ],
           ),
         );
       }),
