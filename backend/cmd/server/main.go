@@ -38,6 +38,7 @@ func main() {
 		})
 	}
 	tokens := token.NewHMACService(secret)
+	liveness := sweeper.NewLiveness()
 
 	server := api.NewServer(api.Dependencies{
 		Config:  cfg,
@@ -57,7 +58,6 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	liveness := sweeper.NewLiveness()
 	sweep := sweeper.New(store, clk, cfg.SweepInterval, logger, liveness)
 	sweep.Start(ctx)
 
