@@ -9,6 +9,11 @@ import 'package:share_plus/share_plus.dart';
 
 import 'destination_preferences.dart';
 
+typedef PhotoPermissionRequester = Future<PermissionState> Function();
+
+PhotoPermissionRequester requestPhotoPermission =
+    PhotoManager.requestPermissionExtend;
+
 class SaveOutcome {
   SaveOutcome({
     required this.success,
@@ -94,7 +99,7 @@ class DefaultSaveService implements SaveService {
     String name,
     String mime,
   ) async {
-    final permission = await PhotoManager.requestPermissionExtend();
+    final permission = await requestPhotoPermission();
     if (!permission.isAuth) {
       return SaveOutcome(
         success: false,

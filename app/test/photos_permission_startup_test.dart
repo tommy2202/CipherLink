@@ -1,18 +1,22 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
-
-import 'package:flutter_test/flutter_test.dart';
-
 import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:photo_manager/photo_manager.dart';
 import 'package:universaldrop_app/main.dart';
+import 'package:universaldrop_app/save_service.dart';
 import 'package:universaldrop_app/transfer_background.dart';
 
 void main() {
-  testWidgets('Home screen renders', (WidgetTester tester) async {
+  testWidgets('does not request photos permission on startup', (tester) async {
+    var requested = false;
+    final originalRequester = requestPhotoPermission;
+    requestPhotoPermission = () async {
+      requested = true;
+      return PermissionState.denied;
+    };
+    addTearDown(() {
+      requestPhotoPermission = originalRequester;
+    });
+
     final backgroundManager = TransferBackgroundManager(
       scheduler: _NoopResumeScheduler(),
       foregroundController: _NoopForegroundController(),
@@ -26,8 +30,9 @@ void main() {
         ),
       ),
     );
+    await tester.pump();
 
-    expect(find.text('UniversalDrop'), findsOneWidget);
+    expect(requested, isFalse);
   });
 }
 

@@ -57,9 +57,17 @@ class HomeScreen extends StatefulWidget {
   const HomeScreen({
     super.key,
     ClipboardService? clipboardService,
+    this.saveService,
+    this.destinationStore,
+    this.backgroundManager,
+    this.runStartupTasks = true,
   }) : clipboardService = clipboardService ?? const SystemClipboardService();
 
   final ClipboardService clipboardService;
+  final SaveService? saveService;
+  final DestinationPreferenceStore? destinationStore;
+  final TransferBackgroundManager? backgroundManager;
+  final bool runStartupTasks;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -83,25 +91,10 @@ class _HomeScreenState extends State<HomeScreen> {
   late final SecureTransferStateStore _transferStore =
       SecureTransferStateStore();
   final SecureKeyPairStore _keyStore = SecureKeyPairStore();
-  late final TransferBackgroundManager _backgroundManager =
-      TransferBackgroundManager(
-    scheduler: FeatureFlaggedResumeScheduler(
-      scheduler: MethodChannelResumeScheduler(),
-      isEnabled: () => _enableBackgroundServices,
-      onUnavailable: _handleBackgroundServicesUnavailable,
-    ),
-    foregroundController: FeatureFlaggedForegroundController(
-      controller: MethodChannelForegroundController(),
-      isEnabled: () => _enableBackgroundServices,
-      onUnavailable: _handleBackgroundServicesUnavailable,
-    ),
-    onConnectivityRestored: () => _resumePendingTransfers(),
-  );
-  final DestinationPreferenceStore _destinationStore =
-      SharedPreferencesDestinationStore();
-  final SaveService _saveService = DefaultSaveService();
-  late final DestinationSelector _destinationSelector =
-      DestinationSelector(_destinationStore);
+  late final TransferBackgroundManager _backgroundManager;
+  late final DestinationPreferenceStore _destinationStore;
+  late final SaveService _saveService;
+  late final DestinationSelector _destinationSelector;
   final TrustStore _trustStore = const TrustStore();
   final TextEditingController _textTitleController = TextEditingController();
   final TextEditingController _textContentController = TextEditingController();
@@ -165,8 +158,28 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
-    _loadSettings();
-    _resumePendingTransfers();
+    _backgroundManager = widget.backgroundManager ??
+        TransferBackgroundManager(
+          scheduler: FeatureFlaggedResumeScheduler(
+            scheduler: MethodChannelResumeScheduler(),
+            isEnabled: () => _enableBackgroundServices,
+            onUnavailable: _handleBackgroundServicesUnavailable,
+          ),
+          foregroundController: FeatureFlaggedForegroundController(
+            controller: MethodChannelForegroundController(),
+            isEnabled: () => _enableBackgroundServices,
+            onUnavailable: _handleBackgroundServicesUnavailable,
+          ),
+          onConnectivityRestored: () => _resumePendingTransfers(),
+        );
+    _destinationStore =
+        widget.destinationStore ?? SharedPreferencesDestinationStore();
+    _saveService = widget.saveService ?? DefaultSaveService();
+    _destinationSelector = DestinationSelector(_destinationStore);
+    if (widget.runStartupTasks) {
+      _loadSettings();
+      _resumePendingTransfers();
+    }
   }
 
   @override

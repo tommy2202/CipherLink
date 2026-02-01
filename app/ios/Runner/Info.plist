@@ -16,6 +16,8 @@
 	<string>universaldrop_app</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>UniversalDrop needs access to save received photos and videos to your Photos library.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>UniversalDrop needs access to select and save photos.</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
