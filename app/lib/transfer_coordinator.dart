@@ -224,6 +224,26 @@ class TransferCoordinator {
     );
   }
 
+  Future<TransferManifest?> fetchManifest({
+    required String sessionId,
+    required String transferToken,
+    required String transferId,
+    required SimplePublicKey senderPublicKey,
+    required KeyPair receiverKeyPair,
+    P2PContext? p2pContext,
+  }) async {
+    final transport = _resolveTransport(p2pContext);
+    final bundle = await _fetchManifestBundle(
+      transport: transport,
+      sessionId: sessionId,
+      transferId: transferId,
+      transferToken: transferToken,
+      senderPublicKey: senderPublicKey,
+      receiverKeyPair: receiverKeyPair,
+    );
+    return bundle?.manifest;
+  }
+
   Future<TransferDownloadResult?> downloadTransfer({
     required String sessionId,
     required String transferToken,

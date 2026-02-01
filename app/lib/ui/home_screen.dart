@@ -24,12 +24,14 @@ import 'package:universaldrop_app/key_store.dart';
 import 'package:universaldrop_app/packaging_builder.dart';
 import 'package:universaldrop_app/save_service.dart';
 import 'package:universaldrop_app/transfer/background_transfer.dart';
+import 'package:universaldrop_app/transfer/transfer_summary.dart';
 import 'package:universaldrop_app/transfer_coordinator.dart';
 import 'package:universaldrop_app/transfer_manifest.dart';
 import 'package:universaldrop_app/transfer_state_store.dart';
 import 'package:universaldrop_app/transport.dart';
 import 'package:universaldrop_app/trust_store.dart';
 import 'package:universaldrop_app/trusted_device_badge.dart';
+import 'package:universaldrop_app/ui/transfer_summary_screen.dart';
 import 'package:universaldrop_app/zip_extract.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -436,6 +438,43 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       destinationResolver: _resolveBackgroundDestination,
       isAppInForeground: () => _isForeground,
     );
+  }
+
+  Future<bool> _showTransferSummary({
+    required TransferManifest manifest,
+    required PendingClaim claim,
+  }) async {
+    if (!mounted) {
+      return false;
+    }
+    final summary = buildTransferSummary(manifest);
+    final result = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) => TransferSummaryScreen(
+          summary: summary,
+          manifest: manifest,
+          routeLabel: _routeLabelForClaim(claim),
+          routeDisclosure: _routeDisclosureForClaim(claim),
+        ),
+      ),
+    );
+    return result ?? false;
+  }
+
+  String _routeLabelForClaim(PendingClaim claim) {
+    return _isDirectP2P(claim) ? 'Direct P2P' : 'Relay';
+  }
+
+  String _routeDisclosureForClaim(PendingClaim claim) {
+    if (_isDirectP2P(claim)) {
+      return 'Direct P2P may expose your IP address to the sender.';
+    }
+    return 'Relay keeps your IP address hidden from the sender.';
+  }
+
+  bool _isDirectP2P(PendingClaim claim) {
+    final p2pToken = _p2pTokensByClaim[claim.claimId] ?? '';
+    return _preferDirect && !_alwaysRelay && p2pToken.isNotEmpty;
   }
 
   Future<SaveDestination?> _resolveBackgroundDestination(
@@ -1188,6 +1227,30 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         return;
       }
       final senderPublicKey = publicKeyFromBase64(senderPubKeyB64);
+      final preview = await coordinator.fetchManifest(
+        sessionId: sessionId,
+        transferToken: transferToken,
+        transferId: claim.transferId,
+        senderPublicKey: senderPublicKey,
+        receiverKeyPair: _receiverKeyPair!,
+        p2pContext: p2pContext,
+      );
+      if (preview == null) {
+        setState(() {
+          _manifestStatus = 'Manifest preview failed.';
+        });
+        return;
+      }
+      final approved = await _showTransferSummary(
+        manifest: preview,
+        claim: claim,
+      );
+      if (!approved) {
+        setState(() {
+          _manifestStatus = 'Receive cancelled.';
+        });
+        return;
+      }
       final result = await coordinator.downloadTransfer(
         sessionId: sessionId,
         transferToken: transferToken,
@@ -2651,12 +2714,14 @@ import 'package:universaldrop_app/key_store.dart';
 import 'package:universaldrop_app/packaging_builder.dart';
 import 'package:universaldrop_app/save_service.dart';
 import 'package:universaldrop_app/transfer/background_transfer.dart';
+import 'package:universaldrop_app/transfer/transfer_summary.dart';
 import 'package:universaldrop_app/transfer_coordinator.dart';
 import 'package:universaldrop_app/transfer_manifest.dart';
 import 'package:universaldrop_app/transfer_state_store.dart';
 import 'package:universaldrop_app/transport.dart';
 import 'package:universaldrop_app/trust_store.dart';
 import 'package:universaldrop_app/trusted_device_badge.dart';
+import 'package:universaldrop_app/ui/transfer_summary_screen.dart';
 import 'package:universaldrop_app/zip_extract.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -3063,6 +3128,43 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       destinationResolver: _resolveBackgroundDestination,
       isAppInForeground: () => _isForeground,
     );
+  }
+
+  Future<bool> _showTransferSummary({
+    required TransferManifest manifest,
+    required PendingClaim claim,
+  }) async {
+    if (!mounted) {
+      return false;
+    }
+    final summary = buildTransferSummary(manifest);
+    final result = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) => TransferSummaryScreen(
+          summary: summary,
+          manifest: manifest,
+          routeLabel: _routeLabelForClaim(claim),
+          routeDisclosure: _routeDisclosureForClaim(claim),
+        ),
+      ),
+    );
+    return result ?? false;
+  }
+
+  String _routeLabelForClaim(PendingClaim claim) {
+    return _isDirectP2P(claim) ? 'Direct P2P' : 'Relay';
+  }
+
+  String _routeDisclosureForClaim(PendingClaim claim) {
+    if (_isDirectP2P(claim)) {
+      return 'Direct P2P may expose your IP address to the sender.';
+    }
+    return 'Relay keeps your IP address hidden from the sender.';
+  }
+
+  bool _isDirectP2P(PendingClaim claim) {
+    final p2pToken = _p2pTokensByClaim[claim.claimId] ?? '';
+    return _preferDirect && !_alwaysRelay && p2pToken.isNotEmpty;
   }
 
   Future<SaveDestination?> _resolveBackgroundDestination(
@@ -3800,6 +3902,30 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         return;
       }
       final senderPublicKey = publicKeyFromBase64(senderPubKeyB64);
+      final preview = await coordinator.fetchManifest(
+        sessionId: sessionId,
+        transferToken: transferToken,
+        transferId: claim.transferId,
+        senderPublicKey: senderPublicKey,
+        receiverKeyPair: _receiverKeyPair!,
+        p2pContext: p2pContext,
+      );
+      if (preview == null) {
+        setState(() {
+          _manifestStatus = 'Manifest preview failed.';
+        });
+        return;
+      }
+      final approved = await _showTransferSummary(
+        manifest: preview,
+        claim: claim,
+      );
+      if (!approved) {
+        setState(() {
+          _manifestStatus = 'Receive cancelled.';
+        });
+        return;
+      }
       final result = await coordinator.downloadTransfer(
         sessionId: sessionId,
         transferToken: transferToken,
@@ -5252,9 +5378,11 @@ import 'package:universaldrop_app/transfer/crypto.dart';
 import 'package:universaldrop_app/transfer/packaging_builder.dart';
 import 'package:universaldrop_app/transfer/background_transfer.dart';
 import 'package:universaldrop_app/transfer/transfer_coordinator.dart';
+import 'package:universaldrop_app/transfer/transfer_summary.dart';
 import 'package:universaldrop_app/transfer/transfer_state_store.dart';
 import 'package:universaldrop_app/transfer/transport.dart';
 import 'package:universaldrop_app/ui/diagnostics_screen.dart';
+import 'package:universaldrop_app/ui/transfer_summary_screen.dart';
 import 'package:universaldrop_app/ui/trusted_device_badge.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -5659,6 +5787,43 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       destinationResolver: _resolveBackgroundDestination,
       isAppInForeground: () => _isForeground,
     );
+  }
+
+  Future<bool> _showTransferSummary({
+    required TransferManifest manifest,
+    required PendingClaim claim,
+  }) async {
+    if (!mounted) {
+      return false;
+    }
+    final summary = buildTransferSummary(manifest);
+    final result = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) => TransferSummaryScreen(
+          summary: summary,
+          manifest: manifest,
+          routeLabel: _routeLabelForClaim(claim),
+          routeDisclosure: _routeDisclosureForClaim(claim),
+        ),
+      ),
+    );
+    return result ?? false;
+  }
+
+  String _routeLabelForClaim(PendingClaim claim) {
+    return _isDirectP2P(claim) ? 'Direct P2P' : 'Relay';
+  }
+
+  String _routeDisclosureForClaim(PendingClaim claim) {
+    if (_isDirectP2P(claim)) {
+      return 'Direct P2P may expose your IP address to the sender.';
+    }
+    return 'Relay keeps your IP address hidden from the sender.';
+  }
+
+  bool _isDirectP2P(PendingClaim claim) {
+    final p2pToken = _p2pTokensByClaim[claim.claimId] ?? '';
+    return _preferDirect && !_alwaysRelay && p2pToken.isNotEmpty;
   }
 
   Future<SaveDestination?> _resolveBackgroundDestination(
@@ -6355,6 +6520,30 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         return;
       }
       final senderPublicKey = publicKeyFromBase64(senderPubKeyB64);
+      final preview = await coordinator.fetchManifest(
+        sessionId: sessionId,
+        transferToken: transferToken,
+        transferId: claim.transferId,
+        senderPublicKey: senderPublicKey,
+        receiverKeyPair: _receiverKeyPair!,
+        p2pContext: p2pContext,
+      );
+      if (preview == null) {
+        setState(() {
+          _manifestStatus = 'Manifest preview failed.';
+        });
+        return;
+      }
+      final approved = await _showTransferSummary(
+        manifest: preview,
+        claim: claim,
+      );
+      if (!approved) {
+        setState(() {
+          _manifestStatus = 'Receive cancelled.';
+        });
+        return;
+      }
       final result = await coordinator.downloadTransfer(
         sessionId: sessionId,
         transferToken: transferToken,
