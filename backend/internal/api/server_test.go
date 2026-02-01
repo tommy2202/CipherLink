@@ -87,6 +87,55 @@ func TestRateLimitTriggers(t *testing.T) {
 	}
 }
 
+func TestTransferRoutesSkipTimeoutMiddleware(t *testing.T) {
+	originalTimeout := timeoutMiddleware
+	timeoutMiddleware = func(_ time.Duration) func(http.Handler) http.Handler {
+		return func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Timeout-Applied", "true")
+				next.ServeHTTP(w, r)
+			})
+		}
+	}
+	t.Cleanup(func() {
+		timeoutMiddleware = originalTimeout
+	})
+
+	server := NewServer(Dependencies{
+		Config: config.Config{
+			Address:               ":0",
+			DataDir:               "data",
+			RateLimitHealth:       config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:           config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitSessionClaim: config.RateLimit{Max: 100, Window: time.Minute},
+			MaxScanBytes:          config.DefaultMaxScanBytes,
+			MaxScanDuration:       config.DefaultMaxScanDuration,
+		},
+		Store:  &stubStorage{},
+		Tokens: token.NewMemoryService(),
+	})
+
+	pingRec := httptest.NewRecorder()
+	server.Router.ServeHTTP(pingRec, httptest.NewRequest(http.MethodGet, "/v1/ping", nil))
+	if pingRec.Header().Get("X-Timeout-Applied") == "" {
+		t.Fatalf("expected timeout middleware on non-transfer route")
+	}
+
+	chunkRec := httptest.NewRecorder()
+	chunkReq := httptest.NewRequest(http.MethodPut, "/v1/transfer/chunk", bytes.NewBuffer([]byte("data")))
+	server.Router.ServeHTTP(chunkRec, chunkReq)
+	if chunkRec.Header().Get("X-Timeout-Applied") != "" {
+		t.Fatalf("expected no timeout middleware on transfer upload")
+	}
+
+	downloadRec := httptest.NewRecorder()
+	downloadReq := httptest.NewRequest(http.MethodGet, "/v1/transfer/download?session_id=missing&transfer_id=missing", nil)
+	server.Router.ServeHTTP(downloadRec, downloadReq)
+	if downloadRec.Header().Get("X-Timeout-Applied") != "" {
+		t.Fatalf("expected no timeout middleware on transfer download")
+	}
+}
+
 func TestQuotaBlocksExtraTransfers(t *testing.T) {
 	store := &stubStorage{}
 	server := NewServer(Dependencies{

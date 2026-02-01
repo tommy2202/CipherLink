@@ -4,6 +4,8 @@ import 'dart:typed_data';
 import 'package:archive/archive.dart';
 import 'package:path/path.dart' as p;
 
+import 'limits.dart';
+
 class ZipEntryData {
   ZipEntryData({
     required this.name,
@@ -49,12 +51,29 @@ class ZipSlipException implements Exception {
   String toString() => message;
 }
 
-List<ZipEntryData> decodeZipEntries(Uint8List bytes) {
-  final archive = ZipDecoder().decodeBytes(bytes);
+class ZipLimitException implements Exception {
+  ZipLimitException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+const String zipArchiveTooLargeMessage =
+    'Archive too large to extract safely.';
+
+List<ZipEntryData> decodeZipEntries(
+  Uint8List bytes, {
+  ZipExtractionLimits limits = const ZipExtractionLimits(),
+}) {
+  final archive = _decodeArchive(bytes, limits);
   final entries = <ZipEntryData>[];
   for (final file in archive.files) {
     final isFile = file.isFile;
-    final content = isFile ? Uint8List.fromList(file.content as List<int>) : Uint8List(0);
+    final content = isFile
+        ? Uint8List.fromList(file.content as List<int>)
+        : Uint8List(0);
     entries.add(
       ZipEntryData(
         name: file.name,
@@ -70,6 +89,7 @@ Future<ExtractResult> extractZipBytes({
   required Uint8List bytes,
   required String destinationDir,
   void Function(ExtractProgress progress)? onProgress,
+  ZipExtractionLimits limits = const ZipExtractionLimits(),
 }) async {
   final dest = Directory(destinationDir);
   if (await dest.exists() == false) {
@@ -82,7 +102,7 @@ Future<ExtractResult> extractZipBytes({
     throw ZipSlipException('destination_not_directory');
   }
 
-  final entries = decodeZipEntries(bytes);
+  final entries = decodeZipEntries(bytes, limits: limits);
   final totalFiles = entries.where((entry) => entry.isFile).length;
   final totalBytes = entries.fold<int>(
     0,
@@ -125,12 +145,14 @@ Future<ExtractResult> extractZipFile({
   required File zipFile,
   required String destinationDir,
   void Function(ExtractProgress progress)? onProgress,
+  ZipExtractionLimits limits = const ZipExtractionLimits(),
 }) async {
   final bytes = await zipFile.readAsBytes();
   return extractZipBytes(
     bytes: bytes,
     destinationDir: destinationDir,
     onProgress: onProgress,
+    limits: limits,
   );
 }
 
@@ -148,4 +170,35 @@ String _safeJoin(String root, String entryName) {
     throw ZipSlipException('path_escape');
   }
   return joined;
+}
+
+Archive _decodeArchive(Uint8List bytes, ZipExtractionLimits limits) {
+  final archive = ZipDecoder().decodeBytes(bytes);
+  _validateArchive(archive, limits);
+  return archive;
+}
+
+void _validateArchive(Archive archive, ZipExtractionLimits limits) {
+  final entries = archive.files;
+  if (entries.length > limits.maxEntries) {
+    throw ZipLimitException(zipArchiveTooLargeMessage);
+  }
+  var totalBytes = 0;
+  for (final entry in entries) {
+    final normalizedName = entry.name.replaceAll('\\', '/');
+    if (normalizedName.length > limits.maxPathLength) {
+      throw ZipLimitException(zipArchiveTooLargeMessage);
+    }
+    if (!entry.isFile) {
+      continue;
+    }
+    final entrySize = entry.size;
+    if (entrySize < 0 || entrySize > limits.maxSingleFileBytes) {
+      throw ZipLimitException(zipArchiveTooLargeMessage);
+    }
+    if (entrySize > limits.maxTotalUncompressedBytes - totalBytes) {
+      throw ZipLimitException(zipArchiveTooLargeMessage);
+    }
+    totalBytes += entrySize;
+  }
 }

@@ -1429,6 +1429,22 @@ class P2PTransport implements P2PFallbackTransport {
   }
 }
 
+Future<bool> isBackgroundTransportPluginAvailable(
+    {MethodChannel? channel}) async {
+  final probeChannel =
+      channel ?? const MethodChannel('universaldrop/background_url_session');
+  try {
+    await probeChannel.invokeMethod('fetchBytes', {'url': ''});
+    return true;
+  } on MissingPluginException {
+    return false;
+  } on PlatformException {
+    return true;
+  } on Exception {
+    return true;
+  }
+}
+
 class _P2PIceConfig {
   _P2PIceConfig({
     required this.stunUrls,

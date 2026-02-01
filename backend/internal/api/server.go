@@ -44,6 +44,9 @@ type Server struct {
 	Router         http.Handler
 }
 
+var nonTransferTimeout = 2 * time.Minute
+var timeoutMiddleware = middleware.Timeout
+
 func NewServer(deps Dependencies) *Server {
 	logSink := deps.Logger
 	if logSink == nil {
@@ -97,39 +100,45 @@ func (s *Server) routes() http.Handler {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(15 * time.Second))
-	r.Use(s.safeLogger)
 
-	r.With(s.rateLimit("health")).Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	r.With(timeoutMiddleware(nonTransferTimeout)).With(s.safeLogger).With(s.rateLimit("health")).Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": s.version})
 	})
 
 	r.Route("/v1", func(r chi.Router) {
-		r.Use(s.rateLimit("v1"))
-		r.Get("/ping", s.handlePing)
-		r.With(s.rateLimit("session-claim")).Post("/session/claim", s.handleClaimSession)
-		r.Post("/session/approve", s.handleApproveSession)
-		r.Post("/session/sas/commit", s.handleCommitSAS)
-		r.Get("/session/sas/status", s.handleSASStatus)
-		r.Get("/session/poll", s.handlePollSession)
-		r.Post("/session/create", s.handleCreateSession)
-		r.Route("/p2p", func(r chi.Router) {
-			r.Post("/offer", s.handleP2POffer)
-			r.Post("/answer", s.handleP2PAnswer)
-			r.Post("/ice", s.handleP2PICE)
-			r.Get("/poll", s.handleP2PPoll)
-			r.Get("/ice_config", s.handleP2PIceConfig)
+		r.Group(func(r chi.Router) {
+			r.Use(timeoutMiddleware(nonTransferTimeout))
+			r.Use(s.safeLogger)
+			r.Use(s.rateLimit("v1"))
+			r.Get("/ping", s.handlePing)
+			r.With(s.rateLimit("session-claim")).Post("/session/claim", s.handleClaimSession)
+			r.Post("/session/approve", s.handleApproveSession)
+			r.Post("/session/sas/commit", s.handleCommitSAS)
+			r.Get("/session/sas/status", s.handleSASStatus)
+			r.Get("/session/poll", s.handlePollSession)
+			r.Post("/session/create", s.handleCreateSession)
+			r.Route("/p2p", func(r chi.Router) {
+				r.Post("/offer", s.handleP2POffer)
+				r.Post("/answer", s.handleP2PAnswer)
+				r.Post("/ice", s.handleP2PICE)
+				r.Get("/poll", s.handleP2PPoll)
+				r.Get("/ice_config", s.handleP2PIceConfig)
+			})
 		})
-		r.Post("/transfer/init", s.handleInitTransfer)
-		r.Put("/transfer/chunk", s.handleUploadChunk)
-		r.Post("/transfer/finalize", s.handleFinalizeTransfer)
-		r.Get("/transfer/manifest", s.handleGetTransferManifest)
-		r.Post("/transfer/download_token", s.handleDownloadToken)
-		r.Get("/transfer/download", s.handleDownloadTransfer)
-		r.Post("/transfer/receipt", s.handleTransferReceipt)
-		r.Post("/transfer/scan_init", s.handleScanInit)
-		r.Put("/transfer/scan_chunk", s.handleScanChunk)
-		r.Post("/transfer/scan_finalize", s.handleScanFinalize)
+		r.Route("/transfer", func(r chi.Router) {
+			r.Use(s.safeLogger)
+			r.Use(s.rateLimit("v1"))
+			r.Post("/init", s.handleInitTransfer)
+			r.Put("/chunk", s.handleUploadChunk)
+			r.Post("/finalize", s.handleFinalizeTransfer)
+			r.Get("/manifest", s.handleGetTransferManifest)
+			r.Post("/download_token", s.handleDownloadToken)
+			r.Get("/download", s.handleDownloadTransfer)
+			r.Post("/receipt", s.handleTransferReceipt)
+			r.Post("/scan_init", s.handleScanInit)
+			r.Put("/scan_chunk", s.handleScanChunk)
+			r.Post("/scan_finalize", s.handleScanFinalize)
+		})
 	})
 
 	return r
