@@ -200,6 +200,39 @@ class FeatureFlaggedForegroundController implements TransferForegroundController
   }
 }
 
+Future<bool> isBackgroundResumePluginAvailable({MethodChannel? channel}) async {
+  final probeChannel =
+      channel ?? const MethodChannel('universaldrop/work_manager');
+  try {
+    await probeChannel.invokeMethod(
+      'cancel',
+      {'transfer_id': '_probe'},
+    );
+    return true;
+  } on MissingPluginException {
+    return false;
+  } on PlatformException {
+    return true;
+  } on Exception {
+    return true;
+  }
+}
+
+Future<bool> isForegroundServicePluginAvailable({MethodChannel? channel}) async {
+  final probeChannel =
+      channel ?? const MethodChannel('universaldrop/foreground_service');
+  try {
+    await probeChannel.invokeMethod('stop');
+    return true;
+  } on MissingPluginException {
+    return false;
+  } on PlatformException {
+    return true;
+  } on Exception {
+    return true;
+  }
+}
+
 class TransferBackgroundManager implements TransferBackgroundHooks {
   TransferBackgroundManager({
     required TransferResumeScheduler scheduler,

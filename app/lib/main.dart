@@ -60,6 +60,7 @@ class HomeScreen extends StatefulWidget {
     this.saveService,
     this.destinationStore,
     this.backgroundManager,
+    this.onTransportSelected,
     this.runStartupTasks = true,
   }) : clipboardService = clipboardService ?? const SystemClipboardService();
 
@@ -67,6 +68,7 @@ class HomeScreen extends StatefulWidget {
   final SaveService? saveService;
   final DestinationPreferenceStore? destinationStore;
   final TransferBackgroundManager? backgroundManager;
+  final void Function(Transport transport)? onTransportSelected;
   final bool runStartupTasks;
 
   @override
@@ -140,6 +142,7 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _preferDirect = true;
   bool _alwaysRelay = false;
   bool _p2pDisclosureShown = false;
+  bool _experimentalDisclosureShown = false;
   bool _enableBackgroundServices = false;
   bool _backgroundServicesUnavailableShown = false;
   bool _enableExperimentalBackgroundTransport = false;
@@ -151,6 +154,7 @@ class _HomeScreenState extends State<HomeScreen> {
   static const _p2pPreferDirectKey = 'p2pPreferDirect';
   static const _p2pAlwaysRelayKey = 'p2pAlwaysRelay';
   static const _p2pDisclosureKey = 'p2pDirectDisclosureShown';
+  static const _experimentalDisclosureKey = 'experimentalDisclosureShown';
   static const _backgroundServicesKey = 'enableBackgroundServices';
   static const _experimentalBackgroundTransportKey =
       'enableExperimentalBackgroundTransport';
@@ -202,6 +206,8 @@ class _HomeScreenState extends State<HomeScreen> {
     final preferDirect = prefs.getBool(_p2pPreferDirectKey) ?? true;
     final alwaysRelay = prefs.getBool(_p2pAlwaysRelayKey) ?? false;
     final disclosureShown = prefs.getBool(_p2pDisclosureKey) ?? false;
+    final experimentalDisclosureShown =
+        prefs.getBool(_experimentalDisclosureKey) ?? false;
     final enableBackgroundServices =
         prefs.getBool(_backgroundServicesKey) ?? false;
     final enableBackground =
@@ -214,12 +220,33 @@ class _HomeScreenState extends State<HomeScreen> {
       _preferDirect = preferDirect;
       _alwaysRelay = alwaysRelay;
       _p2pDisclosureShown = disclosureShown;
+      _experimentalDisclosureShown = experimentalDisclosureShown;
       _enableBackgroundServices = enableBackgroundServices;
       _enableExperimentalBackgroundTransport = enableBackground;
       _trustedFingerprints
         ..clear()
         ..addAll(trustedFingerprints);
     });
+    if (_enableBackgroundServices) {
+      final available = await _areBackgroundServicesAvailable();
+      if (!available && mounted) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) {
+            _handleBackgroundServicesUnavailable();
+          }
+        });
+      }
+    }
+    if (_enableExperimentalBackgroundTransport) {
+      final available = await _isBackgroundTransportAvailable();
+      if (!available && mounted) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) {
+            _handleBackgroundTransportUnavailable();
+          }
+        });
+      }
+    }
   }
 
   Future<void> _persistP2PSettings() async {
@@ -252,6 +279,14 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _setBackgroundServicesEnabled(bool value) async {
+    if (value) {
+      await _maybeShowExperimentalDisclosure();
+      final available = await _areBackgroundServicesAvailable();
+      if (!available) {
+        _handleBackgroundServicesUnavailable();
+        return;
+      }
+    }
     setState(() {
       _enableBackgroundServices = value;
       if (value) {
@@ -263,6 +298,15 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _setExperimentalBackgroundTransport(bool value) async {
+    if (value) {
+      await _maybeShowExperimentalDisclosure();
+      final available = await _isBackgroundTransportAvailable();
+      if (!available) {
+        _handleBackgroundTransportUnavailable();
+        _ensureCoordinator();
+        return;
+      }
+    }
     setState(() {
       _enableExperimentalBackgroundTransport = value;
       if (value) {
@@ -272,6 +316,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _coordinator = null;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_experimentalBackgroundTransportKey, value);
+    _ensureCoordinator();
   }
 
   Future<void> _maybeShowDirectDisclosure() async {
@@ -303,6 +348,38 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     setState(() {
       _p2pDisclosureShown = true;
+    });
+  }
+
+  Future<void> _maybeShowExperimentalDisclosure() async {
+    if (_experimentalDisclosureShown || !mounted) {
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Experimental features'),
+          content: const Text(
+            'May not be available on all devices. If unavailable, '
+            'CipherLink uses standard mode.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_experimentalDisclosureKey, true);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _experimentalDisclosureShown = true;
     });
   }
 
@@ -377,10 +454,16 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     _backgroundTransportFallbackShown = true;
+    setState(() {
+      _enableExperimentalBackgroundTransport = false;
+    });
+    SharedPreferences.getInstance().then((prefs) {
+      prefs.setBool(_experimentalBackgroundTransportKey, false);
+    });
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
         content: Text(
-          'Background transport unavailable; using standard mode.',
+          'Background transfers unavailable; using standard mode.',
         ),
       ),
     );
@@ -400,7 +483,7 @@ class _HomeScreenState extends State<HomeScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
         content: Text(
-          'Background services unavailable; using in-app transfers.',
+          'Foreground transfer notification unavailable; using standard mode.',
         ),
       ),
     );
@@ -430,6 +513,7 @@ class _HomeScreenState extends State<HomeScreen> {
         onFallback: _handleBackgroundTransportUnavailable,
       );
     }
+    widget.onTransportSelected?.call(transport);
     _coordinator = TransferCoordinator(
       transport: transport,
       p2pTransportFactory: (context) => P2PTransport(
@@ -562,6 +646,16 @@ class _HomeScreenState extends State<HomeScreen> {
       isInitiator: isInitiator,
       iceMode: _alwaysRelay ? P2PIceMode.relay : P2PIceMode.direct,
     );
+  }
+
+  Future<bool> _areBackgroundServicesAvailable() async {
+    final resumeAvailable = await isBackgroundResumePluginAvailable();
+    final foregroundAvailable = await isForegroundServicePluginAvailable();
+    return resumeAvailable && foregroundAvailable;
+  }
+
+  Future<bool> _isBackgroundTransportAvailable() async {
+    return isBackgroundTransportPluginAvailable();
   }
 
   Future<void> _pingBackend() async {
@@ -1931,15 +2025,18 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
-              title: const Text('Background resume + foreground service'),
-              subtitle: const Text('Optional; defaults to off'),
+              title: const Text(
+                'Experimental: Foreground transfer notification (Android)',
+              ),
+              subtitle: const Text('Shows a notification during transfers'),
               value: _enableBackgroundServices,
               onChanged: (value) => _setBackgroundServicesEnabled(value),
             ),
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
-              title: const Text('Experimental background transport'),
-              subtitle: const Text('Use native background sessions when available'),
+              title: const Text('Experimental: Background transfers'),
+              subtitle:
+                  const Text('Use native background sessions when available'),
               value: _enableExperimentalBackgroundTransport,
               onChanged: (value) => _setExperimentalBackgroundTransport(value),
             ),

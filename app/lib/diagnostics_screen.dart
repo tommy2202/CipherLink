@@ -4,6 +4,7 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:photo_manager/photo_manager.dart';
 
+import 'transfer_background.dart';
 import 'transfer_state_store.dart';
 
 class DiagnosticsScreen extends StatefulWidget {
@@ -22,6 +23,8 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
   String _secureStorageStatus = 'checking...';
   String _connectivityStatus = 'checking...';
   String _connectivityStreamStatus = 'listening';
+  String _backgroundPluginStatus = 'checking...';
+  String _foregroundPluginStatus = 'checking...';
   String _photosPermissionStatus = 'checking...';
   StreamSubscription<ConnectivityResult>? _connectivitySubscription;
 
@@ -41,6 +44,8 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
     await Future.wait([
       _checkSecureStorage(),
       _checkConnectivity(),
+      _checkBackgroundPlugin(),
+      _checkForegroundPlugin(),
       _checkPhotosPermission(),
     ]);
   }
@@ -56,14 +61,52 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
         return;
       }
       setState(() {
-        _secureStorageStatus = value == 'ok' ? 'available' : 'unavailable';
+        _secureStorageStatus = value == 'ok' ? 'true' : 'false';
       });
     } catch (_) {
       if (!mounted) {
         return;
       }
       setState(() {
-        _secureStorageStatus = 'unavailable';
+        _secureStorageStatus = 'false';
+      });
+    }
+  }
+
+  Future<void> _checkBackgroundPlugin() async {
+    try {
+      final available = await isBackgroundResumePluginAvailable();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _backgroundPluginStatus = available ? 'true' : 'false';
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _backgroundPluginStatus = 'false';
+      });
+    }
+  }
+
+  Future<void> _checkForegroundPlugin() async {
+    try {
+      final available = await isForegroundServicePluginAvailable();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _foregroundPluginStatus = available ? 'true' : 'false';
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _foregroundPluginStatus = 'false';
       });
     }
   }
@@ -184,8 +227,18 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
           ),
           ListTile(
             contentPadding: EdgeInsets.zero,
-            title: const Text('Secure storage'),
+            title: const Text('Secure storage available'),
             subtitle: Text(_secureStorageStatus),
+          ),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Background plugin available'),
+            subtitle: Text(_backgroundPluginStatus),
+          ),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Foreground plugin available'),
+            subtitle: Text(_foregroundPluginStatus),
           ),
           ListTile(
             contentPadding: EdgeInsets.zero,
