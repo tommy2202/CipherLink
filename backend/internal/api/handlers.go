@@ -228,7 +228,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 			ReceiverPubKeyB64: receiverPubKey,
 			PeerID:            receiverPubKey,
 			Visibility:        auth.VisibilityE2E,
-			AllowedRoutes:     []string{"/v1/session/claim"},
+			AllowedRoutes:     []string{"/v1/session/claim", "/v1/session/poll"},
 			SingleUse:         true,
 		})
 		if err != nil {
@@ -488,7 +488,7 @@ func (s *Server) handleApproveSession(w http.ResponseWriter, r *http.Request) {
 		SenderPubKeyB64:   claim.SenderPubKeyB64,
 		ReceiverPubKeyB64: session.ReceiverPubKeyB64,
 		Visibility:        auth.VisibilityE2E,
-		AllowedRoutes:     []string{"/v1/p2p/offer", "/v1/p2p/answer", "/v1/p2p/ice", "/v1/p2p/poll"},
+		AllowedRoutes:     []string{"/v1/p2p/offer", "/v1/p2p/answer", "/v1/p2p/ice", "/v1/p2p/ice_config", "/v1/p2p/poll"},
 	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
@@ -590,7 +590,7 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 							SenderPubKeyB64:   claim.SenderPubKeyB64,
 							ReceiverPubKeyB64: session.ReceiverPubKeyB64,
 							Visibility:        auth.VisibilityE2E,
-							AllowedRoutes:     []string{"/v1/p2p/offer", "/v1/p2p/answer", "/v1/p2p/ice", "/v1/p2p/poll"},
+							AllowedRoutes:     []string{"/v1/p2p/offer", "/v1/p2p/answer", "/v1/p2p/ice", "/v1/p2p/ice_config", "/v1/p2p/poll"},
 						})
 					}
 				}
@@ -1302,7 +1302,7 @@ func (s *Server) handleScanChunk(w http.ResponseWriter, r *http.Request) {
 		writeIndistinguishable(w)
 		return
 	}
-	authz, ok := s.authorizeTransfer(r, scanSession.SessionID, scanSession.TransferID, token, auth.ScopeTransferSend, int64(len(data)), false)
+	authz, ok := s.authorizeTransfer(r, scanSession.SessionID, scanSession.TransferID, token, auth.ScopeTransferSend, 0, false)
 	if !ok || authz.Claim.ID != scanSession.ClaimID {
 		writeIndistinguishable(w)
 		return

@@ -401,7 +401,7 @@ func TestRelayQuotaBlocksExtraIssuance(t *testing.T) {
 	})
 	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
 	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
-	_ = approveSession(t, server, sessionApproveRequest{
+	approveResp := approveSession(t, server, sessionApproveRequest{
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
@@ -650,7 +650,7 @@ func TestP2PIceConfigRelayRequiresTurn(t *testing.T) {
 	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
 	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
 
-	_ = approveSession(t, server, sessionApproveRequest{
+	approveResp := approveSession(t, server, sessionApproveRequest{
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
@@ -699,7 +699,7 @@ func TestP2PIceConfigRelayOmitsStunWhenTurnAvailable(t *testing.T) {
 		SenderLabel:     "Sender",
 		SenderPubKeyB64: senderPubKey,
 	})
-	_ = approveSession(t, server, sessionApproveRequest{
+	approveResp := approveSession(t, server, sessionApproveRequest{
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
@@ -993,7 +993,7 @@ func TestWrongTokenVsMissingTransferIndistinguishable(t *testing.T) {
 		SenderLabel:     "Sender",
 		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
 	})
-	approveResp := approveSession(t, server, sessionApproveRequest{
+	_ = approveSession(t, server, sessionApproveRequest{
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
@@ -1064,7 +1064,12 @@ func TestRangeResumeWorks(t *testing.T) {
 	if string(first) != "abcd" {
 		t.Fatalf("expected first range to match")
 	}
-	second := downloadRange(t, server, createResp.SessionID, initResp.TransferID, downloadResp.DownloadToken, 4, 7)
+	secondDownload := mintDownloadToken(t, server, downloadTokenRequest{
+		SessionID:     createResp.SessionID,
+		TransferID:    initResp.TransferID,
+		TransferToken: receiverToken,
+	})
+	second := downloadRange(t, server, createResp.SessionID, initResp.TransferID, secondDownload.DownloadToken, 4, 7)
 	if string(second) != "efgh" {
 		t.Fatalf("expected second range to match")
 	}
@@ -1081,7 +1086,7 @@ func TestDownloadRangeContentRangeHeader(t *testing.T) {
 		SenderLabel:     "Sender",
 		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
 	})
-	approveResp := approveSession(t, server, sessionApproveRequest{
+	_ = approveSession(t, server, sessionApproveRequest{
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
@@ -1129,7 +1134,7 @@ func TestChunkRetryIdempotent(t *testing.T) {
 		SenderLabel:     "Sender",
 		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
 	})
-	approveResp := approveSession(t, server, sessionApproveRequest{
+	_ = approveSession(t, server, sessionApproveRequest{
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
@@ -1172,7 +1177,7 @@ func TestChunkConflictRejected(t *testing.T) {
 		SenderLabel:     "Sender",
 		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
 	})
-	approveResp := approveSession(t, server, sessionApproveRequest{
+	_ = approveSession(t, server, sessionApproveRequest{
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
@@ -1334,7 +1339,7 @@ func TestScannerUnavailableReturnsUnavailable(t *testing.T) {
 		SenderLabel:     "Sender",
 		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
 	})
-	_ = approveSession(t, server, sessionApproveRequest{
+	approveResp := approveSession(t, server, sessionApproveRequest{
 		SessionID:    createResp.SessionID,
 		ClaimID:      claimResp.ClaimID,
 		Approve:      true,
