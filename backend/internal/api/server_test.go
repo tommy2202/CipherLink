@@ -272,7 +272,7 @@ func TestQuotaBlocksExtraTransfers(t *testing.T) {
 	})
 	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
 	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
-	_ = approveSession(t, server, sessionApproveRequest{
+	approveResp := approveSession(t, server, sessionApproveRequest{
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
@@ -332,7 +332,7 @@ func TestUploadThrottleDelaysResponse(t *testing.T) {
 	})
 	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
 	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
-	_ = approveSession(t, server, sessionApproveRequest{
+	approveResp := approveSession(t, server, sessionApproveRequest{
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
@@ -699,7 +699,7 @@ func TestP2PIceConfigRelayOmitsStunWhenTurnAvailable(t *testing.T) {
 		SenderLabel:     "Sender",
 		SenderPubKeyB64: senderPubKey,
 	})
-	approveResp := approveSession(t, server, sessionApproveRequest{
+	_ = approveSession(t, server, sessionApproveRequest{
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
@@ -749,7 +749,7 @@ func TestIndistinguishableErrors(t *testing.T) {
 		SenderLabel:     "Sender",
 		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
 	})
-	approveResp := approveSession(t, server, sessionApproveRequest{
+	_ = approveSession(t, server, sessionApproveRequest{
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
@@ -904,7 +904,7 @@ func TestTransferTokenScopeEnforced(t *testing.T) {
 		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
 	})
 
-	approveResp := approveSession(t, server, sessionApproveRequest{
+	_ = approveSession(t, server, sessionApproveRequest{
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
