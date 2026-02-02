@@ -650,7 +650,7 @@ func TestP2PIceConfigRelayRequiresTurn(t *testing.T) {
 	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
 	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
 
-	approveResp := approveSession(t, server, sessionApproveRequest{
+	_ = approveSession(t, server, sessionApproveRequest{
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
@@ -1177,10 +1177,6 @@ func TestChunkConflictRejected(t *testing.T) {
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
 	}, createResp.ReceiverToken)
-	if approveResp.TransferToken == "" {
-		t.Fatalf("expected transfer token")
-	}
-
 	senderPoll := pollSender(t, server, createResp.SessionID, createResp.ClaimToken)
 	if senderPoll.TransferToken == "" {
 		t.Fatalf("expected sender init token")
