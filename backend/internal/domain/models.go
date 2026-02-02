@@ -24,6 +24,7 @@ type TransferMeta struct {
 	Status        TransferStatus `json:"status"`
 	BytesReceived int64          `json:"bytes_received"`
 	TotalBytes    int64          `json:"total_bytes"`
+	ManifestHash  string         `json:"manifest_hash,omitempty"`
 	CreatedAt     time.Time      `json:"created_at"`
 	ExpiresAt     time.Time      `json:"expires_at"`
 	ScanStatus    ScanStatus     `json:"scan_status"`

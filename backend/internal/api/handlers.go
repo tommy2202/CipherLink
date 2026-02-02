@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"universaldrop/internal/auth"
 	"universaldrop/internal/config"
 	"universaldrop/internal/domain"
 	"universaldrop/internal/logging"
@@ -23,6 +25,7 @@ type sessionCreateResponse struct {
 	SessionID         string `json:"session_id"`
 	ExpiresAt         string `json:"expires_at"`
 	ClaimToken        string `json:"claim_token"`
+	ReceiverToken     string `json:"receiver_token"`
 	ReceiverPubKeyB64 string `json:"receiver_pubkey_b64"`
 	QRPayload         string `json:"qr_payload"`
 }
@@ -49,6 +52,7 @@ type sessionPollClaimSummary struct {
 	ShortFingerprint string `json:"short_fingerprint"`
 	SenderPubKeyB64  string `json:"sender_pubkey_b64,omitempty"`
 	TransferID       string `json:"transfer_id,omitempty"`
+	TransferToken    string `json:"transfer_token,omitempty"`
 	ScanRequired     bool   `json:"scan_required,omitempty"`
 	ScanStatus       string `json:"scan_status,omitempty"`
 	SASState         string `json:"sas_state"`
@@ -108,7 +112,8 @@ type transferInitRequest struct {
 }
 
 type transferInitResponse struct {
-	TransferID string `json:"transfer_id"`
+	TransferID  string `json:"transfer_id"`
+	UploadToken string `json:"upload_token,omitempty"`
 }
 
 type transferFinalizeRequest struct {
@@ -182,6 +187,15 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
 		return
 	}
+	if _, ok := s.requireCapability(r, "", auth.Requirement{
+		Scope:             auth.ScopeSessionCreate,
+		ReceiverPubKeyB64: req.ReceiverPubKeyB64,
+		Visibility:        auth.VisibilityE2E,
+		SingleUse:         true,
+	}); !ok {
+		writeIndistinguishable(w)
+		return
+	}
 	ip := clientIP(r)
 	if !s.quotas.AllowSession(ip, "", s.cfg.Quotas.SessionsPerDayIP, s.cfg.Quotas.SessionsPerDaySession) {
 		logging.Allowlist(s.logger, map[string]string{
@@ -195,6 +209,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 
 	var session domain.Session
 	var claimToken string
+	var receiverToken string
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
 		var sessionID string
@@ -202,14 +217,36 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			break
 		}
-		claimToken, err = randomBase64(32)
-		if err != nil {
-			break
-		}
 		receiverPubKey := req.ReceiverPubKeyB64
 
 		now := time.Now().UTC()
 		expiresAt := now.Add(ttl)
+		claimToken, err = s.capabilities.Issue(auth.IssueSpec{
+			Scope:             auth.ScopeSessionClaim,
+			TTL:               ttl,
+			SessionID:         sessionID,
+			ReceiverPubKeyB64: receiverPubKey,
+			PeerID:            receiverPubKey,
+			Visibility:        auth.VisibilityE2E,
+			AllowedRoutes:     []string{"/v1/session/claim"},
+			SingleUse:         true,
+		})
+		if err != nil {
+			break
+		}
+		receiverToken, err = s.capabilities.Issue(auth.IssueSpec{
+			Scope:             auth.ScopeSessionApprove,
+			TTL:               ttl,
+			SessionID:         sessionID,
+			ReceiverPubKeyB64: receiverPubKey,
+			PeerID:            receiverPubKey,
+			Visibility:        auth.VisibilityE2E,
+			AllowedRoutes:     []string{"/v1/session/approve"},
+			SingleUse:         true,
+		})
+		if err != nil {
+			break
+		}
 		session = domain.Session{
 			ID:                  sessionID,
 			CreatedAt:           now,
@@ -250,6 +287,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		SessionID:         session.ID,
 		ExpiresAt:         session.ExpiresAt.Format(time.RFC3339),
 		ClaimToken:        claimToken,
+		ReceiverToken:     receiverToken,
 		ReceiverPubKeyB64: session.ReceiverPubKeyB64,
 		QRPayload:         qrPayload,
 	})
@@ -286,6 +324,16 @@ func (s *Server) handleClaimSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if tokenHash(req.ClaimToken) != session.ClaimTokenHash {
+		writeIndistinguishable(w)
+		return
+	}
+	if _, ok := s.requireCapability(r, req.ClaimToken, auth.Requirement{
+		Scope:             auth.ScopeSessionClaim,
+		SessionID:         session.ID,
+		ReceiverPubKeyB64: session.ReceiverPubKeyB64,
+		Visibility:        auth.VisibilityE2E,
+		SingleUse:         true,
+	}); !ok {
 		writeIndistinguishable(w)
 		return
 	}
@@ -340,6 +388,16 @@ func (s *Server) handleApproveSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if time.Now().UTC().After(session.ExpiresAt) {
+		writeIndistinguishable(w)
+		return
+	}
+	if _, ok := s.requireCapability(r, "", auth.Requirement{
+		Scope:             auth.ScopeSessionApprove,
+		SessionID:         session.ID,
+		ReceiverPubKeyB64: session.ReceiverPubKeyB64,
+		Visibility:        auth.VisibilityE2E,
+		SingleUse:         true,
+	}); !ok {
 		writeIndistinguishable(w)
 		return
 	}
@@ -405,13 +463,33 @@ func (s *Server) handleApproveSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	scope := transferScope(session.ID, claim.ID)
-	transferToken, err := s.tokens.Issue(r.Context(), scope, s.cfg.TransferTokenTTL)
+	transferToken, err := s.capabilities.Issue(auth.IssueSpec{
+		Scope:             auth.ScopeTransferReceive,
+		TTL:               s.cfg.TransferTokenTTL,
+		SessionID:         session.ID,
+		ClaimID:           claim.ID,
+		PeerID:            session.ReceiverPubKeyB64,
+		SenderPubKeyB64:   claim.SenderPubKeyB64,
+		ReceiverPubKeyB64: session.ReceiverPubKeyB64,
+		Visibility:        auth.VisibilityE2E,
+		MaxRateBps:        s.cfg.Throttles.TransferBandwidthCapBps,
+		AllowedRoutes:     []string{"/v1/transfer/manifest", "/v1/transfer/download_token", "/v1/transfer/receipt"},
+	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
 		return
 	}
-	p2pToken, err := s.tokens.Issue(r.Context(), p2pScope(session.ID, claim.ID), s.cfg.TransferTokenTTL)
+	p2pToken, err := s.capabilities.Issue(auth.IssueSpec{
+		Scope:             auth.ScopeTransferSignal,
+		TTL:               s.cfg.TransferTokenTTL,
+		SessionID:         session.ID,
+		ClaimID:           claim.ID,
+		PeerID:            session.ReceiverPubKeyB64,
+		SenderPubKeyB64:   claim.SenderPubKeyB64,
+		ReceiverPubKeyB64: session.ReceiverPubKeyB64,
+		Visibility:        auth.VisibilityE2E,
+		AllowedRoutes:     []string{"/v1/p2p/offer", "/v1/p2p/answer", "/v1/p2p/ice", "/v1/p2p/poll"},
+	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
 		return
@@ -454,6 +532,16 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 			writeIndistinguishable(w)
 			return
 		}
+		if _, ok := s.requireCapability(r, claimToken, auth.Requirement{
+			Scope:             auth.ScopeSessionClaim,
+			SessionID:         session.ID,
+			ReceiverPubKeyB64: session.ReceiverPubKeyB64,
+			Visibility:        auth.VisibilityE2E,
+			SingleUse:         false,
+		}); !ok {
+			writeIndistinguishable(w)
+			return
+		}
 		status := domain.SessionClaimPending
 		claimID := ""
 		transferToken := ""
@@ -476,11 +564,35 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if claimID != "" {
-			scope := transferScope(session.ID, claimID)
 			if status == domain.SessionClaimApproved {
 				if _, err := s.store.GetSessionAuthContext(r.Context(), session.ID, claimID); err == nil {
-					transferToken, _ = s.tokens.Issue(r.Context(), scope, s.cfg.TransferTokenTTL)
-					p2pToken, _ = s.tokens.Issue(r.Context(), p2pScope(session.ID, claimID), s.cfg.TransferTokenTTL)
+					claim, ok := findClaim(session, claimID)
+					if ok {
+						transferToken, _ = s.capabilities.Issue(auth.IssueSpec{
+							Scope:             auth.ScopeTransferInit,
+							TTL:               s.cfg.TransferTokenTTL,
+							SessionID:         session.ID,
+							ClaimID:           claimID,
+							PeerID:            claim.SenderPubKeyB64,
+							SenderPubKeyB64:   claim.SenderPubKeyB64,
+							ReceiverPubKeyB64: session.ReceiverPubKeyB64,
+							Visibility:        auth.VisibilityE2E,
+							MaxRateBps:        s.cfg.Throttles.TransferBandwidthCapBps,
+							AllowedRoutes:     []string{"/v1/transfer/init"},
+							SingleUse:         true,
+						})
+						p2pToken, _ = s.capabilities.Issue(auth.IssueSpec{
+							Scope:             auth.ScopeTransferSignal,
+							TTL:               s.cfg.TransferTokenTTL,
+							SessionID:         session.ID,
+							ClaimID:           claimID,
+							PeerID:            claim.SenderPubKeyB64,
+							SenderPubKeyB64:   claim.SenderPubKeyB64,
+							ReceiverPubKeyB64: session.ReceiverPubKeyB64,
+							Visibility:        auth.VisibilityE2E,
+							AllowedRoutes:     []string{"/v1/p2p/offer", "/v1/p2p/answer", "/v1/p2p/ice", "/v1/p2p/poll"},
+						})
+					}
 				}
 			}
 		}
@@ -516,7 +628,7 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 			claims = append(claims, summary)
 			continue
 		}
-		if claim.Status == domain.SessionClaimApproved && claim.TransferReady {
+		if claim.Status == domain.SessionClaimApproved && claim.TransferID != "" {
 			summary := sessionPollClaimSummary{
 				ClaimID:          claim.ID,
 				SenderLabel:      claim.SenderLabel,
@@ -524,6 +636,25 @@ func (s *Server) handlePollSession(w http.ResponseWriter, r *http.Request) {
 				TransferID:       claim.TransferID,
 				ScanRequired:     claim.ScanRequired,
 				SASState:         sasStateForClaim(claim),
+			}
+			meta, err := s.store.GetTransferMeta(r.Context(), claim.TransferID)
+			if err == nil {
+				transferToken, _ := s.capabilities.Issue(auth.IssueSpec{
+					Scope:             auth.ScopeTransferReceive,
+					TTL:               s.cfg.TransferTokenTTL,
+					SessionID:         session.ID,
+					ClaimID:           claim.ID,
+					TransferID:        claim.TransferID,
+					PeerID:            session.ReceiverPubKeyB64,
+					SenderPubKeyB64:   claim.SenderPubKeyB64,
+					ReceiverPubKeyB64: session.ReceiverPubKeyB64,
+					ManifestHash:      meta.ManifestHash,
+					Visibility:        auth.VisibilityE2E,
+					MaxBytes:          meta.TotalBytes,
+					MaxRateBps:        s.cfg.Throttles.TransferBandwidthCapBps,
+					AllowedRoutes:     []string{"/v1/transfer/manifest", "/v1/transfer/download_token", "/v1/transfer/receipt"},
+				})
+				summary.TransferToken = transferToken
 			}
 			if claim.ScanRequired {
 				summary.ScanStatus = string(claim.ScanStatus)
@@ -659,14 +790,6 @@ func sasStateForClaims(claims []sessionPollClaimSummary) string {
 	return state
 }
 
-func transferScope(sessionID string, claimID string) string {
-	return "transfer:session:" + sessionID + ":claim:" + claimID
-}
-
-func p2pScope(sessionID string, claimID string) string {
-	return "p2p:session:" + sessionID + ":claim:" + claimID
-}
-
 func (s *Server) downloadTokenTTL() time.Duration {
 	ttl := s.cfg.DownloadTokenTTL
 	if ttl <= 0 {
@@ -687,16 +810,13 @@ func (s *Server) handleGetTransferManifest(w http.ResponseWriter, r *http.Reques
 	}
 
 	token := bearerToken(r)
-	session, claimID, ok := s.authorizeTransfer(r.Context(), sessionID, token)
+	authz, ok := s.authorizeTransfer(r, sessionID, transferID, token, auth.ScopeTransferReceive, 0, false)
 	if !ok {
 		writeIndistinguishable(w)
 		return
 	}
-	claim, ok := findClaim(session, claimID)
-	if !ok || claim.TransferID == "" || claim.TransferID != transferID {
-		writeIndistinguishable(w)
-		return
-	}
+	session := authz.Session
+	claim := authz.Claim
 
 	manifest, err := s.transfers.GetManifest(r.Context(), transferID)
 	if err != nil {
@@ -708,7 +828,7 @@ func (s *Server) handleGetTransferManifest(w http.ResponseWriter, r *http.Reques
 		"event":            "transfer_manifest_read",
 		"transfer_id_hash": anonHash(transferID),
 		"session_id_hash":  anonHash(session.ID),
-		"claim_id_hash":    anonHash(claimID),
+		"claim_id_hash":    anonHash(claim.ID),
 	})
 
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -727,11 +847,13 @@ func (s *Server) handleInitTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session, claimID, ok := s.authorizeTransfer(r.Context(), req.SessionID, req.TransferToken)
+	authz, ok := s.authorizeTransfer(r, req.SessionID, "", req.TransferToken, auth.ScopeTransferInit, 0, true)
 	if !ok {
 		writeIndistinguishable(w)
 		return
 	}
+	session := authz.Session
+	claimID := authz.Claim.ID
 
 	manifest, err := base64.StdEncoding.DecodeString(req.FileManifestCiphertextB64)
 	if err != nil {
@@ -740,14 +862,16 @@ func (s *Server) handleInitTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	transferID := req.TransferID
+	manifestSum := sha256.Sum256(manifest)
+	manifestHash := base64.RawURLEncoding.EncodeToString(manifestSum[:])
 	expiresAt := session.ExpiresAt
 	if transferID != "" {
-		if err := s.transfers.CreateTransferWithID(r.Context(), transferID, manifest, req.TotalBytes, expiresAt); err != nil {
+		if err := s.transfers.CreateTransferWithID(r.Context(), transferID, manifest, req.TotalBytes, expiresAt, manifestHash); err != nil {
 			writeIndistinguishable(w)
 			return
 		}
 	} else {
-		transferID, err = s.transfers.CreateTransfer(r.Context(), manifest, req.TotalBytes, expiresAt)
+		transferID, err = s.transfers.CreateTransfer(r.Context(), manifest, req.TotalBytes, expiresAt, manifestHash)
 		if err != nil {
 			writeIndistinguishable(w)
 			return
@@ -782,8 +906,32 @@ func (s *Server) handleInitTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	claim, ok := findClaim(session, claimID)
+	if !ok {
+		writeIndistinguishable(w)
+		return
+	}
+	uploadToken, err := s.capabilities.Issue(auth.IssueSpec{
+		Scope:             auth.ScopeTransferSend,
+		TTL:               s.cfg.TransferTokenTTL,
+		SessionID:         session.ID,
+		ClaimID:           claimID,
+		TransferID:        transferID,
+		PeerID:            claim.SenderPubKeyB64,
+		SenderPubKeyB64:   claim.SenderPubKeyB64,
+		ReceiverPubKeyB64: session.ReceiverPubKeyB64,
+		ManifestHash:      manifestHash,
+		Visibility:        auth.VisibilityE2E,
+		MaxBytes:          req.TotalBytes,
+		MaxRateBps:        s.cfg.Throttles.TransferBandwidthCapBps,
+		AllowedRoutes:     []string{"/v1/transfer/chunk", "/v1/transfer/finalize", "/v1/transfer/scan_init", "/v1/transfer/scan_chunk", "/v1/transfer/scan_finalize"},
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+		return
+	}
 	s.metrics.IncTransfersStarted()
-	writeJSON(w, http.StatusOK, transferInitResponse{TransferID: transferID})
+	writeJSON(w, http.StatusOK, transferInitResponse{TransferID: transferID, UploadToken: uploadToken})
 }
 
 func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
@@ -800,17 +948,6 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token := bearerToken(r)
-	session, claimID, ok := s.authorizeTransfer(r.Context(), sessionID, token)
-	if !ok {
-		writeIndistinguishable(w)
-		return
-	}
-	claim, ok := findClaim(session, claimID)
-	if !ok || claim.TransferID == "" || claim.TransferID != transferID {
-		writeIndistinguishable(w)
-		return
-	}
 	ip := clientIP(r)
 
 	r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
@@ -819,6 +956,13 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 		writeIndistinguishable(w)
 		return
 	}
+	token := bearerToken(r)
+	authz, ok := s.authorizeTransfer(r, sessionID, transferID, token, auth.ScopeTransferSend, int64(len(data)), false)
+	if !ok {
+		writeIndistinguishable(w)
+		return
+	}
+	session := authz.Session
 	if !s.quotas.AddBytes(ip, session.ID, int64(len(data)), s.cfg.Quotas.BytesPerDayIP, s.cfg.Quotas.BytesPerDaySession) {
 		logging.Allowlist(s.logger, map[string]string{
 			"event":            "quota_blocked",
@@ -858,16 +1002,13 @@ func (s *Server) handleFinalizeTransfer(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	session, claimID, ok := s.authorizeTransfer(r.Context(), req.SessionID, req.TransferToken)
+	authz, ok := s.authorizeTransfer(r, req.SessionID, req.TransferID, req.TransferToken, auth.ScopeTransferSend, 0, false)
 	if !ok {
 		writeIndistinguishable(w)
 		return
 	}
-	claim, ok := findClaim(session, claimID)
-	if !ok || (claim.TransferID != "" && claim.TransferID != req.TransferID) {
-		writeIndistinguishable(w)
-		return
-	}
+	session := authz.Session
+	claimID := authz.Claim.ID
 
 	if err := s.transfers.FinalizeTransfer(r.Context(), req.TransferID); err != nil {
 		writeIndistinguishable(w)
@@ -892,18 +1033,35 @@ func (s *Server) handleDownloadToken(w http.ResponseWriter, r *http.Request) {
 		writeIndistinguishable(w)
 		return
 	}
-	session, claimID, ok := s.authorizeTransfer(r.Context(), req.SessionID, req.TransferToken)
+	authz, ok := s.authorizeTransfer(r, req.SessionID, req.TransferID, req.TransferToken, auth.ScopeTransferReceive, 0, false)
 	if !ok {
 		writeIndistinguishable(w)
 		return
 	}
-	claim, ok := findClaim(session, claimID)
-	if !ok || claim.TransferID == "" || claim.TransferID != req.TransferID || !claim.TransferReady {
+	claim := authz.Claim
+	session := authz.Session
+	if !claim.TransferReady {
 		writeIndistinguishable(w)
 		return
 	}
 	ttl := s.downloadTokenTTL()
-	token, expiresAt, err := s.downloadTokens.Issue(session.ID, claimID, req.TransferID, ttl)
+	expiresAt := time.Now().UTC().Add(ttl)
+	token, err := s.capabilities.Issue(auth.IssueSpec{
+		Scope:             auth.ScopeTransferDownload,
+		TTL:               ttl,
+		SessionID:         session.ID,
+		ClaimID:           claim.ID,
+		TransferID:        req.TransferID,
+		PeerID:            session.ReceiverPubKeyB64,
+		SenderPubKeyB64:   claim.SenderPubKeyB64,
+		ReceiverPubKeyB64: session.ReceiverPubKeyB64,
+		ManifestHash:      authz.Meta.ManifestHash,
+		Visibility:        auth.VisibilityE2E,
+		MaxBytes:          authz.Meta.TotalBytes,
+		MaxRateBps:        s.cfg.Throttles.TransferBandwidthCapBps,
+		AllowedRoutes:     []string{"/v1/transfer/download"},
+		SingleUse:         true,
+	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
 		return
@@ -911,7 +1069,7 @@ func (s *Server) handleDownloadToken(w http.ResponseWriter, r *http.Request) {
 	logging.Allowlist(s.logger, map[string]string{
 		"event":            "download_token_issued",
 		"session_id_hash":  anonHash(session.ID),
-		"claim_id_hash":    anonHash(claimID),
+		"claim_id_hash":    anonHash(claim.ID),
 		"transfer_id_hash": anonHash(req.TransferID),
 	})
 	writeJSON(w, http.StatusOK, downloadTokenResponse{
@@ -937,50 +1095,53 @@ func (s *Server) handleDownloadTransfer(w http.ResponseWriter, r *http.Request) 
 
 	ip := clientIP(r)
 	downloadToken := headerValue(r, "download_token")
-	var session domain.Session
-	var claim domain.SessionClaim
-	claimID := ""
-	if downloadToken != "" {
-		var err error
-		session, err = s.store.GetSession(r.Context(), sessionID)
-		if err != nil {
-			writeIndistinguishable(w)
-			return
-		}
-		if time.Now().UTC().After(session.ExpiresAt) {
-			writeIndistinguishable(w)
-			return
-		}
-		claimFound := false
-		for _, candidate := range session.Claims {
-			if candidate.TransferID == transferID {
-				claim = candidate
-				claimFound = true
-				break
-			}
-		}
-		if !claimFound || !claim.TransferReady {
-			writeIndistinguishable(w)
-			return
-		}
-		claimID = claim.ID
-		if !s.downloadTokens.Consume(session.ID, claimID, transferID, downloadToken) {
-			writeIndistinguishable(w)
-			return
-		}
-	} else {
-		token := bearerToken(r)
-		var ok bool
-		session, claimID, ok = s.authorizeTransfer(r.Context(), sessionID, token)
-		if !ok {
-			writeIndistinguishable(w)
-			return
-		}
-		claim, ok = findClaim(session, claimID)
-		if !ok || claim.TransferID == "" || claim.TransferID != transferID || !claim.TransferReady {
-			writeIndistinguishable(w)
-			return
-		}
+	if downloadToken == "" {
+		writeIndistinguishable(w)
+		return
+	}
+	capClaims, ok := s.requireCapability(r, downloadToken, auth.Requirement{
+		Scope:      auth.ScopeTransferDownload,
+		SessionID:  sessionID,
+		TransferID: transferID,
+		SingleUse:  true,
+	})
+	if !ok {
+		writeIndistinguishable(w)
+		return
+	}
+	session, err := s.store.GetSession(r.Context(), sessionID)
+	if err != nil {
+		writeIndistinguishable(w)
+		return
+	}
+	if time.Now().UTC().After(session.ExpiresAt) {
+		writeIndistinguishable(w)
+		return
+	}
+	claim, ok := findClaim(session, capClaims.ClaimID)
+	if !ok || claim.TransferID != transferID || !claim.TransferReady {
+		writeIndistinguishable(w)
+		return
+	}
+	meta, err := s.store.GetTransferMeta(r.Context(), transferID)
+	if err != nil {
+		writeIndistinguishable(w)
+		return
+	}
+	if !s.capabilities.ValidateClaims(capClaims, auth.Requirement{
+		ClaimID:           claim.ID,
+		TransferID:        transferID,
+		SenderPubKeyB64:   claim.SenderPubKeyB64,
+		ReceiverPubKeyB64: session.ReceiverPubKeyB64,
+		ManifestHash:      meta.ManifestHash,
+		Visibility:        auth.VisibilityE2E,
+		MaxBytes:          meta.TotalBytes,
+		RequestBytes:      length,
+		MaxRateBps:        s.cfg.Throttles.TransferBandwidthCapBps,
+		Route:             routePattern(r),
+	}) {
+		writeIndistinguishable(w)
+		return
 	}
 
 	data, err := s.transfers.ReadRange(r.Context(), transferID, start, length)
@@ -1039,16 +1200,13 @@ func (s *Server) handleTransferReceipt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session, claimID, ok := s.authorizeTransfer(r.Context(), req.SessionID, req.TransferToken)
+	authz, ok := s.authorizeTransfer(r, req.SessionID, req.TransferID, req.TransferToken, auth.ScopeTransferReceive, 0, false)
 	if !ok {
 		writeIndistinguishable(w)
 		return
 	}
-	claim, ok := findClaim(session, claimID)
-	if !ok || claim.TransferID == "" || claim.TransferID != req.TransferID {
-		writeIndistinguishable(w)
-		return
-	}
+	session := authz.Session
+	claimID := authz.Claim.ID
 
 	if err := s.transfers.DeleteOnReceipt(r.Context(), req.TransferID); err != nil {
 		writeIndistinguishable(w)
@@ -1060,6 +1218,7 @@ func (s *Server) handleTransferReceipt(w http.ResponseWriter, r *http.Request) {
 	}
 	s.quotas.EndTransfer(req.TransferID)
 	s.throttles.ForgetTransfer(req.TransferID)
+	s.capabilities.RevokeTransfer(req.TransferID)
 	s.metrics.IncTransfersCompleted()
 
 	logging.Allowlist(s.logger, map[string]string{
@@ -1083,13 +1242,15 @@ func (s *Server) handleScanInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session, claimID, ok := s.authorizeTransfer(r.Context(), req.SessionID, req.TransferToken)
+	authz, ok := s.authorizeTransfer(r, req.SessionID, req.TransferID, req.TransferToken, auth.ScopeTransferSend, 0, false)
 	if !ok {
 		writeIndistinguishable(w)
 		return
 	}
-	claim, ok := findClaim(session, claimID)
-	if !ok || claim.TransferID != req.TransferID || !claim.ScanRequired {
+	session := authz.Session
+	claim := authz.Claim
+	claimID := claim.ID
+	if !claim.ScanRequired {
 		writeIndistinguishable(w)
 		return
 	}
@@ -1141,16 +1302,14 @@ func (s *Server) handleScanChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session, claimID, ok := s.authorizeTransfer(r.Context(), scanSession.SessionID, token)
-	if !ok || claimID != scanSession.ClaimID {
-		writeIndistinguishable(w)
-		return
-	}
-	_ = session
-
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxScanBytes)
 	data, err := io.ReadAll(r.Body)
 	if err != nil || len(data) == 0 {
+		writeIndistinguishable(w)
+		return
+	}
+	authz, ok := s.authorizeTransfer(r, scanSession.SessionID, scanSession.TransferID, token, auth.ScopeTransferSend, int64(len(data)), false)
+	if !ok || authz.Claim.ID != scanSession.ClaimID {
 		writeIndistinguishable(w)
 		return
 	}
@@ -1192,11 +1351,13 @@ func (s *Server) handleScanFinalize(w http.ResponseWriter, r *http.Request) {
 		writeIndistinguishable(w)
 		return
 	}
-	session, claimID, ok := s.authorizeTransfer(r.Context(), scanSession.SessionID, req.TransferToken)
-	if !ok || claimID != scanSession.ClaimID {
+	authz, ok := s.authorizeTransfer(r, scanSession.SessionID, scanSession.TransferID, req.TransferToken, auth.ScopeTransferSend, 0, false)
+	if !ok || authz.Claim.ID != scanSession.ClaimID {
 		writeIndistinguishable(w)
 		return
 	}
+	session := authz.Session
+	claimID := authz.Claim.ID
 
 	status, err := s.transfers.FinalizeScan(r.Context(), req.ScanID, s.scanner, s.cfg.MaxScanBytes, s.cfg.MaxScanDuration)
 	if err != nil {
@@ -1211,39 +1372,6 @@ func (s *Server) handleScanFinalize(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, scanFinalizeResponse{
 		Status: string(status),
 	})
-}
-
-func (s *Server) authorizeTransfer(ctx context.Context, sessionID string, token string) (domain.Session, string, bool) {
-	if sessionID == "" || token == "" {
-		return domain.Session{}, "", false
-	}
-	session, err := s.store.GetSession(ctx, sessionID)
-	if err != nil {
-		return domain.Session{}, "", false
-	}
-	if time.Now().UTC().After(session.ExpiresAt) {
-		return domain.Session{}, "", false
-	}
-
-	claimID := ""
-	for _, claim := range session.Claims {
-		scope := transferScope(session.ID, claim.ID)
-		ok, err := s.tokens.Validate(ctx, token, scope)
-		if err != nil {
-			return domain.Session{}, "", false
-		}
-		if ok {
-			claimID = claim.ID
-			break
-		}
-	}
-	if claimID == "" {
-		return domain.Session{}, "", false
-	}
-	if _, err := s.store.GetSessionAuthContext(ctx, session.ID, claimID); err != nil {
-		return domain.Session{}, "", false
-	}
-	return session, claimID, true
 }
 
 func (s *Server) setTransferID(ctx context.Context, session domain.Session, claimID string, transferID string) error {

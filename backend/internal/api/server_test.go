@@ -10,22 +10,29 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"universaldrop/internal/auth"
 	"universaldrop/internal/clock"
 	"universaldrop/internal/config"
 	"universaldrop/internal/domain"
 	"universaldrop/internal/scanner"
 	"universaldrop/internal/storage"
 	"universaldrop/internal/sweeper"
-	"universaldrop/internal/token"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
+
+func newTestCapabilities() *auth.Service {
+	secret := bytes.Repeat([]byte{0x42}, 32)
+	clk := clock.RealClock{}
+	return auth.NewService(secret, clk, auth.NewMemoryRevocationStore(clk))
+}
 
 func TestHealthz(t *testing.T) {
 	server := NewServer(Dependencies{
@@ -38,8 +45,8 @@ func TestHealthz(t *testing.T) {
 			MaxScanBytes:          config.DefaultMaxScanBytes,
 			MaxScanDuration:       config.DefaultMaxScanDuration,
 		},
-		Store:  &stubStorage{},
-		Tokens: token.NewMemoryService(),
+		Store:        &stubStorage{},
+		Capabilities: newTestCapabilities(),
 	})
 
 	rec := httptest.NewRecorder()
@@ -68,8 +75,8 @@ func TestRateLimitTriggers(t *testing.T) {
 			MaxScanBytes:          config.DefaultMaxScanBytes,
 			MaxScanDuration:       config.DefaultMaxScanDuration,
 		},
-		Store:  &stubStorage{},
-		Tokens: token.NewMemoryService(),
+		Store:        &stubStorage{},
+		Capabilities: newTestCapabilities(),
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/ping", nil)
@@ -106,7 +113,7 @@ func TestReadyzReportsSweeperOkAfterSweep(t *testing.T) {
 			MaxScanDuration:       config.DefaultMaxScanDuration,
 		},
 		Store:         store,
-		Tokens:        token.NewMemoryService(),
+		Capabilities:  newTestCapabilities(),
 		Clock:         clk,
 		SweeperStatus: liveness,
 	})
@@ -143,8 +150,8 @@ func TestMetricszReturnsExpectedKeys(t *testing.T) {
 			MaxScanBytes:          config.DefaultMaxScanBytes,
 			MaxScanDuration:       config.DefaultMaxScanDuration,
 		},
-		Store:  &stubStorage{},
-		Tokens: token.NewMemoryService(),
+		Store:        &stubStorage{},
+		Capabilities: newTestCapabilities(),
 	})
 
 	rec := httptest.NewRecorder()
@@ -208,8 +215,8 @@ func TestTransferRoutesSkipTimeoutMiddleware(t *testing.T) {
 			MaxScanBytes:          config.DefaultMaxScanBytes,
 			MaxScanDuration:       config.DefaultMaxScanDuration,
 		},
-		Store:  &stubStorage{},
-		Tokens: token.NewMemoryService(),
+		Store:        &stubStorage{},
+		Capabilities: newTestCapabilities(),
 	})
 
 	pingRec := httptest.NewRecorder()
@@ -250,9 +257,9 @@ func TestQuotaBlocksExtraTransfers(t *testing.T) {
 				TransfersPerDaySession: 1,
 			},
 		},
-		Store:   store,
-		Tokens:  token.NewMemoryService(),
-		Scanner: scanner.UnavailableScanner{},
+		Store:        store,
+		Capabilities: newTestCapabilities(),
+		Scanner:      scanner.UnavailableScanner{},
 	})
 
 	createResp := createSession(t, server)
@@ -269,18 +276,22 @@ func TestQuotaBlocksExtraTransfers(t *testing.T) {
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
-	})
+	}, createResp.ReceiverToken)
 
+	senderPoll := pollSender(t, server, createResp.SessionID, createResp.ClaimToken)
+	if senderPoll.TransferToken == "" {
+		t.Fatalf("expected sender init token")
+	}
 	initTransfer(t, server, transferInitRequest{
 		SessionID:                 createResp.SessionID,
-		TransferToken:             approveResp.TransferToken,
+		TransferToken:             senderPoll.TransferToken,
 		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
 		TotalBytes:                4,
 	})
 
 	rec := initTransferRecorder(t, server, transferInitRequest{
 		SessionID:                 createResp.SessionID,
-		TransferToken:             approveResp.TransferToken,
+		TransferToken:             senderPoll.TransferToken,
 		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest2")),
 		TotalBytes:                4,
 	})
@@ -306,9 +317,9 @@ func TestUploadThrottleDelaysResponse(t *testing.T) {
 				TransferBandwidthCapBps: 50,
 			},
 		},
-		Store:   store,
-		Tokens:  token.NewMemoryService(),
-		Scanner: scanner.UnavailableScanner{},
+		Store:        store,
+		Capabilities: newTestCapabilities(),
+		Scanner:      scanner.UnavailableScanner{},
 	})
 
 	createResp := createSession(t, server)
@@ -325,10 +336,14 @@ func TestUploadThrottleDelaysResponse(t *testing.T) {
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
-	})
+	}, createResp.ReceiverToken)
+	senderPoll := pollSender(t, server, createResp.SessionID, createResp.ClaimToken)
+	if senderPoll.TransferToken == "" {
+		t.Fatalf("expected sender init token")
+	}
 	initResp := initTransfer(t, server, transferInitRequest{
 		SessionID:                 createResp.SessionID,
-		TransferToken:             approveResp.TransferToken,
+		TransferToken:             senderPoll.TransferToken,
 		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
 		TotalBytes:                10,
 	})
@@ -336,7 +351,7 @@ func TestUploadThrottleDelaysResponse(t *testing.T) {
 	data := bytes.Repeat([]byte("a"), 10)
 	req := httptest.NewRequest(http.MethodPut, "/v1/transfer/chunk", bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("Authorization", "Bearer "+approveResp.TransferToken)
+	req.Header.Set("Authorization", "Bearer "+initResp.UploadToken)
 	req.Header.Set("session_id", createResp.SessionID)
 	req.Header.Set("transfer_id", initResp.TransferID)
 	req.Header.Set("offset", "0")
@@ -371,9 +386,9 @@ func TestRelayQuotaBlocksExtraIssuance(t *testing.T) {
 				RelayPerIdentityPerDay: 1,
 			},
 		},
-		Store:   store,
-		Tokens:  token.NewMemoryService(),
-		Scanner: scanner.UnavailableScanner{},
+		Store:        store,
+		Capabilities: newTestCapabilities(),
+		Scanner:      scanner.UnavailableScanner{},
 	})
 
 	createResp := createSession(t, server)
@@ -389,10 +404,10 @@ func TestRelayQuotaBlocksExtraIssuance(t *testing.T) {
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
-	})
+	}, createResp.ReceiverToken)
 	tokenValue := approveResp.P2PToken
 	if tokenValue == "" {
-		tokenValue = approveResp.TransferToken
+		t.Fatalf("expected p2p token")
 	}
 
 	first := p2pIceConfigRecorder(t, server, tokenValue, createResp.SessionID, claimResp.ClaimID, "relay")
@@ -481,7 +496,7 @@ func TestApproveRequiresSAS(t *testing.T) {
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
-	})
+	}, createResp.ReceiverToken)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("expected approve 409 got %d", rec.Code)
 	}
@@ -514,7 +529,7 @@ func TestApproveSucceedsAfterSASConfirmed(t *testing.T) {
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
-	})
+	}, createResp.ReceiverToken)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected approve 200 got %d", rec.Code)
 	}
@@ -564,10 +579,17 @@ func TestP2PSignalingRejectsWithoutSAS(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save auth: %v", err)
 	}
-	tokenValue, err := server.tokens.Issue(context.Background(), p2pScope(session.ID, claimResp.ClaimID), time.Minute)
-	if err != nil {
-		t.Fatalf("issue token: %v", err)
-	}
+	tokenValue := issueCapabilityToken(t, server, auth.IssueSpec{
+		Scope:             auth.ScopeTransferSignal,
+		TTL:               time.Minute,
+		SessionID:         session.ID,
+		ClaimID:           claimResp.ClaimID,
+		PeerID:            senderPubKey,
+		SenderPubKeyB64:   senderPubKey,
+		ReceiverPubKeyB64: session.ReceiverPubKeyB64,
+		Visibility:        auth.VisibilityE2E,
+		AllowedRoutes:     []string{"/v1/p2p/offer", "/v1/p2p/answer", "/v1/p2p/ice", "/v1/p2p/poll"},
+	})
 
 	rec := p2pOfferRecorder(t, server, tokenValue, p2pOfferRequest{
 		SessionID: session.ID,
@@ -598,7 +620,7 @@ func TestP2PSignalingRejectsWithoutAuth(t *testing.T) {
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
-	})
+	}, createResp.ReceiverToken)
 
 	rec := p2pOfferRecorder(t, server, "", p2pOfferRequest{
 		SessionID: createResp.SessionID,
@@ -629,9 +651,9 @@ func TestP2PIceConfigRelayRequiresTurn(t *testing.T) {
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
-	})
+	}, createResp.ReceiverToken)
 
-	rec := p2pIceConfigRecorder(t, server, approveResp.TransferToken, createResp.SessionID, claimResp.ClaimID, "relay")
+	rec := p2pIceConfigRecorder(t, server, approveResp.P2PToken, createResp.SessionID, claimResp.ClaimID, "relay")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("expected 409 got %d", rec.Code)
 	}
@@ -661,9 +683,9 @@ func TestP2PIceConfigRelayOmitsStunWhenTurnAvailable(t *testing.T) {
 			TURNURLs:              []string{"turn:relay.example?transport=udp"},
 			TURNSharedSecret:      []byte("secret"),
 		},
-		Store:   store,
-		Tokens:  token.NewMemoryService(),
-		Scanner: scanner.UnavailableScanner{},
+		Store:        store,
+		Capabilities: newTestCapabilities(),
+		Scanner:      scanner.UnavailableScanner{},
 	})
 
 	createResp := createSession(t, server)
@@ -677,7 +699,7 @@ func TestP2PIceConfigRelayOmitsStunWhenTurnAvailable(t *testing.T) {
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
-	})
+	}, createResp.ReceiverToken)
 
 	rec := p2pIceConfigRecorder(t, server, approveResp.P2PToken, createResp.SessionID, claimResp.ClaimID, "relay")
 	if rec.Code != http.StatusOK {
@@ -702,7 +724,6 @@ func TestP2PIceConfigRelayOmitsStunWhenTurnAvailable(t *testing.T) {
 
 func TestIndistinguishableErrors(t *testing.T) {
 	store := &stubStorage{}
-	tokens := token.NewMemoryService()
 	server := NewServer(Dependencies{
 		Config: config.Config{
 			Address:               ":0",
@@ -713,8 +734,8 @@ func TestIndistinguishableErrors(t *testing.T) {
 			MaxScanBytes:          config.DefaultMaxScanBytes,
 			MaxScanDuration:       config.DefaultMaxScanDuration,
 		},
-		Store:  store,
-		Tokens: tokens,
+		Store:        store,
+		Capabilities: newTestCapabilities(),
 	})
 
 	createResp := createSession(t, server)
@@ -728,20 +749,25 @@ func TestIndistinguishableErrors(t *testing.T) {
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
-	})
+	}, createResp.ReceiverToken)
 	if approveResp.TransferToken == "" {
 		t.Fatalf("expected transfer token")
 	}
 
+	senderPoll := pollSender(t, server, createResp.SessionID, createResp.ClaimToken)
+	if senderPoll.TransferToken == "" {
+		t.Fatalf("expected sender init token")
+	}
 	initResp := initTransfer(t, server, transferInitRequest{
 		SessionID:                 createResp.SessionID,
-		TransferToken:             approveResp.TransferToken,
+		TransferToken:             senderPoll.TransferToken,
 		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
 		TotalBytes:                10,
 	})
+	receiverToken := receiverTransferToken(t, server, createResp.SessionID, claimResp.ClaimID)
 
 	invalidRec := manifestRequestRecorder(t, server, createResp.SessionID, initResp.TransferID, "invalid-token")
-	missingRec := manifestRequestRecorder(t, server, createResp.SessionID, "missing", approveResp.TransferToken)
+	missingRec := manifestRequestRecorder(t, server, createResp.SessionID, "missing", receiverToken)
 
 	if invalidRec.Code != missingRec.Code {
 		t.Fatalf("expected same status got %d and %d", invalidRec.Code, missingRec.Code)
@@ -832,11 +858,18 @@ func TestCannotInitTransferBeforeApproval(t *testing.T) {
 		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
 	})
 
-	scope := transferScope(createResp.SessionID, claimResp.ClaimID)
-	transferToken, err := server.tokens.Issue(context.Background(), scope, time.Minute)
-	if err != nil {
-		t.Fatalf("issue token: %v", err)
-	}
+	transferToken := issueCapabilityToken(t, server, auth.IssueSpec{
+		Scope:             auth.ScopeTransferInit,
+		TTL:               time.Minute,
+		SessionID:         createResp.SessionID,
+		ClaimID:           claimResp.ClaimID,
+		PeerID:            claimResp.SenderPubKeyB64,
+		SenderPubKeyB64:   claimResp.SenderPubKeyB64,
+		ReceiverPubKeyB64: createResp.ReceiverPubKeyB64,
+		Visibility:        auth.VisibilityE2E,
+		AllowedRoutes:     []string{"/v1/transfer/init"},
+		SingleUse:         true,
+	})
 
 	rec := initTransferRecorder(t, server, transferInitRequest{
 		SessionID:                 createResp.SessionID,
@@ -875,22 +908,32 @@ func TestTransferTokenScopeEnforced(t *testing.T) {
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
-	})
+	}, createResp.ReceiverToken)
 	if approveResp.TransferToken == "" {
 		t.Fatalf("expected transfer token")
 	}
 
+	senderPoll := pollSender(t, server, createResp.SessionID, createResp.ClaimToken)
+	if senderPoll.TransferToken == "" {
+		t.Fatalf("expected sender init token")
+	}
 	initResp := initTransfer(t, server, transferInitRequest{
 		SessionID:                 createResp.SessionID,
-		TransferToken:             approveResp.TransferToken,
+		TransferToken:             senderPoll.TransferToken,
 		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
 		TotalBytes:                10,
 	})
-
-	wrongToken, err := server.tokens.Issue(context.Background(), "transfer:session:other:claim:other", time.Minute)
-	if err != nil {
-		t.Fatalf("issue wrong token: %v", err)
-	}
+	wrongToken := issueCapabilityToken(t, server, auth.IssueSpec{
+		Scope:             auth.ScopeTransferReceive,
+		TTL:               time.Minute,
+		SessionID:         "other",
+		ClaimID:           "other",
+		PeerID:            "other",
+		SenderPubKeyB64:   "other",
+		ReceiverPubKeyB64: "other",
+		Visibility:        auth.VisibilityE2E,
+		AllowedRoutes:     []string{"/v1/transfer/manifest"},
+	})
 
 	wrongRec := manifestRequestRecorder(t, server, createResp.SessionID, initResp.TransferID, wrongToken)
 	invalidRec := manifestRequestRecorder(t, server, createResp.SessionID, initResp.TransferID, "invalid-token")
@@ -918,20 +961,24 @@ func TestManifestDownloadReturnsIdenticalBytes(t *testing.T) {
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
-	})
+	}, createResp.ReceiverToken)
 	if approveResp.TransferToken == "" {
 		t.Fatalf("expected transfer token")
 	}
 
 	manifest := []byte("ciphertext-manifest")
+	senderPoll := pollSender(t, server, createResp.SessionID, createResp.ClaimToken)
+	if senderPoll.TransferToken == "" {
+		t.Fatalf("expected sender init token")
+	}
 	initResp := initTransfer(t, server, transferInitRequest{
 		SessionID:                 createResp.SessionID,
-		TransferToken:             approveResp.TransferToken,
+		TransferToken:             senderPoll.TransferToken,
 		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString(manifest),
 		TotalBytes:                10,
 	})
-
-	downloaded := fetchManifest(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+	receiverToken := receiverTransferToken(t, server, createResp.SessionID, claimResp.ClaimID)
+	downloaded := fetchManifest(t, server, createResp.SessionID, initResp.TransferID, receiverToken)
 	if !bytes.Equal(downloaded, manifest) {
 		t.Fatalf("manifest bytes mismatch")
 	}
@@ -952,19 +999,23 @@ func TestWrongTokenVsMissingTransferIndistinguishable(t *testing.T) {
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
-	})
+	}, createResp.ReceiverToken)
 	if approveResp.TransferToken == "" {
 		t.Fatalf("expected transfer token")
 	}
 
+	senderPoll := pollSender(t, server, createResp.SessionID, createResp.ClaimToken)
+	if senderPoll.TransferToken == "" {
+		t.Fatalf("expected sender init token")
+	}
 	initResp := initTransfer(t, server, transferInitRequest{
 		SessionID:                 createResp.SessionID,
-		TransferToken:             approveResp.TransferToken,
+		TransferToken:             senderPoll.TransferToken,
 		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
 		TotalBytes:                10,
 	})
-
-	missingRec := manifestRequestRecorder(t, server, createResp.SessionID, "missing", approveResp.TransferToken)
+	receiverToken := receiverTransferToken(t, server, createResp.SessionID, claimResp.ClaimID)
+	missingRec := manifestRequestRecorder(t, server, createResp.SessionID, "missing", receiverToken)
 	wrongRec := manifestRequestRecorder(t, server, createResp.SessionID, initResp.TransferID, "invalid-token")
 
 	if missingRec.Code != wrongRec.Code {
@@ -990,26 +1041,36 @@ func TestRangeResumeWorks(t *testing.T) {
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
-	})
+	}, createResp.ReceiverToken)
 	if approveResp.TransferToken == "" {
 		t.Fatalf("expected transfer token")
 	}
+	senderPoll := pollSender(t, server, createResp.SessionID, createResp.ClaimToken)
+	if senderPoll.TransferToken == "" {
+		t.Fatalf("expected sender init token")
+	}
 	initResp := initTransfer(t, server, transferInitRequest{
 		SessionID:                 createResp.SessionID,
-		TransferToken:             approveResp.TransferToken,
+		TransferToken:             senderPoll.TransferToken,
 		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
 		TotalBytes:                8,
 	})
 
-	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("abcd"))
-	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 4, []byte("efgh"))
-	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken, 0, []byte("abcd"))
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken, 4, []byte("efgh"))
+	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken)
 
-	first := downloadRange(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, 3)
+	receiverToken := receiverTransferToken(t, server, createResp.SessionID, claimResp.ClaimID)
+	downloadResp := mintDownloadToken(t, server, downloadTokenRequest{
+		SessionID:     createResp.SessionID,
+		TransferID:    initResp.TransferID,
+		TransferToken: receiverToken,
+	})
+	first := downloadRange(t, server, createResp.SessionID, initResp.TransferID, downloadResp.DownloadToken, 0, 3)
 	if string(first) != "abcd" {
 		t.Fatalf("expected first range to match")
 	}
-	second := downloadRange(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 4, 7)
+	second := downloadRange(t, server, createResp.SessionID, initResp.TransferID, downloadResp.DownloadToken, 4, 7)
 	if string(second) != "efgh" {
 		t.Fatalf("expected second range to match")
 	}
@@ -1030,22 +1091,32 @@ func TestDownloadRangeContentRangeHeader(t *testing.T) {
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
-	})
+	}, createResp.ReceiverToken)
 	if approveResp.TransferToken == "" {
 		t.Fatalf("expected transfer token")
 	}
 
+	senderPoll := pollSender(t, server, createResp.SessionID, createResp.ClaimToken)
+	if senderPoll.TransferToken == "" {
+		t.Fatalf("expected sender init token")
+	}
 	initResp := initTransfer(t, server, transferInitRequest{
 		SessionID:                 createResp.SessionID,
-		TransferToken:             approveResp.TransferToken,
+		TransferToken:             senderPoll.TransferToken,
 		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
 		TotalBytes:                8,
 	})
-	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("abcd"))
-	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 4, []byte("efgh"))
-	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken, 0, []byte("abcd"))
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken, 4, []byte("efgh"))
+	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken)
 
-	rec := downloadRangeRecorder(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, 3)
+	receiverToken := receiverTransferToken(t, server, createResp.SessionID, claimResp.ClaimID)
+	downloadResp := mintDownloadToken(t, server, downloadTokenRequest{
+		SessionID:     createResp.SessionID,
+		TransferID:    initResp.TransferID,
+		TransferToken: receiverToken,
+	})
+	rec := downloadRangeRecorder(t, server, createResp.SessionID, initResp.TransferID, downloadResp.DownloadToken, 0, 3)
 	if rec.Code != http.StatusPartialContent {
 		t.Fatalf("expected 206 got %d", rec.Code)
 	}
@@ -1072,23 +1143,33 @@ func TestChunkRetryIdempotent(t *testing.T) {
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
-	})
+	}, createResp.ReceiverToken)
 	if approveResp.TransferToken == "" {
 		t.Fatalf("expected transfer token")
 	}
 
+	senderPoll := pollSender(t, server, createResp.SessionID, createResp.ClaimToken)
+	if senderPoll.TransferToken == "" {
+		t.Fatalf("expected sender init token")
+	}
 	initResp := initTransfer(t, server, transferInitRequest{
 		SessionID:                 createResp.SessionID,
-		TransferToken:             approveResp.TransferToken,
+		TransferToken:             senderPoll.TransferToken,
 		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
 		TotalBytes:                4,
 	})
 
-	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("data"))
-	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("data"))
-	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken, 0, []byte("data"))
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken, 0, []byte("data"))
+	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken)
 
-	downloaded := downloadRange(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, 3)
+	receiverToken := receiverTransferToken(t, server, createResp.SessionID, claimResp.ClaimID)
+	downloadResp := mintDownloadToken(t, server, downloadTokenRequest{
+		SessionID:     createResp.SessionID,
+		TransferID:    initResp.TransferID,
+		TransferToken: receiverToken,
+	})
+	downloaded := downloadRange(t, server, createResp.SessionID, initResp.TransferID, downloadResp.DownloadToken, 0, 3)
 	if string(downloaded) != "data" {
 		t.Fatalf("expected data after retry")
 	}
@@ -1109,27 +1190,31 @@ func TestChunkConflictRejected(t *testing.T) {
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
-	})
+	}, createResp.ReceiverToken)
 	if approveResp.TransferToken == "" {
 		t.Fatalf("expected transfer token")
 	}
 
+	senderPoll := pollSender(t, server, createResp.SessionID, createResp.ClaimToken)
+	if senderPoll.TransferToken == "" {
+		t.Fatalf("expected sender init token")
+	}
 	initResp := initTransfer(t, server, transferInitRequest{
 		SessionID:                 createResp.SessionID,
-		TransferToken:             approveResp.TransferToken,
+		TransferToken:             senderPoll.TransferToken,
 		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
 		TotalBytes:                4,
 	})
 
-	rec := uploadChunkRecorder(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("data"))
+	rec := uploadChunkRecorder(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken, 0, []byte("data"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected chunk 200 got %d", rec.Code)
 	}
-	rec = uploadChunkRecorder(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("data"))
+	rec = uploadChunkRecorder(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken, 0, []byte("data"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected retry 200 got %d", rec.Code)
 	}
-	rec = uploadChunkRecorder(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("diff"))
+	rec = uploadChunkRecorder(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken, 0, []byte("diff"))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("expected conflict 409 got %d", rec.Code)
 	}
@@ -1157,27 +1242,32 @@ func TestReceiptDeletesTransferArtifacts(t *testing.T) {
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
-	})
+	}, createResp.ReceiverToken)
 	if approveResp.TransferToken == "" {
 		t.Fatalf("expected transfer token")
 	}
+	senderPoll := pollSender(t, server, createResp.SessionID, createResp.ClaimToken)
+	if senderPoll.TransferToken == "" {
+		t.Fatalf("expected sender init token")
+	}
 	initResp := initTransfer(t, server, transferInitRequest{
 		SessionID:                 createResp.SessionID,
-		TransferToken:             approveResp.TransferToken,
+		TransferToken:             senderPoll.TransferToken,
 		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
 		TotalBytes:                4,
 	})
-	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("data"))
-	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken, 0, []byte("data"))
+	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken)
+	receiverToken := receiverTransferToken(t, server, createResp.SessionID, claimResp.ClaimID)
 	receiptTransfer(t, server, transferReceiptRequest{
 		SessionID:     createResp.SessionID,
 		TransferID:    initResp.TransferID,
-		TransferToken: approveResp.TransferToken,
+		TransferToken: receiverToken,
 		Status:        "complete",
 	})
 
-	missingRec := manifestRequestRecorder(t, server, createResp.SessionID, "missing", approveResp.TransferToken)
-	deletedRec := manifestRequestRecorder(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+	missingRec := manifestRequestRecorder(t, server, createResp.SessionID, "missing", receiverToken)
+	deletedRec := manifestRequestRecorder(t, server, createResp.SessionID, initResp.TransferID, receiverToken)
 	if missingRec.Code != deletedRec.Code {
 		t.Fatalf("expected same status got %d and %d", missingRec.Code, deletedRec.Code)
 	}
@@ -1201,28 +1291,38 @@ func TestSmallPayloadLifecycle(t *testing.T) {
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
-	})
+	}, createResp.ReceiverToken)
 	if approveResp.TransferToken == "" {
 		t.Fatalf("expected transfer token")
 	}
 
 	manifest := []byte("manifest-cipher")
+	senderPoll := pollSender(t, server, createResp.SessionID, createResp.ClaimToken)
+	if senderPoll.TransferToken == "" {
+		t.Fatalf("expected sender init token")
+	}
 	initResp := initTransfer(t, server, transferInitRequest{
 		SessionID:                 createResp.SessionID,
-		TransferToken:             approveResp.TransferToken,
+		TransferToken:             senderPoll.TransferToken,
 		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString(manifest),
 		TotalBytes:                5,
 	})
 
-	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("hello"))
-	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken, 0, []byte("hello"))
+	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken)
 
-	downloadedManifest := fetchManifest(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+	receiverToken := receiverTransferToken(t, server, createResp.SessionID, claimResp.ClaimID)
+	downloadedManifest := fetchManifest(t, server, createResp.SessionID, initResp.TransferID, receiverToken)
 	if !bytes.Equal(downloadedManifest, manifest) {
 		t.Fatalf("expected manifest to match")
 	}
 
-	payload := downloadRange(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, 4)
+	downloadResp := mintDownloadToken(t, server, downloadTokenRequest{
+		SessionID:     createResp.SessionID,
+		TransferID:    initResp.TransferID,
+		TransferToken: receiverToken,
+	})
+	payload := downloadRange(t, server, createResp.SessionID, initResp.TransferID, downloadResp.DownloadToken, 0, 4)
 	if string(payload) != "hello" {
 		t.Fatalf("expected payload to match")
 	}
@@ -1230,12 +1330,12 @@ func TestSmallPayloadLifecycle(t *testing.T) {
 	receiptTransfer(t, server, transferReceiptRequest{
 		SessionID:     createResp.SessionID,
 		TransferID:    initResp.TransferID,
-		TransferToken: approveResp.TransferToken,
+		TransferToken: receiverToken,
 		Status:        "complete",
 	})
 
-	missingRec := manifestRequestRecorder(t, server, createResp.SessionID, "missing", approveResp.TransferToken)
-	deletedRec := manifestRequestRecorder(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+	missingRec := manifestRequestRecorder(t, server, createResp.SessionID, "missing", receiverToken)
+	deletedRec := manifestRequestRecorder(t, server, createResp.SessionID, initResp.TransferID, receiverToken)
 	if missingRec.Code != deletedRec.Code {
 		t.Fatalf("expected same status got %d and %d", missingRec.Code, deletedRec.Code)
 	}
@@ -1257,32 +1357,36 @@ func TestScannerUnavailableReturnsUnavailable(t *testing.T) {
 		ClaimID:      claimResp.ClaimID,
 		Approve:      true,
 		ScanRequired: true,
-	})
+	}, createResp.ReceiverToken)
 	if approveResp.TransferToken == "" {
 		t.Fatalf("expected transfer token")
 	}
 
+	senderPoll := pollSender(t, server, createResp.SessionID, createResp.ClaimToken)
+	if senderPoll.TransferToken == "" {
+		t.Fatalf("expected sender init token")
+	}
 	initResp := initTransfer(t, server, transferInitRequest{
 		SessionID:                 createResp.SessionID,
-		TransferToken:             approveResp.TransferToken,
+		TransferToken:             senderPoll.TransferToken,
 		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
 		TotalBytes:                4,
 	})
-	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("data"))
-	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken, 0, []byte("data"))
+	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken)
 
 	scanInit := scanInitTransfer(t, server, scanInitRequest{
 		SessionID:     createResp.SessionID,
 		TransferID:    initResp.TransferID,
-		TransferToken: approveResp.TransferToken,
+		TransferToken: initResp.UploadToken,
 		TotalBytes:    4,
 		ChunkSize:     4,
 	})
 	encrypted := encryptScanChunk(t, scanInit.ScanKeyB64, 0, []byte("data"))
-	uploadScanChunk(t, server, scanInit.ScanID, approveResp.TransferToken, 0, encrypted)
+	uploadScanChunk(t, server, scanInit.ScanID, initResp.UploadToken, 0, encrypted)
 	finalize := finalizeScan(t, server, scanFinalizeRequest{
 		ScanID:        scanInit.ScanID,
-		TransferToken: approveResp.TransferToken,
+		TransferToken: initResp.UploadToken,
 	})
 	if finalize.Status != string(domain.ScanStatusUnavailable) {
 		t.Fatalf("expected unavailable got %s", finalize.Status)
@@ -1305,28 +1409,32 @@ func TestScanCopyDeletedAfterScan(t *testing.T) {
 		ClaimID:      claimResp.ClaimID,
 		Approve:      true,
 		ScanRequired: true,
-	})
+	}, createResp.ReceiverToken)
+	senderPoll := pollSender(t, server, createResp.SessionID, createResp.ClaimToken)
+	if senderPoll.TransferToken == "" {
+		t.Fatalf("expected sender init token")
+	}
 	initResp := initTransfer(t, server, transferInitRequest{
 		SessionID:                 createResp.SessionID,
-		TransferToken:             approveResp.TransferToken,
+		TransferToken:             senderPoll.TransferToken,
 		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
 		TotalBytes:                4,
 	})
-	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("data"))
-	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken, 0, []byte("data"))
+	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken)
 
 	scanInit := scanInitTransfer(t, server, scanInitRequest{
 		SessionID:     createResp.SessionID,
 		TransferID:    initResp.TransferID,
-		TransferToken: approveResp.TransferToken,
+		TransferToken: initResp.UploadToken,
 		TotalBytes:    4,
 		ChunkSize:     4,
 	})
 	encrypted := encryptScanChunk(t, scanInit.ScanKeyB64, 0, []byte("data"))
-	uploadScanChunk(t, server, scanInit.ScanID, approveResp.TransferToken, 0, encrypted)
+	uploadScanChunk(t, server, scanInit.ScanID, initResp.UploadToken, 0, encrypted)
 	_ = finalizeScan(t, server, scanFinalizeRequest{
 		ScanID:        scanInit.ScanID,
-		TransferToken: approveResp.TransferToken,
+		TransferToken: initResp.UploadToken,
 	})
 
 	if _, err := store.GetScanSession(context.Background(), scanInit.ScanID); err != storage.ErrNotFound {
@@ -1353,34 +1461,38 @@ func TestScanDoesNotAffectReceiverKeys(t *testing.T) {
 		ClaimID:      claimResp.ClaimID,
 		Approve:      true,
 		ScanRequired: true,
-	})
+	}, createResp.ReceiverToken)
 	auth, err := store.GetSessionAuthContext(context.Background(), createResp.SessionID, claimResp.ClaimID)
 	if err != nil {
 		t.Fatalf("auth context missing: %v", err)
 	}
 	receiverKey := auth.ReceiverPubKeyB64
 
+	senderPoll := pollSender(t, server, createResp.SessionID, createResp.ClaimToken)
+	if senderPoll.TransferToken == "" {
+		t.Fatalf("expected sender init token")
+	}
 	initResp := initTransfer(t, server, transferInitRequest{
 		SessionID:                 createResp.SessionID,
-		TransferToken:             approveResp.TransferToken,
+		TransferToken:             senderPoll.TransferToken,
 		FileManifestCiphertextB64: base64.StdEncoding.EncodeToString([]byte("manifest")),
 		TotalBytes:                4,
 	})
-	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken, 0, []byte("data"))
-	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, approveResp.TransferToken)
+	uploadChunk(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken, 0, []byte("data"))
+	finalizeTransfer(t, server, createResp.SessionID, initResp.TransferID, initResp.UploadToken)
 
 	scanInit := scanInitTransfer(t, server, scanInitRequest{
 		SessionID:     createResp.SessionID,
 		TransferID:    initResp.TransferID,
-		TransferToken: approveResp.TransferToken,
+		TransferToken: initResp.UploadToken,
 		TotalBytes:    4,
 		ChunkSize:     4,
 	})
 	encrypted := encryptScanChunk(t, scanInit.ScanKeyB64, 0, []byte("data"))
-	uploadScanChunk(t, server, scanInit.ScanID, approveResp.TransferToken, 0, encrypted)
+	uploadScanChunk(t, server, scanInit.ScanID, initResp.UploadToken, 0, encrypted)
 	_ = finalizeScan(t, server, scanFinalizeRequest{
 		ScanID:        scanInit.ScanID,
-		TransferToken: approveResp.TransferToken,
+		TransferToken: initResp.UploadToken,
 	})
 
 	authAfter, err := store.GetSessionAuthContext(context.Background(), createResp.SessionID, claimResp.ClaimID)
@@ -1405,9 +1517,9 @@ func newSessionTestServer(store *stubStorage) *Server {
 			MaxScanBytes:          config.DefaultMaxScanBytes,
 			MaxScanDuration:       config.DefaultMaxScanDuration,
 		},
-		Store:   store,
-		Tokens:  token.NewMemoryService(),
-		Scanner: scanner.UnavailableScanner{},
+		Store:        store,
+		Capabilities: newTestCapabilities(),
+		Scanner:      scanner.UnavailableScanner{},
 	})
 }
 
@@ -1419,8 +1531,18 @@ func createSession(t *testing.T, server *Server) sessionCreateResponse {
 	if err != nil {
 		t.Fatalf("marshal create request: %v", err)
 	}
+	createToken := issueCapabilityToken(t, server, auth.IssueSpec{
+		Scope:             auth.ScopeSessionCreate,
+		TTL:               config.DefaultClaimTokenTTL,
+		ReceiverPubKeyB64: receiverPubKeyB64,
+		PeerID:            receiverPubKeyB64,
+		Visibility:        auth.VisibilityE2E,
+		AllowedRoutes:     []string{"/v1/session/create"},
+		SingleUse:         true,
+	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/session/create", bytes.NewBuffer(requestBody))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+createToken)
 	server.Router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected create 200 got %d", rec.Code)
@@ -1430,6 +1552,18 @@ func createSession(t *testing.T, server *Server) sessionCreateResponse {
 		t.Fatalf("decode create response: %v", err)
 	}
 	return payload
+}
+
+func issueCapabilityToken(t *testing.T, server *Server, spec auth.IssueSpec) string {
+	t.Helper()
+	if spec.TTL == 0 {
+		spec.TTL = config.DefaultTransferTokenTTL
+	}
+	token, err := server.capabilities.Issue(spec)
+	if err != nil {
+		t.Fatalf("issue capability: %v", err)
+	}
+	return token
 }
 
 func claimSession(t *testing.T, server *Server, reqBody sessionClaimRequest) *httptest.ResponseRecorder {
@@ -1478,7 +1612,7 @@ func commitSAS(t *testing.T, server *Server, sessionID string, claimID string, r
 	}
 }
 
-func approveSessionRecorder(t *testing.T, server *Server, reqBody sessionApproveRequest) *httptest.ResponseRecorder {
+func approveSessionRecorder(t *testing.T, server *Server, reqBody sessionApproveRequest, receiverToken string) *httptest.ResponseRecorder {
 	t.Helper()
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
@@ -1486,18 +1620,21 @@ func approveSessionRecorder(t *testing.T, server *Server, reqBody sessionApprove
 	}
 	req := httptest.NewRequest(http.MethodPost, "/v1/session/approve", bytes.NewBuffer(payload))
 	req.Header.Set("Content-Type", "application/json")
+	if receiverToken != "" {
+		req.Header.Set("Authorization", "Bearer "+receiverToken)
+	}
 	rec := httptest.NewRecorder()
 	server.Router.ServeHTTP(rec, req)
 	return rec
 }
 
-func approveSession(t *testing.T, server *Server, reqBody sessionApproveRequest) sessionApproveResponse {
+func approveSession(t *testing.T, server *Server, reqBody sessionApproveRequest, receiverToken string) sessionApproveResponse {
 	t.Helper()
 	if reqBody.Approve {
 		commitSAS(t, server, reqBody.SessionID, reqBody.ClaimID, "sender")
 		commitSAS(t, server, reqBody.SessionID, reqBody.ClaimID, "receiver")
 	}
-	rec := approveSessionRecorder(t, server, reqBody)
+	rec := approveSessionRecorder(t, server, reqBody, receiverToken)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected approve 200 got %d", rec.Code)
 	}
@@ -1526,6 +1663,48 @@ func initTransfer(t *testing.T, server *Server, reqBody transferInitRequest) tra
 		t.Fatalf("decode init response: %v", err)
 	}
 	return resp
+}
+
+func pollSender(t *testing.T, server *Server, sessionID string, claimToken string) sessionPollSenderResponse {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v1/session/poll?session_id="+url.QueryEscape(sessionID)+"&claim_token="+url.QueryEscape(claimToken), nil)
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected poll sender 200 got %d", rec.Code)
+	}
+	var resp sessionPollSenderResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode poll sender response: %v", err)
+	}
+	return resp
+}
+
+func pollReceiver(t *testing.T, server *Server, sessionID string) sessionPollReceiverResponse {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v1/session/poll?session_id="+url.QueryEscape(sessionID), nil)
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected poll receiver 200 got %d", rec.Code)
+	}
+	var resp sessionPollReceiverResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode poll receiver response: %v", err)
+	}
+	return resp
+}
+
+func receiverTransferToken(t *testing.T, server *Server, sessionID string, claimID string) string {
+	t.Helper()
+	resp := pollReceiver(t, server, sessionID)
+	for _, claim := range resp.Claims {
+		if claim.ClaimID == claimID {
+			return claim.TransferToken
+		}
+	}
+	t.Fatalf("receiver transfer token missing")
+	return ""
 }
 
 func scanInitTransfer(t *testing.T, server *Server, reqBody scanInitRequest) scanInitResponse {
@@ -1669,7 +1848,7 @@ func downloadRangeRecorder(t *testing.T, server *Server, sessionID string, trans
 		"/v1/transfer/download?session_id="+sessionID+"&transfer_id="+transferID,
 		nil,
 	)
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("download_token", token)
 	req.Header.Set("Range", "bytes="+strconv.FormatInt(start, 10)+"-"+strconv.FormatInt(end, 10))
 	rec := httptest.NewRecorder()
 	server.Router.ServeHTTP(rec, req)
@@ -1689,6 +1868,26 @@ func receiptTransfer(t *testing.T, server *Server, reqBody transferReceiptReques
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected receipt 200 got %d", rec.Code)
 	}
+}
+
+func mintDownloadToken(t *testing.T, server *Server, reqBody downloadTokenRequest) downloadTokenResponse {
+	t.Helper()
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		t.Fatalf("marshal download token request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/transfer/download_token", bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected download token 200 got %d", rec.Code)
+	}
+	var resp downloadTokenResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode download token response: %v", err)
+	}
+	return resp
 }
 
 func fetchManifest(t *testing.T, server *Server, sessionID string, transferID string, token string) []byte {

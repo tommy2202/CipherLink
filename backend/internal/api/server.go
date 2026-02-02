@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"universaldrop/internal/auth"
 	"universaldrop/internal/clock"
 	"universaldrop/internal/config"
 	"universaldrop/internal/logging"
@@ -18,7 +19,6 @@ import (
 	"universaldrop/internal/ratelimit"
 	"universaldrop/internal/scanner"
 	"universaldrop/internal/storage"
-	"universaldrop/internal/token"
 	"universaldrop/internal/transfer"
 )
 
@@ -33,18 +33,17 @@ type StorageHealthChecker interface {
 type Dependencies struct {
 	Config        config.Config
 	Store         storage.Storage
-	Tokens        token.TokenService
 	Logger        *log.Logger
 	Version       string
 	Scanner       scanner.Scanner
 	Clock         clock.Clock
+	Capabilities  *auth.Service
 	SweeperStatus SweeperStatus
 }
 
 type Server struct {
 	cfg            config.Config
 	store          storage.Storage
-	tokens         token.TokenService
 	logger         *log.Logger
 	version        string
 	rateLimiters   map[string]*ratelimit.Limiter
@@ -56,6 +55,7 @@ type Server struct {
 	clock          clock.Clock
 	sweeperStatus  SweeperStatus
 	metrics        *metrics.Counters
+	capabilities   *auth.Service
 	Router         http.Handler
 }
 
@@ -73,10 +73,6 @@ func NewServer(deps Dependencies) *Server {
 	if version == "" {
 		version = "0.1"
 	}
-	tokenService := deps.Tokens
-	if tokenService == nil {
-		tokenService = token.NewMemoryService()
-	}
 	scanService := deps.Scanner
 	if scanService == nil {
 		scanService = scanner.UnavailableScanner{}
@@ -84,6 +80,10 @@ func NewServer(deps Dependencies) *Server {
 	clk := deps.Clock
 	if clk == nil {
 		clk = clock.RealClock{}
+	}
+	caps := deps.Capabilities
+	if caps == nil {
+		caps = auth.NewService(nil, clk, nil)
 	}
 
 	rateLimiters := map[string]*ratelimit.Limiter{}
@@ -100,7 +100,6 @@ func NewServer(deps Dependencies) *Server {
 	server := &Server{
 		cfg:            deps.Config,
 		store:          deps.Store,
-		tokens:         tokenService,
 		logger:         logSink,
 		version:        version,
 		rateLimiters:   rateLimiters,
@@ -112,6 +111,7 @@ func NewServer(deps Dependencies) *Server {
 		clock:          clk,
 		sweeperStatus:  deps.SweeperStatus,
 		metrics:        metrics.NewCounters(),
+		capabilities:   caps,
 	}
 
 	server.Router = server.routes()
