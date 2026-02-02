@@ -259,6 +259,7 @@ func TestCapabilityBindingEnforced(t *testing.T) {
 func TestCapabilityExpiryEnforced(t *testing.T) {
 	server := newSessionTestServer(&stubStorage{})
 	createResp, claimResp, _, initResp, _ := setupTransferFixture(t, server, 4)
+	senderPubKeyB64 := base64.StdEncoding.EncodeToString([]byte("pubkey"))
 	expiredToken := issueCapabilityToken(t, server, auth.IssueSpec{
 		Scope:             auth.ScopeTransferReceive,
 		TTL:               -time.Minute,
