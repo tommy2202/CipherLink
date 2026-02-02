@@ -2410,7 +2410,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('UniversalDrop')),
+      appBar: AppBar(title: const Text('CipherLink')),
       body: Padding(
         padding: const EdgeInsets.all(24),
         child: Column(
@@ -5146,7 +5146,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('UniversalDrop')),
+      appBar: AppBar(title: const Text('CipherLink')),
       body: Padding(
         padding: const EdgeInsets.all(24),
         child: Column(
@@ -7823,7 +7823,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('UniversalDrop')),
+      appBar: AppBar(title: const Text('CipherLink')),
       body: Padding(
         padding: const EdgeInsets.all(24),
         child: ListView(

@@ -20,6 +20,6 @@ void main() {
       ),
     );
 
-    expect(find.text('UniversalDrop'), findsOneWidget);
+    expect(find.text('CipherLink'), findsOneWidget);
   });
 }
