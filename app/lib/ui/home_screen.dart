@@ -21,6 +21,7 @@ import 'package:universaldrop_app/destination_preferences.dart';
 import 'package:universaldrop_app/destination_rules.dart';
 import 'package:universaldrop_app/destination_selector.dart';
 import 'package:universaldrop_app/key_store.dart';
+import 'package:universaldrop_app/limits.dart';
 import 'package:universaldrop_app/packaging_builder.dart';
 import 'package:universaldrop_app/save_service.dart';
 import 'package:universaldrop_app/transfer/background_transfer.dart';
@@ -32,6 +33,7 @@ import 'package:universaldrop_app/transport.dart';
 import 'package:universaldrop_app/trust_store.dart';
 import 'package:universaldrop_app/trusted_device_badge.dart';
 import 'package:universaldrop_app/ui/transfer_summary_screen.dart';
+import 'package:universaldrop_app/ui/zip_extraction_info.dart';
 import 'package:universaldrop_app/zip_extract.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -2109,6 +2111,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (zipBytes == null || manifest == null) {
       return;
     }
+    final safety = analyzeZipBytes(zipBytes);
+    if (safety.exceedsLimits) {
+      setState(() {
+        _extractStatus = safety.refusalMessage ??
+            'Archive exceeds extraction limits and will not be extracted.';
+      });
+      return;
+    }
+    if (safety.nearLimits) {
+      final proceed = await _confirmExtractionWarning();
+      if (!proceed) {
+        setState(() {
+          _extractStatus = 'Extraction cancelled.';
+        });
+        return;
+      }
+    }
     setState(() {
       _extracting = true;
       _extractStatus = 'Extracting...';
@@ -2148,6 +2167,128 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _extracting = false;
       });
     }
+  }
+
+  Future<bool> _confirmExtractionWarning() async {
+    if (!mounted) {
+      return false;
+    }
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Extract anyway?'),
+          content: const Text(
+            'This archive is close to extraction limits. '
+            'Extracting it could take longer or fail.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Extract anyway'),
+            ),
+          ],
+        );
+      },
+    );
+    return result ?? false;
+  }
+
+  List<Widget> _buildZipExtractionSection() {
+    final zipBytes = _lastZipBytes;
+    if (_lastManifest?.packagingMode != packagingModeZip || zipBytes == null) {
+      return const [];
+    }
+    final safety = analyzeZipBytes(zipBytes);
+    final canExtract = !_extracting && !safety.exceedsLimits;
+    return [
+      const SizedBox(height: 12),
+      ZipExtractionInfo(
+        safety: safety,
+        limits: const ZipExtractionLimits(),
+      ),
+      const SizedBox(height: 12),
+      ElevatedButton(
+        onPressed: canExtract ? _extractZip : null,
+        child: Text(_extracting ? 'Extracting...' : 'Extract ZIP'),
+      ),
+      if (_extractProgress != null) ...[
+        const SizedBox(height: 8),
+        Text(
+          'Extracted ${_extractProgress!.filesExtracted}/${_extractProgress!.totalFiles} files',
+        ),
+      ],
+      if (_extractStatus.isNotEmpty) ...[
+        const SizedBox(height: 8),
+        Text(_extractStatus),
+      ],
+    ];
+  }
+
+  List<Widget> _buildZipExtractionSection() {
+    final zipBytes = _lastZipBytes;
+    if (_lastManifest?.packagingMode != packagingModeZip || zipBytes == null) {
+      return const [];
+    }
+    final safety = analyzeZipBytes(zipBytes);
+    final canExtract = !_extracting && !safety.exceedsLimits;
+    return [
+      const SizedBox(height: 12),
+      ZipExtractionInfo(
+        safety: safety,
+        limits: const ZipExtractionLimits(),
+      ),
+      const SizedBox(height: 12),
+      ElevatedButton(
+        onPressed: canExtract ? _extractZip : null,
+        child: Text(_extracting ? 'Extracting...' : 'Extract ZIP'),
+      ),
+      if (_extractProgress != null) ...[
+        const SizedBox(height: 8),
+        Text(
+          'Extracted ${_extractProgress!.filesExtracted}/${_extractProgress!.totalFiles} files',
+        ),
+      ],
+      if (_extractStatus.isNotEmpty) ...[
+        const SizedBox(height: 8),
+        Text(_extractStatus),
+      ],
+    ];
+  }
+
+  List<Widget> _buildZipExtractionSection() {
+    final zipBytes = _lastZipBytes;
+    if (_lastManifest?.packagingMode != packagingModeZip || zipBytes == null) {
+      return const [];
+    }
+    final safety = analyzeZipBytes(zipBytes);
+    final canExtract = !_extracting && !safety.exceedsLimits;
+    return [
+      const SizedBox(height: 12),
+      ZipExtractionInfo(
+        safety: safety,
+        limits: const ZipExtractionLimits(),
+      ),
+      const SizedBox(height: 12),
+      ElevatedButton(
+        onPressed: canExtract ? _extractZip : null,
+        child: Text(_extracting ? 'Extracting...' : 'Extract ZIP'),
+      ),
+      if (_extractProgress != null) ...[
+        const SizedBox(height: 8),
+        Text(
+          'Extracted ${_extractProgress!.filesExtracted}/${_extractProgress!.totalFiles} files',
+        ),
+      ],
+      if (_extractStatus.isNotEmpty) ...[
+        const SizedBox(height: 8),
+        Text(_extractStatus),
+      ],
+    ];
   }
 
   String _defaultPackageTitle() {
@@ -2740,25 +2881,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ],
                 ),
               ],
-              if (_lastManifest?.packagingMode == packagingModeZip &&
-                  _lastZipBytes != null) ...[
-                const SizedBox(height: 12),
-                ElevatedButton(
-                  onPressed: _extracting ? null : _extractZip,
-                  child:
-                      Text(_extracting ? 'Extracting...' : 'Extract ZIP'),
-                ),
-                if (_extractProgress != null) ...[
-                  const SizedBox(height: 8),
-                  Text(
-                    'Extracted ${_extractProgress!.filesExtracted}/${_extractProgress!.totalFiles} files',
-                  ),
-                ],
-                if (_extractStatus.isNotEmpty) ...[
-                  const SizedBox(height: 8),
-                  Text(_extractStatus),
-                ],
-              ],
+              ..._buildZipExtractionSection(),
             ],
           ],
         ),
@@ -2908,6 +3031,7 @@ import 'package:universaldrop_app/destination_preferences.dart';
 import 'package:universaldrop_app/destination_rules.dart';
 import 'package:universaldrop_app/destination_selector.dart';
 import 'package:universaldrop_app/key_store.dart';
+import 'package:universaldrop_app/limits.dart';
 import 'package:universaldrop_app/packaging_builder.dart';
 import 'package:universaldrop_app/save_service.dart';
 import 'package:universaldrop_app/transfer/background_transfer.dart';
@@ -2919,6 +3043,7 @@ import 'package:universaldrop_app/transport.dart';
 import 'package:universaldrop_app/trust_store.dart';
 import 'package:universaldrop_app/trusted_device_badge.dart';
 import 'package:universaldrop_app/ui/transfer_summary_screen.dart';
+import 'package:universaldrop_app/ui/zip_extraction_info.dart';
 import 'package:universaldrop_app/zip_extract.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -4816,6 +4941,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (zipBytes == null || manifest == null) {
       return;
     }
+    final safety = analyzeZipBytes(zipBytes);
+    if (safety.exceedsLimits) {
+      setState(() {
+        _extractStatus = safety.refusalMessage ??
+            'Archive exceeds extraction limits and will not be extracted.';
+      });
+      return;
+    }
+    if (safety.nearLimits) {
+      final proceed = await _confirmExtractionWarning();
+      if (!proceed) {
+        setState(() {
+          _extractStatus = 'Extraction cancelled.';
+        });
+        return;
+      }
+    }
     setState(() {
       _extracting = true;
       _extractStatus = 'Extracting...';
@@ -4855,6 +4997,35 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _extracting = false;
       });
     }
+  }
+
+  Future<bool> _confirmExtractionWarning() async {
+    if (!mounted) {
+      return false;
+    }
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Extract anyway?'),
+          content: const Text(
+            'This archive is close to extraction limits. '
+            'Extracting it could take longer or fail.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Extract anyway'),
+            ),
+          ],
+        );
+      },
+    );
+    return result ?? false;
   }
 
   String _defaultPackageTitle() {
@@ -5433,25 +5604,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ],
                 ),
               ],
-              if (_lastManifest?.packagingMode == packagingModeZip &&
-                  _lastZipBytes != null) ...[
-                const SizedBox(height: 12),
-                ElevatedButton(
-                  onPressed: _extracting ? null : _extractZip,
-                  child:
-                      Text(_extracting ? 'Extracting...' : 'Extract ZIP'),
-                ),
-                if (_extractProgress != null) ...[
-                  const SizedBox(height: 8),
-                  Text(
-                    'Extracted ${_extractProgress!.filesExtracted}/${_extractProgress!.totalFiles} files',
-                  ),
-                ],
-                if (_extractStatus.isNotEmpty) ...[
-                  const SizedBox(height: 8),
-                  Text(_extractStatus),
-                ],
-              ],
+              ..._buildZipExtractionSection(),
             ],
           ],
         ),
@@ -5600,6 +5753,7 @@ import 'package:universaldrop_app/models/transfer_manifest.dart';
 import 'package:universaldrop_app/services/clipboard_service.dart';
 import 'package:universaldrop_app/services/destination_selector.dart';
 import 'package:universaldrop_app/services/key_store.dart';
+import 'package:universaldrop_app/limits.dart';
 import 'package:universaldrop_app/services/save_service.dart';
 import 'package:universaldrop_app/services/trust_store.dart';
 import 'package:universaldrop_app/services/zip_extract.dart';
@@ -5613,6 +5767,7 @@ import 'package:universaldrop_app/transfer/transport.dart';
 import 'package:universaldrop_app/ui/diagnostics_screen.dart';
 import 'package:universaldrop_app/ui/transfer_summary_screen.dart';
 import 'package:universaldrop_app/ui/trusted_device_badge.dart';
+import 'package:universaldrop_app/ui/zip_extraction_info.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({
@@ -7245,6 +7400,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (zipBytes == null || manifest == null) {
       return;
     }
+    final safety = analyzeZipBytes(zipBytes);
+    if (safety.exceedsLimits) {
+      setState(() {
+        _extractStatus = safety.refusalMessage ??
+            'Archive exceeds extraction limits and will not be extracted.';
+      });
+      return;
+    }
+    if (safety.nearLimits) {
+      final proceed = await _confirmExtractionWarning();
+      if (!proceed) {
+        setState(() {
+          _extractStatus = 'Extraction cancelled.';
+        });
+        return;
+      }
+    }
     setState(() {
       _extracting = true;
       _extractStatus = 'Extracting...';
@@ -7284,6 +7456,35 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _extracting = false;
       });
     }
+  }
+
+  Future<bool> _confirmExtractionWarning() async {
+    if (!mounted) {
+      return false;
+    }
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Extract anyway?'),
+          content: const Text(
+            'This archive is close to extraction limits. '
+            'Extracting it could take longer or fail.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Extract anyway'),
+            ),
+          ],
+        );
+      },
+    );
+    return result ?? false;
   }
 
   String _defaultPackageTitle() {
@@ -8094,25 +8295,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ],
                 ),
               ],
-              if (_lastManifest?.packagingMode == packagingModeZip &&
-                  _lastZipBytes != null) ...[
-                const SizedBox(height: 12),
-                ElevatedButton(
-                  onPressed: _extracting ? null : _extractZip,
-                  child:
-                      Text(_extracting ? 'Extracting...' : 'Extract ZIP'),
-                ),
-                if (_extractProgress != null) ...[
-                  const SizedBox(height: 8),
-                  Text(
-                    'Extracted ${_extractProgress!.filesExtracted}/${_extractProgress!.totalFiles} files',
-                  ),
-                ],
-                if (_extractStatus.isNotEmpty) ...[
-                  const SizedBox(height: 8),
-                  Text(_extractStatus),
-                ],
-              ],
+              ..._buildZipExtractionSection(),
             ],
           ],
         ),
