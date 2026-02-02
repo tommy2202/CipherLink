@@ -451,14 +451,14 @@ func (s *Server) handleApproveSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auth := domain.SessionAuthContext{
+	authCtx := domain.SessionAuthContext{
 		SessionID:         session.ID,
 		ClaimID:           claim.ID,
 		SenderPubKeyB64:   claim.SenderPubKeyB64,
 		ReceiverPubKeyB64: session.ReceiverPubKeyB64,
 		ApprovedAt:        now,
 	}
-	if err := s.store.SaveSessionAuthContext(r.Context(), auth); err != nil {
+	if err := s.store.SaveSessionAuthContext(r.Context(), authCtx); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
 		return
 	}
@@ -1164,12 +1164,6 @@ func (s *Server) handleDownloadTransfer(w http.ResponseWriter, r *http.Request) 
 		writeIndistinguishable(w)
 		return
 	}
-	meta, err := s.store.GetTransferMeta(r.Context(), transferID)
-	if err != nil {
-		writeIndistinguishable(w)
-		return
-	}
-
 	waitTransfer := s.throttles.ReserveTransfer(transferID, int64(len(data)))
 	waitGlobal := s.throttles.ReserveGlobal(int64(len(data)))
 	if delay := maxDuration(waitTransfer, waitGlobal); delay > 0 {

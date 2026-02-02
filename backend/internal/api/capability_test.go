@@ -162,6 +162,7 @@ func TestCapabilityTokenRequiredForEndpoints(t *testing.T) {
 func TestCapabilityScopeEnforcement(t *testing.T) {
 	server := newSessionTestServer(&stubStorage{})
 	createResp, claimResp, _, initResp, receiverToken := setupTransferFixture(t, server, 4)
+	senderPubKeyB64 := base64.StdEncoding.EncodeToString([]byte("pubkey"))
 
 	rec := uploadChunkRecorder(t, server, createResp.SessionID, initResp.TransferID, receiverToken, 0, []byte("data"))
 	if rec.Code != http.StatusNotFound {
@@ -194,7 +195,7 @@ func TestCapabilityBindingEnforced(t *testing.T) {
 		ClaimID:           claimResp.ClaimID,
 		TransferID:        "wrong",
 		PeerID:            createResp.ReceiverPubKeyB64,
-		SenderPubKeyB64:   claimResp.SenderPubKeyB64,
+		SenderPubKeyB64:   senderPubKeyB64,
 		ReceiverPubKeyB64: createResp.ReceiverPubKeyB64,
 		Visibility:        auth.VisibilityE2E,
 		AllowedRoutes:     []string{"/v1/transfer/manifest"},
@@ -211,7 +212,7 @@ func TestCapabilityBindingEnforced(t *testing.T) {
 		ClaimID:           claimResp.ClaimID,
 		TransferID:        initResp.TransferID,
 		PeerID:            createResp.ReceiverPubKeyB64,
-		SenderPubKeyB64:   claimResp.SenderPubKeyB64,
+		SenderPubKeyB64:   senderPubKeyB64,
 		ReceiverPubKeyB64: createResp.ReceiverPubKeyB64,
 		ManifestHash:      "wrong",
 		Visibility:        auth.VisibilityE2E,
@@ -261,7 +262,7 @@ func TestCapabilityExpiryEnforced(t *testing.T) {
 		ClaimID:           claimResp.ClaimID,
 		TransferID:        initResp.TransferID,
 		PeerID:            createResp.ReceiverPubKeyB64,
-		SenderPubKeyB64:   claimResp.SenderPubKeyB64,
+		SenderPubKeyB64:   senderPubKeyB64,
 		ReceiverPubKeyB64: createResp.ReceiverPubKeyB64,
 		Visibility:        auth.VisibilityE2E,
 		AllowedRoutes:     []string{"/v1/transfer/manifest"},
