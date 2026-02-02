@@ -272,7 +272,7 @@ func TestQuotaBlocksExtraTransfers(t *testing.T) {
 	})
 	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
 	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
-	approveResp := approveSession(t, server, sessionApproveRequest{
+	_ = approveSession(t, server, sessionApproveRequest{
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
@@ -332,7 +332,7 @@ func TestUploadThrottleDelaysResponse(t *testing.T) {
 	})
 	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
 	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
-	approveResp := approveSession(t, server, sessionApproveRequest{
+	_ = approveSession(t, server, sessionApproveRequest{
 		SessionID: createResp.SessionID,
 		ClaimID:   claimResp.ClaimID,
 		Approve:   true,
@@ -392,11 +392,12 @@ func TestRelayQuotaBlocksExtraIssuance(t *testing.T) {
 	})
 
 	createResp := createSession(t, server)
+	senderPubKey := base64.StdEncoding.EncodeToString([]byte("pubkey"))
 	claimResp := claimSessionSuccess(t, server, sessionClaimRequest{
 		SessionID:       createResp.SessionID,
 		ClaimToken:      createResp.ClaimToken,
 		SenderLabel:     "Sender",
-		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
+		SenderPubKeyB64: senderPubKey,
 	})
 	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "sender")
 	commitSAS(t, server, createResp.SessionID, claimResp.ClaimID, "receiver")
@@ -863,8 +864,8 @@ func TestCannotInitTransferBeforeApproval(t *testing.T) {
 		TTL:               time.Minute,
 		SessionID:         createResp.SessionID,
 		ClaimID:           claimResp.ClaimID,
-		PeerID:            claimResp.SenderPubKeyB64,
-		SenderPubKeyB64:   claimResp.SenderPubKeyB64,
+		PeerID:            senderPubKey,
+		SenderPubKeyB64:   senderPubKey,
 		ReceiverPubKeyB64: createResp.ReceiverPubKeyB64,
 		Visibility:        auth.VisibilityE2E,
 		AllowedRoutes:     []string{"/v1/transfer/init"},
@@ -1352,7 +1353,7 @@ func TestScannerUnavailableReturnsUnavailable(t *testing.T) {
 		SenderLabel:     "Sender",
 		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
 	})
-	approveResp := approveSession(t, server, sessionApproveRequest{
+	_ = approveSession(t, server, sessionApproveRequest{
 		SessionID:    createResp.SessionID,
 		ClaimID:      claimResp.ClaimID,
 		Approve:      true,
@@ -1404,7 +1405,7 @@ func TestScanCopyDeletedAfterScan(t *testing.T) {
 		SenderLabel:     "Sender",
 		SenderPubKeyB64: base64.StdEncoding.EncodeToString([]byte("pubkey")),
 	})
-	approveResp := approveSession(t, server, sessionApproveRequest{
+	_ = approveSession(t, server, sessionApproveRequest{
 		SessionID:    createResp.SessionID,
 		ClaimID:      claimResp.ClaimID,
 		Approve:      true,

@@ -162,7 +162,6 @@ func TestCapabilityTokenRequiredForEndpoints(t *testing.T) {
 func TestCapabilityScopeEnforcement(t *testing.T) {
 	server := newSessionTestServer(&stubStorage{})
 	createResp, claimResp, _, initResp, receiverToken := setupTransferFixture(t, server, 4)
-	senderPubKeyB64 := base64.StdEncoding.EncodeToString([]byte("pubkey"))
 
 	rec := uploadChunkRecorder(t, server, createResp.SessionID, initResp.TransferID, receiverToken, 0, []byte("data"))
 	if rec.Code != http.StatusNotFound {
@@ -187,6 +186,11 @@ func TestCapabilityScopeEnforcement(t *testing.T) {
 func TestCapabilityBindingEnforced(t *testing.T) {
 	server := newSessionTestServer(&stubStorage{})
 	createResp, claimResp, _, initResp, receiverToken := setupTransferFixture(t, server, 4)
+	senderPubKeyB64 := base64.StdEncoding.EncodeToString([]byte("pubkey"))
+	meta, err := server.store.GetTransferMeta(context.Background(), initResp.TransferID)
+	if err != nil {
+		t.Fatalf("get transfer meta: %v", err)
+	}
 
 	wrongTransferToken := issueCapabilityToken(t, server, auth.IssueSpec{
 		Scope:             auth.ScopeTransferReceive,
