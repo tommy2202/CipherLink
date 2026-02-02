@@ -49,6 +49,7 @@ abstract class SaveService {
     required String mime,
     required bool isMedia,
     required SaveDestination destination,
+    bool allowUserInteraction = true,
   });
 
   Future<void> openIn(String path);
@@ -81,8 +82,29 @@ class DefaultSaveService implements SaveService {
     required String mime,
     required bool isMedia,
     required SaveDestination destination,
+    bool allowUserInteraction = true,
   }) async {
     if (isMedia && destination == SaveDestination.photos) {
+      if (!allowUserInteraction) {
+        final permission = await PhotoManager.permissionState;
+        if (permission.isAuth) {
+          final outcome =
+              await (_gallerySaver ?? _saveToGallery)(bytes, name, mime);
+          if (outcome.success) {
+            return outcome;
+          }
+        }
+        final fallbackPath =
+            await (_appStorageWriter ?? _writeToAppStorage)(bytes, name);
+        return SaveOutcome(
+          success: false,
+          usedFallback: true,
+          savedToGallery: false,
+          localPath: fallbackPath,
+          message: 'permission_denied',
+        );
+      }
+
       final outcome =
           await (_gallerySaver ?? _saveToGallery)(bytes, name, mime);
       if (outcome.success) {
@@ -101,6 +123,15 @@ class DefaultSaveService implements SaveService {
 
     final localPath =
         await (_appStorageWriter ?? _writeToAppStorage)(bytes, name);
+    if (!allowUserInteraction) {
+      return SaveOutcome(
+        success: false,
+        usedFallback: true,
+        savedToGallery: false,
+        localPath: localPath,
+        message: 'background_saved',
+      );
+    }
     final savedPath = await (_saveAsHandler ?? saveAs)(localPath, name);
     return SaveOutcome(
       success: savedPath != null,

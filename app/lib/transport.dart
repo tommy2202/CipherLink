@@ -1,10 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
-import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 class TransferInitResult {
@@ -27,6 +25,16 @@ class ScanFinalizeResult {
   const ScanFinalizeResult(this.status);
 
   final String status;
+}
+
+class DownloadTokenResult {
+  const DownloadTokenResult({
+    required this.token,
+    this.expiresAt,
+  });
+
+  final String token;
+  final DateTime? expiresAt;
 }
 
 abstract class Transport {
@@ -89,6 +97,12 @@ abstract class Transport {
 
   Future<ScanFinalizeResult> scanFinalize({
     required String scanId,
+    required String transferToken,
+  });
+
+  Future<DownloadTokenResult> fetchDownloadToken({
+    required String sessionId,
+    required String transferId,
     required String transferToken,
   });
 }
@@ -388,20 +402,48 @@ class HttpTransport implements Transport {
     final status = payload['status']?.toString() ?? '';
     return ScanFinalizeResult(status);
   }
+
+  @override
+  Future<DownloadTokenResult> fetchDownloadToken({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+  }) async {
+    final uri = baseUri.resolve('/v1/transfer/download_token');
+    final response = await _client.post(
+      uri,
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'session_id': sessionId,
+        'transfer_id': transferId,
+        'transfer_token': transferToken,
+      }),
+    );
+    if (response.statusCode >= 400) {
+      throw TransportException(
+        'downloadToken failed: ${response.statusCode}',
+        statusCode: response.statusCode,
+      );
+    }
+    final payload = jsonDecode(response.body) as Map<String, dynamic>;
+    final token = payload['download_token']?.toString() ?? '';
+    if (token.isEmpty) {
+      throw TransportException('downloadToken missing token');
+    }
+    final expiresRaw = payload['expires_at']?.toString();
+    final expiresAt = expiresRaw != null ? DateTime.tryParse(expiresRaw) : null;
+    return DownloadTokenResult(token: token, expiresAt: expiresAt);
+  }
 }
 
 class BackgroundUrlSessionTransport implements Transport {
   BackgroundUrlSessionTransport(
     this.baseUri, {
     http.Client? client,
-    MethodChannel? channel,
-  })  : _http = HttpTransport(baseUri, client: client),
-        _channel = channel ??
-            const MethodChannel('universaldrop/background_url_session');
+  }) : _http = HttpTransport(baseUri, client: client);
 
   final Uri baseUri;
   final HttpTransport _http;
-  final MethodChannel _channel;
 
   @override
   Future<TransferInitResult> initTransfer({
@@ -456,27 +498,6 @@ class BackgroundUrlSessionTransport implements Transport {
     required String transferId,
     required String transferToken,
   }) async {
-    if (!Platform.isIOS) {
-      return _http.fetchManifest(
-        sessionId: sessionId,
-        transferId: transferId,
-        transferToken: transferToken,
-      );
-    }
-    final uri = baseUri.replace(
-      path: '/v1/transfer/manifest',
-      queryParameters: {
-        'session_id': sessionId,
-        'transfer_id': transferId,
-      },
-    );
-    final bytes = await _channel.invokeMethod<Uint8List>('fetchBytes', {
-      'url': uri.toString(),
-      'headers': {'Authorization': 'Bearer $transferToken'},
-    });
-    if (bytes != null) {
-      return bytes;
-    }
     return _http.fetchManifest(
       sessionId: sessionId,
       transferId: transferId,
@@ -492,32 +513,6 @@ class BackgroundUrlSessionTransport implements Transport {
     required int offset,
     required int length,
   }) async {
-    if (!Platform.isIOS) {
-      return _http.fetchRange(
-        sessionId: sessionId,
-        transferId: transferId,
-        transferToken: transferToken,
-        offset: offset,
-        length: length,
-      );
-    }
-    final uri = baseUri.replace(
-      path: '/v1/transfer/download',
-      queryParameters: {
-        'session_id': sessionId,
-        'transfer_id': transferId,
-      },
-    );
-    final bytes = await _channel.invokeMethod<Uint8List>('fetchRange', {
-      'url': uri.toString(),
-      'headers': {
-        'Authorization': 'Bearer $transferToken',
-        'Range': 'bytes=$offset-${offset + length - 1}',
-      },
-    });
-    if (bytes != null) {
-      return bytes;
-    }
     return _http.fetchRange(
       sessionId: sessionId,
       transferId: transferId,
@@ -579,6 +574,19 @@ class BackgroundUrlSessionTransport implements Transport {
   }) {
     return _http.scanFinalize(
       scanId: scanId,
+      transferToken: transferToken,
+    );
+  }
+
+  @override
+  Future<DownloadTokenResult> fetchDownloadToken({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+  }) {
+    return _http.fetchDownloadToken(
+      sessionId: sessionId,
+      transferId: transferId,
       transferToken: transferToken,
     );
   }
@@ -704,6 +712,21 @@ class OptionalBackgroundTransport implements Transport {
   }
 
   @override
+  Future<DownloadTokenResult> fetchDownloadToken({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+  }) {
+    return _run((transport) {
+      return transport.fetchDownloadToken(
+        sessionId: sessionId,
+        transferId: transferId,
+        transferToken: transferToken,
+      );
+    });
+  }
+
+  @override
   Future<ScanInitResult> scanInit({
     required String sessionId,
     required String transferId,
@@ -758,7 +781,7 @@ class OptionalBackgroundTransport implements Transport {
     }
     try {
       return await action(_background);
-    } on MissingPluginException {
+    } catch (_) {
       _switchToFallback();
       return action(_fallback);
     }
@@ -988,6 +1011,19 @@ class P2PTransport implements P2PFallbackTransport {
     required String transferToken,
   }) {
     return _fallback.sendReceipt(
+      sessionId: sessionId,
+      transferId: transferId,
+      transferToken: transferToken,
+    );
+  }
+
+  @override
+  Future<DownloadTokenResult> fetchDownloadToken({
+    required String sessionId,
+    required String transferId,
+    required String transferToken,
+  }) {
+    return _fallback.fetchDownloadToken(
       sessionId: sessionId,
       transferId: transferId,
       transferToken: transferToken,
@@ -1429,21 +1465,6 @@ class P2PTransport implements P2PFallbackTransport {
   }
 }
 
-Future<bool> isBackgroundTransportPluginAvailable(
-    {MethodChannel? channel}) async {
-  final probeChannel =
-      channel ?? const MethodChannel('universaldrop/background_url_session');
-  try {
-    await probeChannel.invokeMethod('fetchBytes', {'url': ''});
-    return true;
-  } on MissingPluginException {
-    return false;
-  } on PlatformException {
-    return true;
-  } on Exception {
-    return true;
-  }
-}
 
 class _P2PIceConfig {
   _P2PIceConfig({

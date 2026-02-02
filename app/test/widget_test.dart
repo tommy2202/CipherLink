@@ -9,43 +9,17 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:flutter/material.dart';
 import 'package:universaldrop_app/main.dart';
-import 'package:universaldrop_app/transfer_background.dart';
 
 void main() {
   testWidgets('Home screen renders', (WidgetTester tester) async {
-    final backgroundManager = TransferBackgroundManager(
-      scheduler: _NoopResumeScheduler(),
-      foregroundController: _NoopForegroundController(),
-    );
-
     await tester.pumpWidget(
       MaterialApp(
         home: HomeScreen(
-          backgroundManager: backgroundManager,
           runStartupTasks: false,
         ),
       ),
     );
 
-    expect(find.text('UniversalDrop'), findsOneWidget);
+    expect(find.text('CipherLink'), findsOneWidget);
   });
-}
-
-class _NoopResumeScheduler implements TransferResumeScheduler {
-  @override
-  Future<void> scheduleResume(TransferState state) async {}
-
-  @override
-  Future<void> cancelResume(String transferId) async {}
-}
-
-class _NoopForegroundController implements TransferForegroundController {
-  @override
-  Future<void> startReceiving() async {}
-
-  @override
-  Future<void> startSending() async {}
-
-  @override
-  Future<void> stop() async {}
 }

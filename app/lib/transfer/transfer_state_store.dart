@@ -16,6 +16,15 @@ class TransferState {
     this.peerPublicKeyB64,
     this.payloadPath,
     this.scanRequired,
+    this.claimId,
+    this.ciphertextPath,
+    this.ciphertextComplete,
+    this.backgroundTaskId,
+    this.manifestHashB64,
+    this.destination,
+    this.requiresForegroundResume,
+    this.downloadTokenRefreshFailures,
+    this.notificationLabel,
   });
 
   final String transferId;
@@ -30,9 +39,21 @@ class TransferState {
   final String? peerPublicKeyB64;
   final String? payloadPath;
   final bool? scanRequired;
+  final String? claimId;
+  final String? ciphertextPath;
+  final bool? ciphertextComplete;
+  final String? backgroundTaskId;
+  final String? manifestHashB64;
+  final String? destination;
+  final bool? requiresForegroundResume;
+  final int? downloadTokenRefreshFailures;
+  final String? notificationLabel;
 
   bool get isTerminal => status == 'completed' || status == 'failed';
-  bool get isActive => status == 'uploading' || status == 'downloading';
+  bool get isActive =>
+      status == 'uploading' ||
+      status == 'downloading' ||
+      status == 'decrypting';
   bool get needsResume => !isTerminal;
 
   TransferState copyWith({
@@ -47,6 +68,15 @@ class TransferState {
     String? peerPublicKeyB64,
     String? payloadPath,
     bool? scanRequired,
+    String? claimId,
+    String? ciphertextPath,
+    bool? ciphertextComplete,
+    String? backgroundTaskId,
+    String? manifestHashB64,
+    String? destination,
+    bool? requiresForegroundResume,
+    int? downloadTokenRefreshFailures,
+    String? notificationLabel,
   }) {
     return TransferState(
       transferId: transferId,
@@ -61,6 +91,17 @@ class TransferState {
       peerPublicKeyB64: peerPublicKeyB64 ?? this.peerPublicKeyB64,
       payloadPath: payloadPath ?? this.payloadPath,
       scanRequired: scanRequired ?? this.scanRequired,
+      claimId: claimId ?? this.claimId,
+      ciphertextPath: ciphertextPath ?? this.ciphertextPath,
+      ciphertextComplete: ciphertextComplete ?? this.ciphertextComplete,
+      backgroundTaskId: backgroundTaskId ?? this.backgroundTaskId,
+      manifestHashB64: manifestHashB64 ?? this.manifestHashB64,
+      destination: destination ?? this.destination,
+      requiresForegroundResume:
+          requiresForegroundResume ?? this.requiresForegroundResume,
+      downloadTokenRefreshFailures:
+          downloadTokenRefreshFailures ?? this.downloadTokenRefreshFailures,
+      notificationLabel: notificationLabel ?? this.notificationLabel,
     );
   }
 
@@ -78,6 +119,15 @@ class TransferState {
       'peer_public_key_b64': peerPublicKeyB64,
       'payload_path': payloadPath,
       'scan_required': scanRequired,
+      'claim_id': claimId,
+      'ciphertext_path': ciphertextPath,
+      'ciphertext_complete': ciphertextComplete,
+      'background_task_id': backgroundTaskId,
+      'manifest_hash_b64': manifestHashB64,
+      'destination': destination,
+      'requires_foreground_resume': requiresForegroundResume,
+      'download_token_refresh_failures': downloadTokenRefreshFailures,
+      'notification_label': notificationLabel,
     };
   }
 
@@ -95,6 +145,16 @@ class TransferState {
       peerPublicKeyB64: json['peer_public_key_b64']?.toString(),
       payloadPath: json['payload_path']?.toString(),
       scanRequired: _asBool(json['scan_required']),
+      claimId: json['claim_id']?.toString(),
+      ciphertextPath: json['ciphertext_path']?.toString(),
+      ciphertextComplete: _asBool(json['ciphertext_complete']),
+      backgroundTaskId: json['background_task_id']?.toString(),
+      manifestHashB64: json['manifest_hash_b64']?.toString(),
+      destination: json['destination']?.toString(),
+      requiresForegroundResume: _asBool(json['requires_foreground_resume']),
+      downloadTokenRefreshFailures:
+          _asInt(json['download_token_refresh_failures']),
+      notificationLabel: json['notification_label']?.toString(),
     );
   }
 
@@ -281,4 +341,57 @@ class SecureTransferStateStore implements TransferStateStore {
   }
 
   String _stateKey(String transferId) => 'transfer_state_$transferId';
+}
+
+class StoredDownloadToken {
+  StoredDownloadToken({
+    required this.token,
+    this.expiresAt,
+  });
+
+  final String token;
+  final DateTime? expiresAt;
+
+  bool get isExpired =>
+      expiresAt != null && expiresAt!.isBefore(DateTime.now());
+}
+
+class DownloadTokenStore {
+  DownloadTokenStore({SecureStore? secureStore})
+      : _secureStore = secureStore ?? FlutterSecureStore();
+
+  final SecureStore _secureStore;
+
+  Future<void> saveToken({
+    required String transferId,
+    required String token,
+    DateTime? expiresAt,
+  }) async {
+    await _secureStore.write(key: _tokenKey(transferId), value: token);
+    if (expiresAt != null) {
+      await _secureStore.write(
+        key: _expiryKey(transferId),
+        value: expiresAt.toIso8601String(),
+      );
+    }
+  }
+
+  Future<StoredDownloadToken?> loadToken(String transferId) async {
+    final token = await _secureStore.read(key: _tokenKey(transferId));
+    if (token == null || token.isEmpty) {
+      return null;
+    }
+    final expiryRaw = await _secureStore.read(key: _expiryKey(transferId));
+    final expiry =
+        expiryRaw == null ? null : DateTime.tryParse(expiryRaw.toString());
+    return StoredDownloadToken(token: token, expiresAt: expiry);
+  }
+
+  Future<void> deleteToken(String transferId) async {
+    await _secureStore.delete(key: _tokenKey(transferId));
+    await _secureStore.delete(key: _expiryKey(transferId));
+  }
+
+  String _tokenKey(String transferId) => 'download_token_$transferId';
+  String _expiryKey(String transferId) => 'download_token_exp_$transferId';
 }

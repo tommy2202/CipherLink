@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"universaldrop/internal/auth"
 	"universaldrop/internal/config"
 	"universaldrop/internal/domain"
 	"universaldrop/internal/logging"
@@ -56,7 +57,7 @@ func (s *Server) handleP2POffer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := bearerToken(r)
-	session, _, ok := s.authorizeP2P(r.Context(), req.SessionID, req.ClaimID, token)
+	session, _, ok := s.authorizeP2P(r, req.SessionID, req.ClaimID, token)
 	if !ok {
 		writeIndistinguishable(w)
 		return
@@ -82,7 +83,7 @@ func (s *Server) handleP2PAnswer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := bearerToken(r)
-	session, _, ok := s.authorizeP2P(r.Context(), req.SessionID, req.ClaimID, token)
+	session, _, ok := s.authorizeP2P(r, req.SessionID, req.ClaimID, token)
 	if !ok {
 		writeIndistinguishable(w)
 		return
@@ -108,7 +109,7 @@ func (s *Server) handleP2PICE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := bearerToken(r)
-	session, _, ok := s.authorizeP2P(r.Context(), req.SessionID, req.ClaimID, token)
+	session, _, ok := s.authorizeP2P(r, req.SessionID, req.ClaimID, token)
 	if !ok {
 		writeIndistinguishable(w)
 		return
@@ -131,7 +132,7 @@ func (s *Server) handleP2PPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := bearerToken(r)
-	session, _, ok := s.authorizeP2P(r.Context(), sessionID, claimID, token)
+	session, _, ok := s.authorizeP2P(r, sessionID, claimID, token)
 	if !ok {
 		writeIndistinguishable(w)
 		return
@@ -155,7 +156,7 @@ func (s *Server) handleP2PIceConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := bearerToken(r)
-	if _, _, ok := s.authorizeP2P(r.Context(), sessionID, claimID, token); !ok {
+	if _, _, ok := s.authorizeP2P(r, sessionID, claimID, token); !ok {
 		writeIndistinguishable(w)
 		return
 	}
@@ -166,7 +167,7 @@ func (s *Server) handleP2PIceConfig(w http.ResponseWriter, r *http.Request) {
 	if mode == "relay" {
 		ttl := s.turnCredentialTTL()
 		identity := sessionID + ":" + claimID
-		if !s.quotas.AllowRelay(identity, s.cfg.RelayPerIdentityPerDay, s.cfg.RelayConcurrentPerIdentity, ttl) {
+		if !s.quotas.AllowRelay(identity, s.cfg.Quotas.RelayPerIdentityPerDay, s.cfg.Quotas.RelayConcurrentPerIdentity, ttl) {
 			logging.Allowlist(s.logger, map[string]string{
 				"event":           "quota_blocked",
 				"scope":           "relay_issue",
@@ -194,14 +195,25 @@ func (s *Server) handleP2PIceConfig(w http.ResponseWriter, r *http.Request) {
 		response.TURNURLs = nil
 	}
 
+	if mode == "relay" {
+		s.metrics.IncRelayIceConfigIssued()
+	}
 	writeJSON(w, http.StatusOK, response)
 }
 
-func (s *Server) authorizeP2P(ctx context.Context, sessionID string, claimID string, token string) (domain.Session, domain.SessionClaim, bool) {
+func (s *Server) authorizeP2P(r *http.Request, sessionID string, claimID string, token string) (domain.Session, domain.SessionClaim, bool) {
 	if sessionID == "" || claimID == "" || token == "" {
 		return domain.Session{}, domain.SessionClaim{}, false
 	}
-	session, err := s.store.GetSession(ctx, sessionID)
+	capClaims, ok := s.requireCapability(r, token, auth.Requirement{
+		Scope:     auth.ScopeTransferSignal,
+		SessionID: sessionID,
+		ClaimID:   claimID,
+	})
+	if !ok {
+		return domain.Session{}, domain.SessionClaim{}, false
+	}
+	session, err := s.store.GetSession(r.Context(), sessionID)
 	if err != nil {
 		return domain.Session{}, domain.SessionClaim{}, false
 	}
@@ -218,16 +230,20 @@ func (s *Server) authorizeP2P(ctx context.Context, sessionID string, claimID str
 	if sasStateForClaim(claim) != "verified" {
 		return domain.Session{}, domain.SessionClaim{}, false
 	}
-	if _, err := s.store.GetSessionAuthContext(ctx, sessionID, claimID); err != nil {
+	if _, err := s.store.GetSessionAuthContext(r.Context(), sessionID, claimID); err != nil {
 		return domain.Session{}, domain.SessionClaim{}, false
 	}
-
-	ok, err = s.tokens.Validate(ctx, token, p2pScope(sessionID, claimID))
-	if err != nil || !ok {
-		ok, err = s.tokens.Validate(ctx, token, transferScope(sessionID, claimID))
-		if err != nil || !ok {
-			return domain.Session{}, domain.SessionClaim{}, false
-		}
+	if !s.capabilities.ValidateClaims(capClaims, auth.Requirement{
+		ClaimID:           claimID,
+		SenderPubKeyB64:   claim.SenderPubKeyB64,
+		ReceiverPubKeyB64: session.ReceiverPubKeyB64,
+		Visibility:        auth.VisibilityE2E,
+		Route:             routePattern(r),
+	}) {
+		return domain.Session{}, domain.SessionClaim{}, false
+	}
+	if capClaims.PeerID != "" && capClaims.PeerID != claim.SenderPubKeyB64 && capClaims.PeerID != session.ReceiverPubKeyB64 {
+		return domain.Session{}, domain.SessionClaim{}, false
 	}
 	return session, claim, true
 }

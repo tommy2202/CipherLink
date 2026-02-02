@@ -201,16 +201,16 @@ func (s *Store) DeleteTransfer(_ context.Context, transferID string) error {
 	return nil
 }
 
-func (s *Store) SweepExpired(_ context.Context, now time.Time) (int, error) {
+func (s *Store) SweepExpired(_ context.Context, now time.Time) (storage.SweepResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	now = now.UTC()
-	deleted := 0
+	result := storage.SweepResult{}
 
 	sessionEntries, err := os.ReadDir(s.sessionsDir)
 	if err != nil {
-		return 0, err
+		return storage.SweepResult{}, err
 	}
 	for _, entry := range sessionEntries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
@@ -229,20 +229,20 @@ func (s *Store) SweepExpired(_ context.Context, now time.Time) (int, error) {
 			continue
 		}
 		_ = os.Remove(path)
-		deleted++
+		result.Sessions++
 		s.deleteAuthContextsLocked(session.ID)
 		for _, claim := range session.Claims {
 			if claim.TransferID == "" {
 				continue
 			}
 			_ = os.RemoveAll(s.transferDir(claim.TransferID))
-			deleted++
+			result.Transfers++
 		}
 	}
 
 	transferEntries, err := os.ReadDir(s.transfersDir)
 	if err != nil {
-		return deleted, err
+		return result, err
 	}
 	for _, entry := range transferEntries {
 		if !entry.IsDir() {
@@ -261,12 +261,12 @@ func (s *Store) SweepExpired(_ context.Context, now time.Time) (int, error) {
 			continue
 		}
 		_ = os.RemoveAll(filepath.Join(s.transfersDir, entry.Name()))
-		deleted++
+		result.Transfers++
 	}
 
 	scanEntries, err := os.ReadDir(s.scansDir)
 	if err != nil {
-		return deleted, err
+		return result, err
 	}
 	for _, entry := range scanEntries {
 		if !entry.IsDir() {
@@ -285,10 +285,10 @@ func (s *Store) SweepExpired(_ context.Context, now time.Time) (int, error) {
 			continue
 		}
 		_ = os.RemoveAll(filepath.Join(s.scansDir, entry.Name()))
-		deleted++
+		result.Scans++
 	}
 
-	return deleted, nil
+	return result, nil
 }
 
 func (s *Store) CreateScanSession(_ context.Context, scan domain.ScanSession) error {

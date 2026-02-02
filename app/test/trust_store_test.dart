@@ -23,4 +23,21 @@ void main() {
     final afterRemove = await store.removeFingerprint('fingerprint-1');
     expect(afterRemove, isNot(contains('fingerprint-1')));
   });
+
+  test('trust store persists nickname mapping', () async {
+    final store = TrustStore();
+    await store.addFingerprint('fingerprint-1');
+    await store.setNickname('fingerprint-1', 'Laptop');
+
+    final nicknames = await store.loadNicknames();
+    expect(nicknames['fingerprint-1'], equals('Laptop'));
+
+    final store2 = TrustStore();
+    final nicknames2 = await store2.loadNicknames();
+    expect(nicknames2['fingerprint-1'], equals('Laptop'));
+
+    await store2.removeFingerprint('fingerprint-1');
+    final nicknames3 = await store.loadNicknames();
+    expect(nicknames3.containsKey('fingerprint-1'), isFalse);
+  });
 }

@@ -11,13 +11,14 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"universaldrop/internal/auth"
 	"universaldrop/internal/clock"
 	"universaldrop/internal/config"
 	"universaldrop/internal/logging"
+	"universaldrop/internal/metrics"
 	"universaldrop/internal/ratelimit"
 	"universaldrop/internal/scanner"
 	"universaldrop/internal/storage"
-	"universaldrop/internal/token"
 	"universaldrop/internal/transfer"
 )
 
@@ -30,20 +31,19 @@ type StorageHealthChecker interface {
 }
 
 type Dependencies struct {
-	Config  config.Config
-	Store   storage.Storage
-	Tokens  token.TokenService
-	Logger  *log.Logger
-	Version string
-	Scanner scanner.Scanner
-	Clock   clock.Clock
+	Config        config.Config
+	Store         storage.Storage
+	Logger        *log.Logger
+	Version       string
+	Scanner       scanner.Scanner
+	Clock         clock.Clock
+	Capabilities  *auth.Service
 	SweeperStatus SweeperStatus
 }
 
 type Server struct {
 	cfg            config.Config
 	store          storage.Storage
-	tokens         token.TokenService
 	logger         *log.Logger
 	version        string
 	rateLimiters   map[string]*ratelimit.Limiter
@@ -54,11 +54,14 @@ type Server struct {
 	downloadTokens *downloadTokenStore
 	clock          clock.Clock
 	sweeperStatus  SweeperStatus
+	metrics        *metrics.Counters
+	capabilities   *auth.Service
 	Router         http.Handler
 }
 
 var nonTransferTimeout = 2 * time.Minute
 var timeoutMiddleware = middleware.Timeout
+
 const sweeperStaleThreshold = 10 * time.Minute
 
 func NewServer(deps Dependencies) *Server {
@@ -70,10 +73,6 @@ func NewServer(deps Dependencies) *Server {
 	if version == "" {
 		version = "0.1"
 	}
-	tokenService := deps.Tokens
-	if tokenService == nil {
-		tokenService = token.NewMemoryService()
-	}
 	scanService := deps.Scanner
 	if scanService == nil {
 		scanService = scanner.UnavailableScanner{}
@@ -81,6 +80,10 @@ func NewServer(deps Dependencies) *Server {
 	clk := deps.Clock
 	if clk == nil {
 		clk = clock.RealClock{}
+	}
+	caps := deps.Capabilities
+	if caps == nil {
+		caps = auth.NewService(nil, clk, nil)
 	}
 
 	rateLimiters := map[string]*ratelimit.Limiter{}
@@ -97,17 +100,18 @@ func NewServer(deps Dependencies) *Server {
 	server := &Server{
 		cfg:            deps.Config,
 		store:          deps.Store,
-		tokens:         tokenService,
 		logger:         logSink,
 		version:        version,
 		rateLimiters:   rateLimiters,
 		transfers:      transfer.New(deps.Store),
 		scanner:        scanService,
 		quotas:         newQuotaTracker(),
-		throttles:      newThrottleManager(deps.Config.TransferBandwidthCapBps, deps.Config.GlobalBandwidthCapBps),
+		throttles:      newThrottleManager(deps.Config.Throttles.TransferBandwidthCapBps, deps.Config.Throttles.GlobalBandwidthCapBps),
 		downloadTokens: newDownloadTokenStore(),
 		clock:          clk,
 		sweeperStatus:  deps.SweeperStatus,
+		metrics:        metrics.NewCounters(),
+		capabilities:   caps,
 	}
 
 	server.Router = server.routes()
@@ -124,6 +128,7 @@ func (s *Server) routes() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
 	r.With(timeoutMiddleware(nonTransferTimeout)).With(s.safeLogger).With(s.rateLimit("health")).Get("/readyz", s.handleReadyz)
+	r.With(timeoutMiddleware(nonTransferTimeout)).With(s.safeLogger).With(s.rateLimit("health")).Get("/metricsz", s.handleMetrics)
 
 	r.Route("/v1", func(r chi.Router) {
 		r.Group(func(r chi.Router) {
@@ -162,6 +167,10 @@ func (s *Server) routes() http.Handler {
 	})
 
 	return r
+}
+
+func (s *Server) Metrics() *metrics.Counters {
+	return s.metrics
 }
 
 func (s *Server) safeLogger(next http.Handler) http.Handler {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"universaldrop/internal/api"
+	"universaldrop/internal/auth"
 	"universaldrop/internal/clock"
 	"universaldrop/internal/config"
 	"universaldrop/internal/logging"
@@ -37,15 +38,15 @@ func main() {
 			"error": "token_secret_load_failed",
 		})
 	}
-	tokens := token.NewHMACService(secret)
 	liveness := sweeper.NewLiveness()
+	capabilities := auth.NewService(secret, clk, nil)
 
 	server := api.NewServer(api.Dependencies{
-		Config:  cfg,
-		Store:   store,
-		Tokens:  tokens,
-		Logger:  logger,
-		Scanner: scanner.UnavailableScanner{},
+		Config:        cfg,
+		Store:         store,
+		Logger:        logger,
+		Scanner:       scanner.UnavailableScanner{},
+		Capabilities:  capabilities,
 		SweeperStatus: liveness,
 	})
 
@@ -58,7 +59,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	sweep := sweeper.New(store, clk, cfg.SweepInterval, logger, liveness)
+	sweep := sweeper.New(store, clk, cfg.SweepInterval, logger, liveness, server.Metrics())
 	sweep.Start(ctx)
 
 	go func() {

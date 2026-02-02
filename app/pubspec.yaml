@@ -1,5 +1,5 @@
 name: universaldrop_app
-description: UniversalDrop Flutter client (minimal scaffold).
+description: CipherLink Flutter client (minimal scaffold).
 publish_to: "none"
 version: 0.1.0
 
@@ -9,6 +9,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  background_downloader: ^9.5.2
   connectivity_plus: ^7.0.0
   http: ^1.2.2
   cryptography: ^2.7.0

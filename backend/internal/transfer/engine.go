@@ -27,7 +27,7 @@ func New(store storage.Storage) *Engine {
 	return &Engine{store: store}
 }
 
-func (e *Engine) CreateTransfer(ctx context.Context, manifest []byte, totalBytes int64, expiresAt time.Time) (string, error) {
+func (e *Engine) CreateTransfer(ctx context.Context, manifest []byte, totalBytes int64, expiresAt time.Time, manifestHash string) (string, error) {
 	if len(manifest) == 0 || totalBytes < 0 {
 		return "", ErrInvalidInput
 	}
@@ -35,13 +35,13 @@ func (e *Engine) CreateTransfer(ctx context.Context, manifest []byte, totalBytes
 	if err != nil {
 		return "", err
 	}
-	if err := e.CreateTransferWithID(ctx, transferID, manifest, totalBytes, expiresAt); err != nil {
+	if err := e.CreateTransferWithID(ctx, transferID, manifest, totalBytes, expiresAt, manifestHash); err != nil {
 		return "", err
 	}
 	return transferID, nil
 }
 
-func (e *Engine) CreateTransferWithID(ctx context.Context, transferID string, manifest []byte, totalBytes int64, expiresAt time.Time) error {
+func (e *Engine) CreateTransferWithID(ctx context.Context, transferID string, manifest []byte, totalBytes int64, expiresAt time.Time, manifestHash string) error {
 	if transferID == "" || len(manifest) == 0 || totalBytes < 0 {
 		return ErrInvalidInput
 	}
@@ -54,6 +54,7 @@ func (e *Engine) CreateTransferWithID(ctx context.Context, transferID string, ma
 		Status:        domain.TransferStatusActive,
 		BytesReceived: 0,
 		TotalBytes:    totalBytes,
+		ManifestHash:  manifestHash,
 		CreatedAt:     time.Now().UTC(),
 		ExpiresAt:     expiresAt.UTC(),
 		ScanStatus:    domain.ScanStatusNotRequired,

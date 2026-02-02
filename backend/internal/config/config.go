@@ -14,44 +14,64 @@ type RateLimit struct {
 }
 
 type Config struct {
-	Address                         string
-	DataDir                         string
-	RateLimitHealth                 RateLimit
-	RateLimitV1                     RateLimit
-	RateLimitSessionClaim           RateLimit
-	ClaimTokenTTL                   time.Duration
-	TransferTokenTTL                time.Duration
-	DownloadTokenTTL                time.Duration
-	SweepInterval                   time.Duration
-	MaxScanBytes                    int64
-	MaxScanDuration                 time.Duration
-	STUNURLs                        []string
-	TURNURLs                        []string
-	TURNSharedSecret                []byte
-	QuotaSessionsPerDayIP           int64
-	QuotaSessionsPerDaySession      int64
-	QuotaTransfersPerDayIP          int64
-	QuotaTransfersPerDaySession     int64
-	QuotaBytesPerDayIP              int64
-	QuotaBytesPerDaySession         int64
-	QuotaConcurrentTransfersIP      int
-	QuotaConcurrentTransfersSession int
-	TransferBandwidthCapBps         int64
-	GlobalBandwidthCapBps           int64
-	RelayPerIdentityPerDay          int64
-	RelayConcurrentPerIdentity      int
+	Address               string
+	DataDir               string
+	RateLimitHealth       RateLimit
+	RateLimitV1           RateLimit
+	RateLimitSessionClaim RateLimit
+	ClaimTokenTTL         time.Duration
+	TransferTokenTTL      time.Duration
+	DownloadTokenTTL      time.Duration
+	SweepInterval         time.Duration
+	MaxScanBytes          int64
+	MaxScanDuration       time.Duration
+	STUNURLs              []string
+	TURNURLs              []string
+	TURNSharedSecret      []byte
+	Quotas                QuotaConfig
+	Throttles             ThrottleConfig
+}
+
+type QuotaConfig struct {
+	SessionsPerDayIP           int64
+	SessionsPerDaySession      int64
+	TransfersPerDayIP          int64
+	TransfersPerDaySession     int64
+	BytesPerDayIP              int64
+	BytesPerDaySession         int64
+	ConcurrentTransfersIP      int
+	ConcurrentTransfersSession int
+	RelayPerIdentityPerDay     int64
+	RelayConcurrentPerIdentity int
+}
+
+type ThrottleConfig struct {
+	TransferBandwidthCapBps int64
+	GlobalBandwidthCapBps   int64
 }
 
 const (
-	DefaultClaimTokenTTL    = 3 * time.Minute
-	MinClaimTokenTTL        = 2 * time.Minute
-	MaxClaimTokenTTL        = 5 * time.Minute
-	DefaultTransferTokenTTL = 5 * time.Minute
-	MinTransferTokenTTL     = 1 * time.Minute
-	MaxTransferTokenTTL     = 15 * time.Minute
-	DefaultSweepInterval    = 30 * time.Second
-	DefaultMaxScanBytes     = 50 << 20
-	DefaultMaxScanDuration  = 10 * time.Second
+	DefaultClaimTokenTTL                   = 3 * time.Minute
+	MinClaimTokenTTL                       = 2 * time.Minute
+	MaxClaimTokenTTL                       = 5 * time.Minute
+	DefaultTransferTokenTTL                = 5 * time.Minute
+	MinTransferTokenTTL                    = 1 * time.Minute
+	MaxTransferTokenTTL                    = 15 * time.Minute
+	DefaultSweepInterval                   = 30 * time.Second
+	DefaultMaxScanBytes                    = 50 << 20
+	DefaultMaxScanDuration                 = 10 * time.Second
+	DefaultQuotaSessionsPerDayIP           = int64(0)
+	DefaultQuotaSessionsPerDaySession      = int64(0)
+	DefaultQuotaTransfersPerDayIP          = int64(0)
+	DefaultQuotaTransfersPerDaySession     = int64(0)
+	DefaultQuotaBytesPerDayIP              = int64(0)
+	DefaultQuotaBytesPerDaySession         = int64(0)
+	DefaultQuotaConcurrentTransfersIP      = 0
+	DefaultQuotaConcurrentTransfersSession = 0
+	DefaultRelayPerIdentityPerDay          = int64(0)
+	DefaultRelayConcurrentPerIdentity      = 0
+	DefaultTransferBandwidthCapBps         = int64(0)
+	DefaultGlobalBandwidthCapBps           = int64(0)
 )
 
 func Load() Config {
@@ -75,6 +95,22 @@ func Load() Config {
 		SweepInterval:    DefaultSweepInterval,
 		MaxScanBytes:     DefaultMaxScanBytes,
 		MaxScanDuration:  DefaultMaxScanDuration,
+		Quotas: QuotaConfig{
+			SessionsPerDayIP:           DefaultQuotaSessionsPerDayIP,
+			SessionsPerDaySession:      DefaultQuotaSessionsPerDaySession,
+			TransfersPerDayIP:          DefaultQuotaTransfersPerDayIP,
+			TransfersPerDaySession:     DefaultQuotaTransfersPerDaySession,
+			BytesPerDayIP:              DefaultQuotaBytesPerDayIP,
+			BytesPerDaySession:         DefaultQuotaBytesPerDaySession,
+			ConcurrentTransfersIP:      DefaultQuotaConcurrentTransfersIP,
+			ConcurrentTransfersSession: DefaultQuotaConcurrentTransfersSession,
+			RelayPerIdentityPerDay:     DefaultRelayPerIdentityPerDay,
+			RelayConcurrentPerIdentity: DefaultRelayConcurrentPerIdentity,
+		},
+		Throttles: ThrottleConfig{
+			TransferBandwidthCapBps: DefaultTransferBandwidthCapBps,
+			GlobalBandwidthCapBps:   DefaultGlobalBandwidthCapBps,
+		},
 	}
 
 	if value := os.Getenv("UD_ADDRESS"); value != "" {
@@ -136,40 +172,40 @@ func Load() Config {
 		cfg.TURNSharedSecret = secret
 	}
 	if value := parseIntEnv("UD_QUOTA_IP_SESSIONS_PER_DAY"); value > 0 {
-		cfg.QuotaSessionsPerDayIP = value
+		cfg.Quotas.SessionsPerDayIP = value
 	}
 	if value := parseIntEnv("UD_QUOTA_SESSION_SESSIONS_PER_DAY"); value > 0 {
-		cfg.QuotaSessionsPerDaySession = value
+		cfg.Quotas.SessionsPerDaySession = value
 	}
 	if value := parseIntEnv("UD_QUOTA_IP_TRANSFERS_PER_DAY"); value > 0 {
-		cfg.QuotaTransfersPerDayIP = value
+		cfg.Quotas.TransfersPerDayIP = value
 	}
 	if value := parseIntEnv("UD_QUOTA_SESSION_TRANSFERS_PER_DAY"); value > 0 {
-		cfg.QuotaTransfersPerDaySession = value
+		cfg.Quotas.TransfersPerDaySession = value
 	}
 	if value := parseIntEnv("UD_QUOTA_IP_BYTES_PER_DAY"); value > 0 {
-		cfg.QuotaBytesPerDayIP = value
+		cfg.Quotas.BytesPerDayIP = value
 	}
 	if value := parseIntEnv("UD_QUOTA_SESSION_BYTES_PER_DAY"); value > 0 {
-		cfg.QuotaBytesPerDaySession = value
+		cfg.Quotas.BytesPerDaySession = value
 	}
 	if value := parseIntEnv("UD_QUOTA_IP_CONCURRENT_TRANSFERS"); value > 0 {
-		cfg.QuotaConcurrentTransfersIP = int(value)
+		cfg.Quotas.ConcurrentTransfersIP = int(value)
 	}
 	if value := parseIntEnv("UD_QUOTA_SESSION_CONCURRENT_TRANSFERS"); value > 0 {
-		cfg.QuotaConcurrentTransfersSession = int(value)
+		cfg.Quotas.ConcurrentTransfersSession = int(value)
 	}
 	if value := parseIntEnv("UD_TRANSFER_BANDWIDTH_BPS"); value > 0 {
-		cfg.TransferBandwidthCapBps = value
+		cfg.Throttles.TransferBandwidthCapBps = value
 	}
 	if value := parseIntEnv("UD_GLOBAL_BANDWIDTH_BPS"); value > 0 {
-		cfg.GlobalBandwidthCapBps = value
+		cfg.Throttles.GlobalBandwidthCapBps = value
 	}
 	if value := parseIntEnv("UD_RELAY_ISSUANCE_PER_DAY"); value > 0 {
-		cfg.RelayPerIdentityPerDay = value
+		cfg.Quotas.RelayPerIdentityPerDay = value
 	}
 	if value := parseIntEnv("UD_RELAY_CONCURRENT_SESSIONS"); value > 0 {
-		cfg.RelayConcurrentPerIdentity = int(value)
+		cfg.Quotas.RelayConcurrentPerIdentity = int(value)
 	}
 
 	return cfg

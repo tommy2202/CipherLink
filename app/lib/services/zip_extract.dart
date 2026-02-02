@@ -42,6 +42,26 @@ class ExtractResult {
   final int bytesExtracted;
 }
 
+class ZipSafetyInfo {
+  ZipSafetyInfo({
+    required this.totalEntries,
+    required this.totalBytes,
+    required this.maxEntryBytes,
+    required this.maxPathLength,
+    required this.exceedsLimits,
+    required this.nearLimits,
+    this.refusalMessage,
+  });
+
+  final int totalEntries;
+  final int totalBytes;
+  final int maxEntryBytes;
+  final int maxPathLength;
+  final bool exceedsLimits;
+  final bool nearLimits;
+  final String? refusalMessage;
+}
+
 class ZipSlipException implements Exception {
   ZipSlipException(this.message);
 
@@ -62,6 +82,12 @@ class ZipLimitException implements Exception {
 
 const String zipArchiveTooLargeMessage =
     'Archive too large to extract safely.';
+const String zipArchiveRefusedMessage =
+    'Archive exceeds extraction limits and will not be extracted.';
+const String zipArchiveInspectFailedMessage =
+    'Archive could not be inspected for safety limits.';
+
+const double zipNearLimitRatioDefault = 0.9;
 
 List<ZipEntryData> decodeZipEntries(
   Uint8List bytes, {
@@ -83,6 +109,64 @@ List<ZipEntryData> decodeZipEntries(
     );
   }
   return entries;
+}
+
+ZipSafetyInfo analyzeZipBytes(
+  Uint8List bytes, {
+  ZipExtractionLimits limits = const ZipExtractionLimits(),
+  double nearLimitRatio = zipNearLimitRatioDefault,
+}) {
+  Archive archive;
+  try {
+    archive = ZipDecoder().decodeBytes(bytes);
+  } catch (_) {
+    return ZipSafetyInfo(
+      totalEntries: 0,
+      totalBytes: 0,
+      maxEntryBytes: 0,
+      maxPathLength: 0,
+      exceedsLimits: true,
+      nearLimits: false,
+      refusalMessage: zipArchiveInspectFailedMessage,
+    );
+  }
+  final entries = archive.files;
+  var totalBytes = 0;
+  var maxEntryBytes = 0;
+  var maxPathLength = 0;
+  for (final entry in entries) {
+    final normalizedName = entry.name.replaceAll('\\', '/');
+    if (normalizedName.length > maxPathLength) {
+      maxPathLength = normalizedName.length;
+    }
+    if (!entry.isFile) {
+      continue;
+    }
+    final size = entry.size;
+    if (size > maxEntryBytes) {
+      maxEntryBytes = size;
+    }
+    totalBytes += size;
+  }
+  final totalEntries = entries.length;
+  final exceedsLimits = totalEntries > limits.maxEntries ||
+      totalBytes > limits.maxTotalUncompressedBytes ||
+      maxEntryBytes > limits.maxSingleFileBytes ||
+      maxPathLength > limits.maxPathLength;
+  final nearLimits = !exceedsLimits &&
+      (totalEntries >= limits.maxEntries * nearLimitRatio ||
+          totalBytes >= limits.maxTotalUncompressedBytes * nearLimitRatio ||
+          maxEntryBytes >= limits.maxSingleFileBytes * nearLimitRatio ||
+          maxPathLength >= limits.maxPathLength * nearLimitRatio);
+  return ZipSafetyInfo(
+    totalEntries: totalEntries,
+    totalBytes: totalBytes,
+    maxEntryBytes: maxEntryBytes,
+    maxPathLength: maxPathLength,
+    exceedsLimits: exceedsLimits,
+    nearLimits: nearLimits,
+    refusalMessage: exceedsLimits ? zipArchiveRefusedMessage : null,
+  );
 }
 
 Future<ExtractResult> extractZipBytes({

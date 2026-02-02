@@ -21,15 +21,19 @@ import 'package:universaldrop_app/destination_preferences.dart';
 import 'package:universaldrop_app/destination_rules.dart';
 import 'package:universaldrop_app/destination_selector.dart';
 import 'package:universaldrop_app/key_store.dart';
+import 'package:universaldrop_app/limits.dart';
 import 'package:universaldrop_app/packaging_builder.dart';
 import 'package:universaldrop_app/save_service.dart';
-import 'package:universaldrop_app/transfer_background.dart';
+import 'package:universaldrop_app/transfer/background_transfer.dart';
+import 'package:universaldrop_app/transfer/transfer_summary.dart';
 import 'package:universaldrop_app/transfer_coordinator.dart';
 import 'package:universaldrop_app/transfer_manifest.dart';
 import 'package:universaldrop_app/transfer_state_store.dart';
 import 'package:universaldrop_app/transport.dart';
 import 'package:universaldrop_app/trust_store.dart';
 import 'package:universaldrop_app/trusted_device_badge.dart';
+import 'package:universaldrop_app/ui/transfer_summary_screen.dart';
+import 'package:universaldrop_app/ui/zip_extraction_info.dart';
 import 'package:universaldrop_app/zip_extract.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -38,7 +42,6 @@ class HomeScreen extends StatefulWidget {
     ClipboardService? clipboardService,
     this.saveService,
     this.destinationStore,
-    this.backgroundManager,
     this.onTransportSelected,
     this.runStartupTasks = true,
   }) : clipboardService = clipboardService ?? const SystemClipboardService();
@@ -46,7 +49,6 @@ class HomeScreen extends StatefulWidget {
   final ClipboardService clipboardService;
   final SaveService? saveService;
   final DestinationPreferenceStore? destinationStore;
-  final TransferBackgroundManager? backgroundManager;
   final void Function(Transport transport)? onTransportSelected;
   final bool runStartupTasks;
 
@@ -54,7 +56,7 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final TextEditingController _baseUrlController =
       TextEditingController(text: 'http://localhost:8080');
   String _status = 'Idle';
@@ -71,8 +73,9 @@ class _HomeScreenState extends State<HomeScreen> {
   TransferCoordinator? _coordinator;
   late final SecureTransferStateStore _transferStore =
       SecureTransferStateStore();
+  final BackgroundTransferApi _backgroundTransfer = BackgroundTransferApiImpl();
+  final DownloadTokenStore _downloadTokenStore = DownloadTokenStore();
   final SecureKeyPairStore _keyStore = SecureKeyPairStore();
-  late final TransferBackgroundManager _backgroundManager;
   late final DestinationPreferenceStore _destinationStore;
   late final SaveService _saveService;
   late final DestinationSelector _destinationSelector;
@@ -122,11 +125,11 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _alwaysRelay = false;
   bool _p2pDisclosureShown = false;
   bool _experimentalDisclosureShown = false;
-  bool _enableBackgroundServices = false;
-  bool _backgroundServicesUnavailableShown = false;
-  bool _enableExperimentalBackgroundTransport = false;
-  bool _backgroundTransportFallbackShown = false;
+  bool _preferBackgroundDownloads = false;
+  bool _showNotificationDetails = false;
+  bool _isForeground = true;
   final Set<String> _trustedFingerprints = {};
+  final Map<String, String> _trustedNicknames = {};
   final Map<String, String> _receiverSasByClaim = {};
   final Set<String> _receiverSasConfirming = {};
 
@@ -134,33 +137,20 @@ class _HomeScreenState extends State<HomeScreen> {
   static const _p2pAlwaysRelayKey = 'p2pAlwaysRelay';
   static const _p2pDisclosureKey = 'p2pDirectDisclosureShown';
   static const _experimentalDisclosureKey = 'experimentalDisclosureShown';
-  static const _backgroundServicesKey = 'enableBackgroundServices';
-  static const _experimentalBackgroundTransportKey =
-      'enableExperimentalBackgroundTransport';
+  static const _preferBackgroundDownloadsKey = 'preferBackgroundDownloads';
+  static const _notificationDetailsKey =
+      'showNotificationDetailsInNotifications';
 
   @override
   void initState() {
     super.initState();
-    _backgroundManager = widget.backgroundManager ??
-        TransferBackgroundManager(
-          scheduler: FeatureFlaggedResumeScheduler(
-            scheduler: MethodChannelResumeScheduler(),
-            isEnabled: () => _enableBackgroundServices,
-            onUnavailable: _handleBackgroundServicesUnavailable,
-          ),
-          foregroundController: FeatureFlaggedForegroundController(
-            controller: MethodChannelForegroundController(),
-            isEnabled: () => _enableBackgroundServices,
-            onUnavailable: _handleBackgroundServicesUnavailable,
-          ),
-          onConnectivityRestored: () => _resumePendingTransfers(),
-        );
+    WidgetsBinding.instance.addObserver(this);
     _destinationStore =
         widget.destinationStore ?? SharedPreferencesDestinationStore();
     _saveService = widget.saveService ?? DefaultSaveService();
     _destinationSelector = DestinationSelector(_destinationStore);
+    _loadSettings();
     if (widget.runStartupTasks) {
-      _loadSettings();
       _resumePendingTransfers();
     }
   }
@@ -176,8 +166,23 @@ class _HomeScreenState extends State<HomeScreen> {
     _textContentController.dispose();
     _packageTitleController.dispose();
     _pollTimer?.cancel();
-    _backgroundManager.dispose();
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final isForeground = state == AppLifecycleState.resumed;
+    if (isForeground == _isForeground) {
+      return;
+    }
+    if (!mounted) {
+      _isForeground = isForeground;
+      return;
+    }
+    setState(() {
+      _isForeground = isForeground;
+    });
   }
 
   Future<void> _loadSettings() async {
@@ -187,11 +192,14 @@ class _HomeScreenState extends State<HomeScreen> {
     final disclosureShown = prefs.getBool(_p2pDisclosureKey) ?? false;
     final experimentalDisclosureShown =
         prefs.getBool(_experimentalDisclosureKey) ?? false;
-    final enableBackgroundServices =
-        prefs.getBool(_backgroundServicesKey) ?? false;
-    final enableBackground =
-        prefs.getBool(_experimentalBackgroundTransportKey) ?? false;
+    final preferBackgroundDownloads =
+        prefs.getBool(_preferBackgroundDownloadsKey) ?? false;
+    final showNotificationDetails =
+        prefs.getBool(_notificationDetailsKey) ?? false;
     final trustedFingerprints = await _trustStore.loadFingerprints();
+    final trustedNicknames = await _trustStore.loadNicknames();
+    final trustedNicknames = await _trustStore.loadNicknames();
+    final trustedNicknames = await _trustStore.loadNicknames();
     if (!mounted) {
       return;
     }
@@ -200,32 +208,21 @@ class _HomeScreenState extends State<HomeScreen> {
       _alwaysRelay = alwaysRelay;
       _p2pDisclosureShown = disclosureShown;
       _experimentalDisclosureShown = experimentalDisclosureShown;
-      _enableBackgroundServices = enableBackgroundServices;
-      _enableExperimentalBackgroundTransport = enableBackground;
+      _preferBackgroundDownloads = preferBackgroundDownloads;
+      _showNotificationDetails = showNotificationDetails;
       _trustedFingerprints
         ..clear()
         ..addAll(trustedFingerprints);
+      _trustedNicknames
+        ..clear()
+        ..addAll(trustedNicknames);
+      _trustedNicknames
+        ..clear()
+        ..addAll(trustedNicknames);
+      _trustedNicknames
+        ..clear()
+        ..addAll(trustedNicknames);
     });
-    if (_enableBackgroundServices) {
-      final available = await _areBackgroundServicesAvailable();
-      if (!available && mounted) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) {
-            _handleBackgroundServicesUnavailable();
-          }
-        });
-      }
-    }
-    if (_enableExperimentalBackgroundTransport) {
-      final available = await _isBackgroundTransportAvailable();
-      if (!available && mounted) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) {
-            _handleBackgroundTransportUnavailable();
-          }
-        });
-      }
-    }
   }
 
   Future<void> _persistP2PSettings() async {
@@ -257,45 +254,23 @@ class _HomeScreenState extends State<HomeScreen> {
     await _persistP2PSettings();
   }
 
-  Future<void> _setBackgroundServicesEnabled(bool value) async {
+  Future<void> _setPreferBackgroundDownloads(bool value) async {
     if (value) {
       await _maybeShowExperimentalDisclosure();
-      final available = await _areBackgroundServicesAvailable();
-      if (!available) {
-        _handleBackgroundServicesUnavailable();
-        return;
-      }
     }
     setState(() {
-      _enableBackgroundServices = value;
-      if (value) {
-        _backgroundServicesUnavailableShown = false;
-      }
+      _preferBackgroundDownloads = value;
     });
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_backgroundServicesKey, value);
+    await prefs.setBool(_preferBackgroundDownloadsKey, value);
   }
 
-  Future<void> _setExperimentalBackgroundTransport(bool value) async {
-    if (value) {
-      await _maybeShowExperimentalDisclosure();
-      final available = await _isBackgroundTransportAvailable();
-      if (!available) {
-        _handleBackgroundTransportUnavailable();
-        _ensureCoordinator();
-        return;
-      }
-    }
+  Future<void> _setNotificationDetails(bool value) async {
     setState(() {
-      _enableExperimentalBackgroundTransport = value;
-      if (value) {
-        _backgroundTransportFallbackShown = false;
-      }
+      _showNotificationDetails = value;
     });
-    _coordinator = null;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_experimentalBackgroundTransportKey, value);
-    _ensureCoordinator();
+    await prefs.setBool(_notificationDetailsKey, value);
   }
 
   Future<void> _maybeShowDirectDisclosure() async {
@@ -364,6 +339,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _addTrustedFingerprint(String fingerprint) async {
     final updated = await _trustStore.addFingerprint(fingerprint);
+    final nicknames = await _trustStore.loadNicknames();
     if (!mounted) {
       return;
     }
@@ -371,11 +347,15 @@ class _HomeScreenState extends State<HomeScreen> {
       _trustedFingerprints
         ..clear()
         ..addAll(updated);
+      _trustedNicknames
+        ..clear()
+        ..addAll(nicknames);
     });
   }
 
   Future<void> _removeTrustedFingerprint(String fingerprint) async {
     final updated = await _trustStore.removeFingerprint(fingerprint);
+    final nicknames = await _trustStore.loadNicknames();
     if (!mounted) {
       return;
     }
@@ -383,7 +363,163 @@ class _HomeScreenState extends State<HomeScreen> {
       _trustedFingerprints
         ..clear()
         ..addAll(updated);
+      _trustedNicknames
+        ..clear()
+        ..addAll(nicknames);
     });
+  }
+
+  Future<void> _setTrustedNickname(
+    String fingerprint,
+    String nickname,
+  ) async {
+    final nicknames = await _trustStore.setNickname(fingerprint, nickname);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _trustedNicknames
+        ..clear()
+        ..addAll(nicknames);
+    });
+  }
+
+  Future<void> _promptTrustedNickname(String fingerprint) async {
+    final controller = TextEditingController(
+      text: _trustedNicknames[fingerprint] ?? '',
+    );
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Set nickname'),
+          content: TextField(
+            controller: controller,
+            decoration: const InputDecoration(
+              hintText: 'Optional nickname',
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () =>
+                  Navigator.of(context).pop(controller.text.trim()),
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+    controller.dispose();
+    if (result == null) {
+      return;
+    }
+    await _setTrustedNickname(fingerprint, result);
+  }
+
+  Future<void> _setTrustedNickname(
+    String fingerprint,
+    String nickname,
+  ) async {
+    final nicknames = await _trustStore.setNickname(fingerprint, nickname);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _trustedNicknames
+        ..clear()
+        ..addAll(nicknames);
+    });
+  }
+
+  Future<void> _promptTrustedNickname(String fingerprint) async {
+    final controller = TextEditingController(
+      text: _trustedNicknames[fingerprint] ?? '',
+    );
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Set nickname'),
+          content: TextField(
+            controller: controller,
+            decoration: const InputDecoration(
+              hintText: 'Optional nickname',
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () =>
+                  Navigator.of(context).pop(controller.text.trim()),
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+    controller.dispose();
+    if (result == null) {
+      return;
+    }
+    await _setTrustedNickname(fingerprint, result);
+  }
+
+  Future<void> _setTrustedNickname(
+    String fingerprint,
+    String nickname,
+  ) async {
+    final nicknames = await _trustStore.setNickname(fingerprint, nickname);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _trustedNicknames
+        ..clear()
+        ..addAll(nicknames);
+    });
+  }
+
+  Future<void> _promptTrustedNickname(String fingerprint) async {
+    final controller = TextEditingController(
+      text: _trustedNicknames[fingerprint] ?? '',
+    );
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Set nickname'),
+          content: TextField(
+            controller: controller,
+            decoration: const InputDecoration(
+              hintText: 'Optional nickname',
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () =>
+                  Navigator.of(context).pop(controller.text.trim()),
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+    controller.dispose();
+    if (result == null) {
+      return;
+    }
+    await _setTrustedNickname(fingerprint, result);
   }
 
   String _formatFingerprint(String fingerprint) {
@@ -403,6 +539,11 @@ class _HomeScreenState extends State<HomeScreen> {
           style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
         ),
         SizedBox(height: 8),
+        Text(
+          'Trusted means you\'ve verified SAS with this device before. '
+          'Always verify SAS if unsure.',
+        ),
+        SizedBox(height: 8),
         Text('No trusted devices yet.'),
       ];
     }
@@ -412,60 +553,38 @@ class _HomeScreenState extends State<HomeScreen> {
         style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
       ),
       const SizedBox(height: 8),
+      const Text(
+        'Trusted means you\'ve verified SAS with this device before. '
+        'Always verify SAS if unsure.',
+      ),
+      const SizedBox(height: 8),
       ...entries.map((fingerprint) {
+        final nickname = _trustedNicknames[fingerprint];
+        final hasNickname = nickname != null && nickname.trim().isNotEmpty;
         return ListTile(
           contentPadding: EdgeInsets.zero,
-          title: Text(_formatFingerprint(fingerprint)),
-          trailing: IconButton(
-            tooltip: 'Remove',
-            icon: const Icon(Icons.delete_outline),
-            onPressed: () {
-              _removeTrustedFingerprint(fingerprint);
-            },
+          title: Text(
+            hasNickname ? nickname : _formatFingerprint(fingerprint),
+          ),
+          subtitle: hasNickname ? Text(_formatFingerprint(fingerprint)) : null,
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                tooltip: 'Edit nickname',
+                icon: const Icon(Icons.edit_outlined),
+                onPressed: () => _promptTrustedNickname(fingerprint),
+              ),
+              IconButton(
+                tooltip: 'Revoke trust',
+                icon: const Icon(Icons.delete_outline),
+                onPressed: () => _removeTrustedFingerprint(fingerprint),
+              ),
+            ],
           ),
         );
       }),
     ];
-  }
-
-  void _handleBackgroundTransportUnavailable() {
-    if (_backgroundTransportFallbackShown || !mounted) {
-      return;
-    }
-    _backgroundTransportFallbackShown = true;
-    setState(() {
-      _enableExperimentalBackgroundTransport = false;
-    });
-    SharedPreferences.getInstance().then((prefs) {
-      prefs.setBool(_experimentalBackgroundTransportKey, false);
-    });
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text(
-          'Background transfers unavailable; using standard mode.',
-        ),
-      ),
-    );
-  }
-
-  void _handleBackgroundServicesUnavailable() {
-    if (_backgroundServicesUnavailableShown || !mounted) {
-      return;
-    }
-    _backgroundServicesUnavailableShown = true;
-    setState(() {
-      _enableBackgroundServices = false;
-    });
-    SharedPreferences.getInstance().then((prefs) {
-      prefs.setBool(_backgroundServicesKey, false);
-    });
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text(
-          'Foreground transfer notification unavailable; using standard mode.',
-        ),
-      ),
-    );
   }
 
   void _openDiagnostics() {
@@ -483,18 +602,11 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     final baseUri = Uri.parse(baseUrl);
-    final httpTransport = HttpTransport(baseUri);
-    Transport transport = httpTransport;
-    if (_enableExperimentalBackgroundTransport) {
-      transport = OptionalBackgroundTransport(
-        backgroundTransport: BackgroundUrlSessionTransport(baseUri),
-        fallbackTransport: httpTransport,
-        onFallback: _handleBackgroundTransportUnavailable,
-      );
-    }
+    final transport = HttpTransport(baseUri);
     widget.onTransportSelected?.call(transport);
     _coordinator = TransferCoordinator(
       transport: transport,
+      baseUri: baseUri,
       p2pTransportFactory: (context) => P2PTransport(
         baseUri: baseUri,
         context: context,
@@ -511,7 +623,176 @@ class _HomeScreenState extends State<HomeScreen> {
           _scanStatus = status;
         });
       },
-      backgroundHooks: _backgroundManager,
+      backgroundTransfer: _backgroundTransfer,
+      downloadTokenStore: _downloadTokenStore,
+      saveHandler: _handleTransferSave,
+      downloadResolver: _resolveDownloadResumeContext,
+    );
+  }
+
+  TransferDownloadPolicy _downloadPolicy() {
+    return TransferDownloadPolicy(
+      preferBackground: _preferBackgroundDownloads,
+      showNotificationDetails: _showNotificationDetails,
+      destinationResolver: _resolveBackgroundDestination,
+      isAppInForeground: () => _isForeground,
+    );
+  }
+
+  Future<bool> _showTransferSummary({
+    required TransferManifest manifest,
+    required PendingClaim claim,
+  }) async {
+    if (!mounted) {
+      return false;
+    }
+    final summary = buildTransferSummary(manifest);
+    final result = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) => TransferSummaryScreen(
+          summary: summary,
+          manifest: manifest,
+          routeLabel: _routeLabelForClaim(claim),
+          routeDisclosure: _routeDisclosureForClaim(claim),
+        ),
+      ),
+    );
+    return result ?? false;
+  }
+
+  String _routeLabelForClaim(PendingClaim claim) {
+    return _isDirectP2P(claim) ? 'Direct P2P' : 'Relay';
+  }
+
+  String _routeDisclosureForClaim(PendingClaim claim) {
+    if (_isDirectP2P(claim)) {
+      return 'Direct P2P may expose your IP address to the sender.';
+    }
+    return 'Relay keeps your IP address hidden from the sender.';
+  }
+
+  bool _isDirectP2P(PendingClaim claim) {
+    final p2pToken = _p2pTokensByClaim[claim.claimId] ?? '';
+    return _preferDirect && !_alwaysRelay && p2pToken.isNotEmpty;
+  }
+
+  Future<SaveDestination?> _resolveBackgroundDestination(
+    TransferManifest manifest,
+    bool allowPrompt,
+  ) async {
+    if (allowPrompt && mounted) {
+      final defaultDestination =
+          await _destinationSelector.defaultDestination(manifest);
+      final choice = await _showDestinationSelector(
+        defaultDestination,
+        isMediaManifest(manifest),
+      );
+      if (choice == null) {
+        return null;
+      }
+      await _destinationSelector.rememberChoice(manifest, choice);
+      return choice.destination;
+    }
+    final prefs = await _destinationStore.load();
+    if (isMediaManifest(manifest)) {
+      return prefs.defaultMediaDestination ?? SaveDestination.files;
+    }
+    return prefs.defaultFileDestination ?? SaveDestination.files;
+  }
+
+  SaveDestination? _destinationFromState(String? value) {
+    if (value == null || value.isEmpty) {
+      return null;
+    }
+    for (final destination in SaveDestination.values) {
+      if (destination.name == value) {
+        return destination;
+      }
+    }
+    return null;
+  }
+
+  Future<TransferSaveResult> _handleTransferSave(
+    TransferManifest manifest,
+    Uint8List bytes,
+    TransferState state,
+  ) async {
+    final destination = _destinationFromState(state.destination) ??
+        await _resolveBackgroundDestination(manifest, false) ??
+        SaveDestination.files;
+
+    if (manifest.payloadKind == payloadKindText) {
+      final text = utf8.decode(bytes);
+      if (mounted) {
+        setState(() {
+          _receivedText = text;
+          _manifestStatus = 'Text received.';
+          _saveStatus = 'Ready to copy.';
+        });
+      } else {
+        _receivedText = text;
+      }
+      return const TransferSaveResult(shouldSendReceipt: true);
+    }
+
+    if (manifest.packagingMode == packagingModeAlbum) {
+      final outcome = await _saveAlbumPayload(
+        bytes: bytes,
+        manifest: manifest,
+        destination: destination,
+        allowUserInteraction: false,
+      );
+      if (mounted) {
+        setState(() {
+          _manifestStatus =
+              'Album: ${manifest.albumItemCount ?? manifest.files.length} items';
+          _saveStatus =
+              outcome.success ? 'Album saved.' : 'Album saved with fallback.';
+        });
+      }
+      return TransferSaveResult(
+        shouldSendReceipt: outcome.success || outcome.localPath != null,
+        localPath: outcome.localPath,
+      );
+    }
+
+    _lastManifest = manifest;
+    _extractStatus = '';
+    _extractProgress = null;
+    if (manifest.packagingMode == packagingModeZip) {
+      _lastZipBytes = bytes;
+    } else {
+      _lastZipBytes = null;
+    }
+    final fileName = _suggestFileName(manifest);
+    final mime = _suggestMime(manifest);
+    final isMedia = isMediaManifest(manifest);
+    final outcome = await _saveService.saveBytes(
+      bytes: bytes,
+      name: fileName,
+      mime: mime,
+      isMedia: isMedia,
+      destination: destination,
+      allowUserInteraction: false,
+    );
+    _lastSavedPath = outcome.localPath;
+    _lastSaveIsMedia = isMedia;
+    _lastSavedMime = mime;
+    if (mounted) {
+      setState(() {
+        if (manifest.packagingMode == packagingModeZip) {
+          _manifestStatus = 'ZIP: ${manifest.outputFilename ?? fileName}';
+        } else if (manifest.files.isNotEmpty) {
+          _manifestStatus = 'File: ${manifest.files.first.relativePath}';
+        } else {
+          _manifestStatus = 'Downloaded ${bytes.length} bytes.';
+        }
+        _saveStatus = outcome.success ? 'Saved.' : 'Saved locally with fallback.';
+      });
+    }
+    return TransferSaveResult(
+      shouldSendReceipt: outcome.success || outcome.localPath != null,
+      localPath: outcome.localPath,
     );
   }
 
@@ -523,6 +804,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     await coordinator.resumePendingDownloads(
       resolve: _resolveDownloadResumeContext,
+      downloadPolicy: _downloadPolicy(),
     );
     await coordinator.resumePendingUploads(
       resolve: _resolveUploadResumeContext,
@@ -627,16 +909,6 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Future<bool> _areBackgroundServicesAvailable() async {
-    final resumeAvailable = await isBackgroundResumePluginAvailable();
-    final foregroundAvailable = await isForegroundServicePluginAvailable();
-    return resumeAvailable && foregroundAvailable;
-  }
-
-  Future<bool> _isBackgroundTransportAvailable() async {
-    return isBackgroundTransportPluginAvailable();
-  }
-
   Future<void> _pingBackend() async {
     final baseUrl = _baseUrlController.text.trim();
     if (baseUrl.isEmpty) {
@@ -649,6 +921,21 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _loading = true;
       _status = 'Pinging...';
+    });
+
+    if (_preferDirect) {
+      await _maybeShowDirectDisclosure();
+    }
+    final p2pToken = _p2pTokensByClaim[claim.claimId] ?? transferToken;
+    final p2pContext = _buildP2PContext(
+      sessionId: sessionId,
+      claimId: claim.claimId,
+      token: p2pToken,
+      isInitiator: false,
+    );
+
+    setState(() {
+      _manifestStatus = 'Downloading manifest...';
     });
 
     try {
@@ -1139,6 +1426,30 @@ class _HomeScreenState extends State<HomeScreen> {
         return;
       }
       final senderPublicKey = publicKeyFromBase64(senderPubKeyB64);
+      final preview = await coordinator.fetchManifest(
+        sessionId: sessionId,
+        transferToken: transferToken,
+        transferId: claim.transferId,
+        senderPublicKey: senderPublicKey,
+        receiverKeyPair: _receiverKeyPair!,
+        p2pContext: p2pContext,
+      );
+      if (preview == null) {
+        setState(() {
+          _manifestStatus = 'Manifest preview failed.';
+        });
+        return;
+      }
+      final approved = await _showTransferSummary(
+        manifest: preview,
+        claim: claim,
+      );
+      if (!approved) {
+        setState(() {
+          _manifestStatus = 'Receive cancelled.';
+        });
+        return;
+      }
       final result = await coordinator.downloadTransfer(
         sessionId: sessionId,
         transferToken: transferToken,
@@ -1147,10 +1458,21 @@ class _HomeScreenState extends State<HomeScreen> {
         receiverKeyPair: _receiverKeyPair!,
         sendReceipt: false,
         p2pContext: p2pContext,
+        downloadPolicy: _downloadPolicy(),
       );
       if (result == null) {
+        final pending = await _transferStore.load(claim.transferId);
+        if (!mounted) {
+          return;
+        }
         setState(() {
-          _manifestStatus = 'Download paused or failed.';
+          if (pending?.backgroundTaskId?.isNotEmpty == true) {
+            _manifestStatus = 'Download running in background.';
+          } else if (pending?.requiresForegroundResume == true) {
+            _manifestStatus = 'Download paused. Resume in foreground.';
+          } else {
+            _manifestStatus = 'Download paused or failed.';
+          }
         });
         return;
       }
@@ -1737,6 +2059,7 @@ class _HomeScreenState extends State<HomeScreen> {
     required Uint8List bytes,
     required TransferManifest manifest,
     required SaveDestination destination,
+    bool allowUserInteraction = true,
   }) async {
     final entries = decodeZipEntries(bytes);
     final fileMap = <String, TransferManifestFile>{};
@@ -1767,6 +2090,7 @@ class _HomeScreenState extends State<HomeScreen> {
         mime: mime,
         isMedia: true,
         destination: destination,
+        allowUserInteraction: allowUserInteraction,
       );
       if (_lastSavedPath == null && outcome.localPath != null) {
         _lastSavedPath = outcome.localPath;
@@ -1786,6 +2110,23 @@ class _HomeScreenState extends State<HomeScreen> {
     final manifest = _lastManifest;
     if (zipBytes == null || manifest == null) {
       return;
+    }
+    final safety = analyzeZipBytes(zipBytes);
+    if (safety.exceedsLimits) {
+      setState(() {
+        _extractStatus = safety.refusalMessage ??
+            'Archive exceeds extraction limits and will not be extracted.';
+      });
+      return;
+    }
+    if (safety.nearLimits) {
+      final proceed = await _confirmExtractionWarning();
+      if (!proceed) {
+        setState(() {
+          _extractStatus = 'Extraction cancelled.';
+        });
+        return;
+      }
     }
     setState(() {
       _extracting = true;
@@ -1826,6 +2167,128 @@ class _HomeScreenState extends State<HomeScreen> {
         _extracting = false;
       });
     }
+  }
+
+  Future<bool> _confirmExtractionWarning() async {
+    if (!mounted) {
+      return false;
+    }
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Extract anyway?'),
+          content: const Text(
+            'This archive is close to extraction limits. '
+            'Extracting it could take longer or fail.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Extract anyway'),
+            ),
+          ],
+        );
+      },
+    );
+    return result ?? false;
+  }
+
+  List<Widget> _buildZipExtractionSection() {
+    final zipBytes = _lastZipBytes;
+    if (_lastManifest?.packagingMode != packagingModeZip || zipBytes == null) {
+      return const [];
+    }
+    final safety = analyzeZipBytes(zipBytes);
+    final canExtract = !_extracting && !safety.exceedsLimits;
+    return [
+      const SizedBox(height: 12),
+      ZipExtractionInfo(
+        safety: safety,
+        limits: const ZipExtractionLimits(),
+      ),
+      const SizedBox(height: 12),
+      ElevatedButton(
+        onPressed: canExtract ? _extractZip : null,
+        child: Text(_extracting ? 'Extracting...' : 'Extract ZIP'),
+      ),
+      if (_extractProgress != null) ...[
+        const SizedBox(height: 8),
+        Text(
+          'Extracted ${_extractProgress!.filesExtracted}/${_extractProgress!.totalFiles} files',
+        ),
+      ],
+      if (_extractStatus.isNotEmpty) ...[
+        const SizedBox(height: 8),
+        Text(_extractStatus),
+      ],
+    ];
+  }
+
+  List<Widget> _buildZipExtractionSection() {
+    final zipBytes = _lastZipBytes;
+    if (_lastManifest?.packagingMode != packagingModeZip || zipBytes == null) {
+      return const [];
+    }
+    final safety = analyzeZipBytes(zipBytes);
+    final canExtract = !_extracting && !safety.exceedsLimits;
+    return [
+      const SizedBox(height: 12),
+      ZipExtractionInfo(
+        safety: safety,
+        limits: const ZipExtractionLimits(),
+      ),
+      const SizedBox(height: 12),
+      ElevatedButton(
+        onPressed: canExtract ? _extractZip : null,
+        child: Text(_extracting ? 'Extracting...' : 'Extract ZIP'),
+      ),
+      if (_extractProgress != null) ...[
+        const SizedBox(height: 8),
+        Text(
+          'Extracted ${_extractProgress!.filesExtracted}/${_extractProgress!.totalFiles} files',
+        ),
+      ],
+      if (_extractStatus.isNotEmpty) ...[
+        const SizedBox(height: 8),
+        Text(_extractStatus),
+      ],
+    ];
+  }
+
+  List<Widget> _buildZipExtractionSection() {
+    final zipBytes = _lastZipBytes;
+    if (_lastManifest?.packagingMode != packagingModeZip || zipBytes == null) {
+      return const [];
+    }
+    final safety = analyzeZipBytes(zipBytes);
+    final canExtract = !_extracting && !safety.exceedsLimits;
+    return [
+      const SizedBox(height: 12),
+      ZipExtractionInfo(
+        safety: safety,
+        limits: const ZipExtractionLimits(),
+      ),
+      const SizedBox(height: 12),
+      ElevatedButton(
+        onPressed: canExtract ? _extractZip : null,
+        child: Text(_extracting ? 'Extracting...' : 'Extract ZIP'),
+      ),
+      if (_extractProgress != null) ...[
+        const SizedBox(height: 8),
+        Text(
+          'Extracted ${_extractProgress!.filesExtracted}/${_extractProgress!.totalFiles} files',
+        ),
+      ],
+      if (_extractStatus.isNotEmpty) ...[
+        const SizedBox(height: 8),
+        Text(_extractStatus),
+      ],
+    ];
   }
 
   String _defaultPackageTitle() {
@@ -1947,7 +2410,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('UniversalDrop')),
+      appBar: AppBar(title: const Text('CipherLink')),
       body: Padding(
         padding: const EdgeInsets.all(24),
         child: Column(
@@ -2000,25 +2463,23 @@ class _HomeScreenState extends State<HomeScreen> {
             Text('Status: $_status'),
             const SizedBox(height: 24),
             const Text(
-              'Transport settings',
+              'Download settings',
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
             ),
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
-              title: const Text(
-                'Experimental: Foreground transfer notification (Android)',
-              ),
-              subtitle: const Text('Shows a notification during transfers'),
-              value: _enableBackgroundServices,
-              onChanged: (value) => _setBackgroundServicesEnabled(value),
+              title: const Text('Prefer background downloads'),
+              subtitle:
+                  const Text('Use background downloads for large transfers'),
+              value: _preferBackgroundDownloads,
+              onChanged: (value) => _setPreferBackgroundDownloads(value),
             ),
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
-              title: const Text('Experimental: Background transfers'),
-              subtitle:
-                  const Text('Use native background sessions when available'),
-              value: _enableExperimentalBackgroundTransport,
-              onChanged: (value) => _setExperimentalBackgroundTransport(value),
+              title: const Text('Show more details in notifications'),
+              subtitle: const Text('May include transfer details'),
+              value: _showNotificationDetails,
+              onChanged: (value) => _setNotificationDetails(value),
             ),
             const SizedBox(height: 16),
             ..._buildTrustedDevicesSection(),
@@ -2420,25 +2881,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   ],
                 ),
               ],
-              if (_lastManifest?.packagingMode == packagingModeZip &&
-                  _lastZipBytes != null) ...[
-                const SizedBox(height: 12),
-                ElevatedButton(
-                  onPressed: _extracting ? null : _extractZip,
-                  child:
-                      Text(_extracting ? 'Extracting...' : 'Extract ZIP'),
-                ),
-                if (_extractProgress != null) ...[
-                  const SizedBox(height: 8),
-                  Text(
-                    'Extracted ${_extractProgress!.filesExtracted}/${_extractProgress!.totalFiles} files',
-                  ),
-                ],
-                if (_extractStatus.isNotEmpty) ...[
-                  const SizedBox(height: 8),
-                  Text(_extractStatus),
-                ],
-              ],
+              ..._buildZipExtractionSection(),
             ],
           ],
         ),
@@ -2588,15 +3031,19 @@ import 'package:universaldrop_app/destination_preferences.dart';
 import 'package:universaldrop_app/destination_rules.dart';
 import 'package:universaldrop_app/destination_selector.dart';
 import 'package:universaldrop_app/key_store.dart';
+import 'package:universaldrop_app/limits.dart';
 import 'package:universaldrop_app/packaging_builder.dart';
 import 'package:universaldrop_app/save_service.dart';
-import 'package:universaldrop_app/transfer_background.dart';
+import 'package:universaldrop_app/transfer/background_transfer.dart';
+import 'package:universaldrop_app/transfer/transfer_summary.dart';
 import 'package:universaldrop_app/transfer_coordinator.dart';
 import 'package:universaldrop_app/transfer_manifest.dart';
 import 'package:universaldrop_app/transfer_state_store.dart';
 import 'package:universaldrop_app/transport.dart';
 import 'package:universaldrop_app/trust_store.dart';
 import 'package:universaldrop_app/trusted_device_badge.dart';
+import 'package:universaldrop_app/ui/transfer_summary_screen.dart';
+import 'package:universaldrop_app/ui/zip_extraction_info.dart';
 import 'package:universaldrop_app/zip_extract.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -2605,7 +3052,6 @@ class HomeScreen extends StatefulWidget {
     ClipboardService? clipboardService,
     this.saveService,
     this.destinationStore,
-    this.backgroundManager,
     this.onTransportSelected,
     this.runStartupTasks = true,
   }) : clipboardService = clipboardService ?? const SystemClipboardService();
@@ -2613,7 +3059,6 @@ class HomeScreen extends StatefulWidget {
   final ClipboardService clipboardService;
   final SaveService? saveService;
   final DestinationPreferenceStore? destinationStore;
-  final TransferBackgroundManager? backgroundManager;
   final void Function(Transport transport)? onTransportSelected;
   final bool runStartupTasks;
 
@@ -2621,7 +3066,7 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final TextEditingController _baseUrlController =
       TextEditingController(text: 'http://localhost:8080');
   String _status = 'Idle';
@@ -2639,7 +3084,8 @@ class _HomeScreenState extends State<HomeScreen> {
   late final SecureTransferStateStore _transferStore =
       SecureTransferStateStore();
   final SecureKeyPairStore _keyStore = SecureKeyPairStore();
-  late final TransferBackgroundManager _backgroundManager;
+  final BackgroundTransferApi _backgroundTransfer = BackgroundTransferApiImpl();
+  final DownloadTokenStore _downloadTokenStore = DownloadTokenStore();
   late final DestinationPreferenceStore _destinationStore;
   late final SaveService _saveService;
   late final DestinationSelector _destinationSelector;
@@ -2689,11 +3135,11 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _alwaysRelay = false;
   bool _p2pDisclosureShown = false;
   bool _experimentalDisclosureShown = false;
-  bool _enableBackgroundServices = false;
-  bool _backgroundServicesUnavailableShown = false;
-  bool _enableExperimentalBackgroundTransport = false;
-  bool _backgroundTransportFallbackShown = false;
+  bool _preferBackgroundDownloads = false;
+  bool _showNotificationDetails = false;
+  bool _isForeground = true;
   final Set<String> _trustedFingerprints = {};
+  final Map<String, String> _trustedNicknames = {};
   final Map<String, String> _receiverSasByClaim = {};
   final Set<String> _receiverSasConfirming = {};
 
@@ -2701,33 +3147,20 @@ class _HomeScreenState extends State<HomeScreen> {
   static const _p2pAlwaysRelayKey = 'p2pAlwaysRelay';
   static const _p2pDisclosureKey = 'p2pDirectDisclosureShown';
   static const _experimentalDisclosureKey = 'experimentalDisclosureShown';
-  static const _backgroundServicesKey = 'enableBackgroundServices';
-  static const _experimentalBackgroundTransportKey =
-      'enableExperimentalBackgroundTransport';
+  static const _preferBackgroundDownloadsKey = 'preferBackgroundDownloads';
+  static const _notificationDetailsKey =
+      'showNotificationDetailsInNotifications';
 
   @override
   void initState() {
     super.initState();
-    _backgroundManager = widget.backgroundManager ??
-        TransferBackgroundManager(
-          scheduler: FeatureFlaggedResumeScheduler(
-            scheduler: MethodChannelResumeScheduler(),
-            isEnabled: () => _enableBackgroundServices,
-            onUnavailable: _handleBackgroundServicesUnavailable,
-          ),
-          foregroundController: FeatureFlaggedForegroundController(
-            controller: MethodChannelForegroundController(),
-            isEnabled: () => _enableBackgroundServices,
-            onUnavailable: _handleBackgroundServicesUnavailable,
-          ),
-          onConnectivityRestored: () => _resumePendingTransfers(),
-        );
+    WidgetsBinding.instance.addObserver(this);
     _destinationStore =
         widget.destinationStore ?? SharedPreferencesDestinationStore();
     _saveService = widget.saveService ?? DefaultSaveService();
     _destinationSelector = DestinationSelector(_destinationStore);
+    _loadSettings();
     if (widget.runStartupTasks) {
-      _loadSettings();
       _resumePendingTransfers();
     }
   }
@@ -2743,8 +3176,23 @@ class _HomeScreenState extends State<HomeScreen> {
     _textContentController.dispose();
     _packageTitleController.dispose();
     _pollTimer?.cancel();
-    _backgroundManager.dispose();
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final isForeground = state == AppLifecycleState.resumed;
+    if (isForeground == _isForeground) {
+      return;
+    }
+    if (!mounted) {
+      _isForeground = isForeground;
+      return;
+    }
+    setState(() {
+      _isForeground = isForeground;
+    });
   }
 
   Future<void> _loadSettings() async {
@@ -2754,10 +3202,10 @@ class _HomeScreenState extends State<HomeScreen> {
     final disclosureShown = prefs.getBool(_p2pDisclosureKey) ?? false;
     final experimentalDisclosureShown =
         prefs.getBool(_experimentalDisclosureKey) ?? false;
-    final enableBackgroundServices =
-        prefs.getBool(_backgroundServicesKey) ?? false;
-    final enableBackground =
-        prefs.getBool(_experimentalBackgroundTransportKey) ?? false;
+    final preferBackgroundDownloads =
+        prefs.getBool(_preferBackgroundDownloadsKey) ?? false;
+    final showNotificationDetails =
+        prefs.getBool(_notificationDetailsKey) ?? false;
     final trustedFingerprints = await _trustStore.loadFingerprints();
     if (!mounted) {
       return;
@@ -2767,32 +3215,12 @@ class _HomeScreenState extends State<HomeScreen> {
       _alwaysRelay = alwaysRelay;
       _p2pDisclosureShown = disclosureShown;
       _experimentalDisclosureShown = experimentalDisclosureShown;
-      _enableBackgroundServices = enableBackgroundServices;
-      _enableExperimentalBackgroundTransport = enableBackground;
+      _preferBackgroundDownloads = preferBackgroundDownloads;
+      _showNotificationDetails = showNotificationDetails;
       _trustedFingerprints
         ..clear()
         ..addAll(trustedFingerprints);
     });
-    if (_enableBackgroundServices) {
-      final available = await _areBackgroundServicesAvailable();
-      if (!available && mounted) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) {
-            _handleBackgroundServicesUnavailable();
-          }
-        });
-      }
-    }
-    if (_enableExperimentalBackgroundTransport) {
-      final available = await _isBackgroundTransportAvailable();
-      if (!available && mounted) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) {
-            _handleBackgroundTransportUnavailable();
-          }
-        });
-      }
-    }
   }
 
   Future<void> _persistP2PSettings() async {
@@ -2824,45 +3252,23 @@ class _HomeScreenState extends State<HomeScreen> {
     await _persistP2PSettings();
   }
 
-  Future<void> _setBackgroundServicesEnabled(bool value) async {
+  Future<void> _setPreferBackgroundDownloads(bool value) async {
     if (value) {
       await _maybeShowExperimentalDisclosure();
-      final available = await _areBackgroundServicesAvailable();
-      if (!available) {
-        _handleBackgroundServicesUnavailable();
-        return;
-      }
     }
     setState(() {
-      _enableBackgroundServices = value;
-      if (value) {
-        _backgroundServicesUnavailableShown = false;
-      }
+      _preferBackgroundDownloads = value;
     });
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_backgroundServicesKey, value);
+    await prefs.setBool(_preferBackgroundDownloadsKey, value);
   }
 
-  Future<void> _setExperimentalBackgroundTransport(bool value) async {
-    if (value) {
-      await _maybeShowExperimentalDisclosure();
-      final available = await _isBackgroundTransportAvailable();
-      if (!available) {
-        _handleBackgroundTransportUnavailable();
-        _ensureCoordinator();
-        return;
-      }
-    }
+  Future<void> _setNotificationDetails(bool value) async {
     setState(() {
-      _enableExperimentalBackgroundTransport = value;
-      if (value) {
-        _backgroundTransportFallbackShown = false;
-      }
+      _showNotificationDetails = value;
     });
-    _coordinator = null;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_experimentalBackgroundTransportKey, value);
-    _ensureCoordinator();
+    await prefs.setBool(_notificationDetailsKey, value);
   }
 
   Future<void> _maybeShowDirectDisclosure() async {
@@ -2931,6 +3337,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _addTrustedFingerprint(String fingerprint) async {
     final updated = await _trustStore.addFingerprint(fingerprint);
+    final nicknames = await _trustStore.loadNicknames();
     if (!mounted) {
       return;
     }
@@ -2938,11 +3345,15 @@ class _HomeScreenState extends State<HomeScreen> {
       _trustedFingerprints
         ..clear()
         ..addAll(updated);
+      _trustedNicknames
+        ..clear()
+        ..addAll(nicknames);
     });
   }
 
   Future<void> _removeTrustedFingerprint(String fingerprint) async {
     final updated = await _trustStore.removeFingerprint(fingerprint);
+    final nicknames = await _trustStore.loadNicknames();
     if (!mounted) {
       return;
     }
@@ -2950,6 +3361,9 @@ class _HomeScreenState extends State<HomeScreen> {
       _trustedFingerprints
         ..clear()
         ..addAll(updated);
+      _trustedNicknames
+        ..clear()
+        ..addAll(nicknames);
     });
   }
 
@@ -2970,6 +3384,11 @@ class _HomeScreenState extends State<HomeScreen> {
           style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
         ),
         SizedBox(height: 8),
+        Text(
+          'Trusted means you\'ve verified SAS with this device before. '
+          'Always verify SAS if unsure.',
+        ),
+        SizedBox(height: 8),
         Text('No trusted devices yet.'),
       ];
     }
@@ -2979,60 +3398,38 @@ class _HomeScreenState extends State<HomeScreen> {
         style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
       ),
       const SizedBox(height: 8),
+      const Text(
+        'Trusted means you\'ve verified SAS with this device before. '
+        'Always verify SAS if unsure.',
+      ),
+      const SizedBox(height: 8),
       ...entries.map((fingerprint) {
+        final nickname = _trustedNicknames[fingerprint];
+        final hasNickname = nickname != null && nickname.trim().isNotEmpty;
         return ListTile(
           contentPadding: EdgeInsets.zero,
-          title: Text(_formatFingerprint(fingerprint)),
-          trailing: IconButton(
-            tooltip: 'Remove',
-            icon: const Icon(Icons.delete_outline),
-            onPressed: () {
-              _removeTrustedFingerprint(fingerprint);
-            },
+          title: Text(
+            hasNickname ? nickname : _formatFingerprint(fingerprint),
+          ),
+          subtitle: hasNickname ? Text(_formatFingerprint(fingerprint)) : null,
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                tooltip: 'Edit nickname',
+                icon: const Icon(Icons.edit_outlined),
+                onPressed: () => _promptTrustedNickname(fingerprint),
+              ),
+              IconButton(
+                tooltip: 'Revoke trust',
+                icon: const Icon(Icons.delete_outline),
+                onPressed: () => _removeTrustedFingerprint(fingerprint),
+              ),
+            ],
           ),
         );
       }),
     ];
-  }
-
-  void _handleBackgroundTransportUnavailable() {
-    if (_backgroundTransportFallbackShown || !mounted) {
-      return;
-    }
-    _backgroundTransportFallbackShown = true;
-    setState(() {
-      _enableExperimentalBackgroundTransport = false;
-    });
-    SharedPreferences.getInstance().then((prefs) {
-      prefs.setBool(_experimentalBackgroundTransportKey, false);
-    });
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text(
-          'Background transfers unavailable; using standard mode.',
-        ),
-      ),
-    );
-  }
-
-  void _handleBackgroundServicesUnavailable() {
-    if (_backgroundServicesUnavailableShown || !mounted) {
-      return;
-    }
-    _backgroundServicesUnavailableShown = true;
-    setState(() {
-      _enableBackgroundServices = false;
-    });
-    SharedPreferences.getInstance().then((prefs) {
-      prefs.setBool(_backgroundServicesKey, false);
-    });
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text(
-          'Foreground transfer notification unavailable; using standard mode.',
-        ),
-      ),
-    );
   }
 
   void _openDiagnostics() {
@@ -3050,18 +3447,11 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     final baseUri = Uri.parse(baseUrl);
-    final httpTransport = HttpTransport(baseUri);
-    Transport transport = httpTransport;
-    if (_enableExperimentalBackgroundTransport) {
-      transport = OptionalBackgroundTransport(
-        backgroundTransport: BackgroundUrlSessionTransport(baseUri),
-        fallbackTransport: httpTransport,
-        onFallback: _handleBackgroundTransportUnavailable,
-      );
-    }
+    final transport = HttpTransport(baseUri);
     widget.onTransportSelected?.call(transport);
     _coordinator = TransferCoordinator(
       transport: transport,
+      baseUri: baseUri,
       p2pTransportFactory: (context) => P2PTransport(
         baseUri: baseUri,
         context: context,
@@ -3078,7 +3468,176 @@ class _HomeScreenState extends State<HomeScreen> {
           _scanStatus = status;
         });
       },
-      backgroundHooks: _backgroundManager,
+      backgroundTransfer: _backgroundTransfer,
+      downloadTokenStore: _downloadTokenStore,
+      saveHandler: _handleTransferSave,
+      downloadResolver: _resolveDownloadResumeContext,
+    );
+  }
+
+  TransferDownloadPolicy _downloadPolicy() {
+    return TransferDownloadPolicy(
+      preferBackground: _preferBackgroundDownloads,
+      showNotificationDetails: _showNotificationDetails,
+      destinationResolver: _resolveBackgroundDestination,
+      isAppInForeground: () => _isForeground,
+    );
+  }
+
+  Future<bool> _showTransferSummary({
+    required TransferManifest manifest,
+    required PendingClaim claim,
+  }) async {
+    if (!mounted) {
+      return false;
+    }
+    final summary = buildTransferSummary(manifest);
+    final result = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) => TransferSummaryScreen(
+          summary: summary,
+          manifest: manifest,
+          routeLabel: _routeLabelForClaim(claim),
+          routeDisclosure: _routeDisclosureForClaim(claim),
+        ),
+      ),
+    );
+    return result ?? false;
+  }
+
+  String _routeLabelForClaim(PendingClaim claim) {
+    return _isDirectP2P(claim) ? 'Direct P2P' : 'Relay';
+  }
+
+  String _routeDisclosureForClaim(PendingClaim claim) {
+    if (_isDirectP2P(claim)) {
+      return 'Direct P2P may expose your IP address to the sender.';
+    }
+    return 'Relay keeps your IP address hidden from the sender.';
+  }
+
+  bool _isDirectP2P(PendingClaim claim) {
+    final p2pToken = _p2pTokensByClaim[claim.claimId] ?? '';
+    return _preferDirect && !_alwaysRelay && p2pToken.isNotEmpty;
+  }
+
+  Future<SaveDestination?> _resolveBackgroundDestination(
+    TransferManifest manifest,
+    bool allowPrompt,
+  ) async {
+    if (allowPrompt && mounted) {
+      final defaultDestination =
+          await _destinationSelector.defaultDestination(manifest);
+      final choice = await _showDestinationSelector(
+        defaultDestination,
+        isMediaManifest(manifest),
+      );
+      if (choice == null) {
+        return null;
+      }
+      await _destinationSelector.rememberChoice(manifest, choice);
+      return choice.destination;
+    }
+    final prefs = await _destinationStore.load();
+    if (isMediaManifest(manifest)) {
+      return prefs.defaultMediaDestination ?? SaveDestination.files;
+    }
+    return prefs.defaultFileDestination ?? SaveDestination.files;
+  }
+
+  SaveDestination? _destinationFromState(String? value) {
+    if (value == null || value.isEmpty) {
+      return null;
+    }
+    for (final destination in SaveDestination.values) {
+      if (destination.name == value) {
+        return destination;
+      }
+    }
+    return null;
+  }
+
+  Future<TransferSaveResult> _handleTransferSave(
+    TransferManifest manifest,
+    Uint8List bytes,
+    TransferState state,
+  ) async {
+    final destination = _destinationFromState(state.destination) ??
+        await _resolveBackgroundDestination(manifest, false) ??
+        SaveDestination.files;
+
+    if (manifest.payloadKind == payloadKindText) {
+      final text = utf8.decode(bytes);
+      if (mounted) {
+        setState(() {
+          _receivedText = text;
+          _manifestStatus = 'Text received.';
+          _saveStatus = 'Ready to copy.';
+        });
+      } else {
+        _receivedText = text;
+      }
+      return const TransferSaveResult(shouldSendReceipt: true);
+    }
+
+    if (manifest.packagingMode == packagingModeAlbum) {
+      final outcome = await _saveAlbumPayload(
+        bytes: bytes,
+        manifest: manifest,
+        destination: destination,
+        allowUserInteraction: false,
+      );
+      if (mounted) {
+        setState(() {
+          _manifestStatus =
+              'Album: ${manifest.albumItemCount ?? manifest.files.length} items';
+          _saveStatus =
+              outcome.success ? 'Album saved.' : 'Album saved with fallback.';
+        });
+      }
+      return TransferSaveResult(
+        shouldSendReceipt: outcome.success || outcome.localPath != null,
+        localPath: outcome.localPath,
+      );
+    }
+
+    _lastManifest = manifest;
+    _extractStatus = '';
+    _extractProgress = null;
+    if (manifest.packagingMode == packagingModeZip) {
+      _lastZipBytes = bytes;
+    } else {
+      _lastZipBytes = null;
+    }
+    final fileName = _suggestFileName(manifest);
+    final mime = _suggestMime(manifest);
+    final isMedia = isMediaManifest(manifest);
+    final outcome = await _saveService.saveBytes(
+      bytes: bytes,
+      name: fileName,
+      mime: mime,
+      isMedia: isMedia,
+      destination: destination,
+      allowUserInteraction: false,
+    );
+    _lastSavedPath = outcome.localPath;
+    _lastSaveIsMedia = isMedia;
+    _lastSavedMime = mime;
+    if (mounted) {
+      setState(() {
+        if (manifest.packagingMode == packagingModeZip) {
+          _manifestStatus = 'ZIP: ${manifest.outputFilename ?? fileName}';
+        } else if (manifest.files.isNotEmpty) {
+          _manifestStatus = 'File: ${manifest.files.first.relativePath}';
+        } else {
+          _manifestStatus = 'Downloaded ${bytes.length} bytes.';
+        }
+        _saveStatus = outcome.success ? 'Saved.' : 'Saved locally with fallback.';
+      });
+    }
+    return TransferSaveResult(
+      shouldSendReceipt: outcome.success || outcome.localPath != null,
+      localPath: outcome.localPath,
     );
   }
 
@@ -3090,6 +3649,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     await coordinator.resumePendingDownloads(
       resolve: _resolveDownloadResumeContext,
+      downloadPolicy: _downloadPolicy(),
     );
     await coordinator.resumePendingUploads(
       resolve: _resolveUploadResumeContext,
@@ -3192,16 +3752,6 @@ class _HomeScreenState extends State<HomeScreen> {
       isInitiator: isInitiator,
       iceMode: _alwaysRelay ? P2PIceMode.relay : P2PIceMode.direct,
     );
-  }
-
-  Future<bool> _areBackgroundServicesAvailable() async {
-    final resumeAvailable = await isBackgroundResumePluginAvailable();
-    final foregroundAvailable = await isForegroundServicePluginAvailable();
-    return resumeAvailable && foregroundAvailable;
-  }
-
-  Future<bool> _isBackgroundTransportAvailable() async {
-    return isBackgroundTransportPluginAvailable();
   }
 
   Future<void> _pingBackend() async {
@@ -3706,6 +4256,30 @@ class _HomeScreenState extends State<HomeScreen> {
         return;
       }
       final senderPublicKey = publicKeyFromBase64(senderPubKeyB64);
+      final preview = await coordinator.fetchManifest(
+        sessionId: sessionId,
+        transferToken: transferToken,
+        transferId: claim.transferId,
+        senderPublicKey: senderPublicKey,
+        receiverKeyPair: _receiverKeyPair!,
+        p2pContext: p2pContext,
+      );
+      if (preview == null) {
+        setState(() {
+          _manifestStatus = 'Manifest preview failed.';
+        });
+        return;
+      }
+      final approved = await _showTransferSummary(
+        manifest: preview,
+        claim: claim,
+      );
+      if (!approved) {
+        setState(() {
+          _manifestStatus = 'Receive cancelled.';
+        });
+        return;
+      }
       final result = await coordinator.downloadTransfer(
         sessionId: sessionId,
         transferToken: transferToken,
@@ -3714,10 +4288,21 @@ class _HomeScreenState extends State<HomeScreen> {
         receiverKeyPair: _receiverKeyPair!,
         sendReceipt: false,
         p2pContext: p2pContext,
+        downloadPolicy: _downloadPolicy(),
       );
       if (result == null) {
+        final pending = await _transferStore.load(claim.transferId);
+        if (!mounted) {
+          return;
+        }
         setState(() {
-          _manifestStatus = 'Download paused or failed.';
+          if (pending?.backgroundTaskId?.isNotEmpty == true) {
+            _manifestStatus = 'Download running in background.';
+          } else if (pending?.requiresForegroundResume == true) {
+            _manifestStatus = 'Download paused. Resume in foreground.';
+          } else {
+            _manifestStatus = 'Download paused or failed.';
+          }
         });
         return;
       }
@@ -4304,6 +4889,7 @@ class _HomeScreenState extends State<HomeScreen> {
     required Uint8List bytes,
     required TransferManifest manifest,
     required SaveDestination destination,
+    bool allowUserInteraction = true,
   }) async {
     final entries = decodeZipEntries(bytes);
     final fileMap = <String, TransferManifestFile>{};
@@ -4334,6 +4920,7 @@ class _HomeScreenState extends State<HomeScreen> {
         mime: mime,
         isMedia: true,
         destination: destination,
+        allowUserInteraction: allowUserInteraction,
       );
       if (_lastSavedPath == null && outcome.localPath != null) {
         _lastSavedPath = outcome.localPath;
@@ -4353,6 +4940,23 @@ class _HomeScreenState extends State<HomeScreen> {
     final manifest = _lastManifest;
     if (zipBytes == null || manifest == null) {
       return;
+    }
+    final safety = analyzeZipBytes(zipBytes);
+    if (safety.exceedsLimits) {
+      setState(() {
+        _extractStatus = safety.refusalMessage ??
+            'Archive exceeds extraction limits and will not be extracted.';
+      });
+      return;
+    }
+    if (safety.nearLimits) {
+      final proceed = await _confirmExtractionWarning();
+      if (!proceed) {
+        setState(() {
+          _extractStatus = 'Extraction cancelled.';
+        });
+        return;
+      }
     }
     setState(() {
       _extracting = true;
@@ -4393,6 +4997,35 @@ class _HomeScreenState extends State<HomeScreen> {
         _extracting = false;
       });
     }
+  }
+
+  Future<bool> _confirmExtractionWarning() async {
+    if (!mounted) {
+      return false;
+    }
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Extract anyway?'),
+          content: const Text(
+            'This archive is close to extraction limits. '
+            'Extracting it could take longer or fail.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Extract anyway'),
+            ),
+          ],
+        );
+      },
+    );
+    return result ?? false;
   }
 
   String _defaultPackageTitle() {
@@ -4513,7 +5146,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('UniversalDrop')),
+      appBar: AppBar(title: const Text('CipherLink')),
       body: Padding(
         padding: const EdgeInsets.all(24),
         child: Column(
@@ -4566,25 +5199,23 @@ class _HomeScreenState extends State<HomeScreen> {
             Text('Status: $_status'),
             const SizedBox(height: 24),
             const Text(
-              'Transport settings',
+              'Download settings',
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
             ),
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
-              title: const Text(
-                'Experimental: Foreground transfer notification (Android)',
-              ),
-              subtitle: const Text('Shows a notification during transfers'),
-              value: _enableBackgroundServices,
-              onChanged: (value) => _setBackgroundServicesEnabled(value),
+              title: const Text('Prefer background downloads'),
+              subtitle:
+                  const Text('Use background downloads for large transfers'),
+              value: _preferBackgroundDownloads,
+              onChanged: (value) => _setPreferBackgroundDownloads(value),
             ),
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
-              title: const Text('Experimental: Background transfers'),
-              subtitle:
-                  const Text('Use native background sessions when available'),
-              value: _enableExperimentalBackgroundTransport,
-              onChanged: (value) => _setExperimentalBackgroundTransport(value),
+              title: const Text('Show more details in notifications'),
+              subtitle: const Text('May include transfer details'),
+              value: _showNotificationDetails,
+              onChanged: (value) => _setNotificationDetails(value),
             ),
             const SizedBox(height: 16),
             ..._buildTrustedDevicesSection(),
@@ -4973,25 +5604,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   ],
                 ),
               ],
-              if (_lastManifest?.packagingMode == packagingModeZip &&
-                  _lastZipBytes != null) ...[
-                const SizedBox(height: 12),
-                ElevatedButton(
-                  onPressed: _extracting ? null : _extractZip,
-                  child:
-                      Text(_extracting ? 'Extracting...' : 'Extract ZIP'),
-                ),
-                if (_extractProgress != null) ...[
-                  const SizedBox(height: 8),
-                  Text(
-                    'Extracted ${_extractProgress!.filesExtracted}/${_extractProgress!.totalFiles} files',
-                  ),
-                ],
-                if (_extractStatus.isNotEmpty) ...[
-                  const SizedBox(height: 8),
-                  Text(_extractStatus),
-                ],
-              ],
+              ..._buildZipExtractionSection(),
             ],
           ],
         ),
@@ -5140,17 +5753,21 @@ import 'package:universaldrop_app/models/transfer_manifest.dart';
 import 'package:universaldrop_app/services/clipboard_service.dart';
 import 'package:universaldrop_app/services/destination_selector.dart';
 import 'package:universaldrop_app/services/key_store.dart';
+import 'package:universaldrop_app/limits.dart';
 import 'package:universaldrop_app/services/save_service.dart';
 import 'package:universaldrop_app/services/trust_store.dart';
 import 'package:universaldrop_app/services/zip_extract.dart';
 import 'package:universaldrop_app/transfer/crypto.dart';
 import 'package:universaldrop_app/transfer/packaging_builder.dart';
-import 'package:universaldrop_app/transfer/transfer_background.dart';
+import 'package:universaldrop_app/transfer/background_transfer.dart';
 import 'package:universaldrop_app/transfer/transfer_coordinator.dart';
+import 'package:universaldrop_app/transfer/transfer_summary.dart';
 import 'package:universaldrop_app/transfer/transfer_state_store.dart';
 import 'package:universaldrop_app/transfer/transport.dart';
 import 'package:universaldrop_app/ui/diagnostics_screen.dart';
+import 'package:universaldrop_app/ui/transfer_summary_screen.dart';
 import 'package:universaldrop_app/ui/trusted_device_badge.dart';
+import 'package:universaldrop_app/ui/zip_extraction_info.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({
@@ -5158,7 +5775,6 @@ class HomeScreen extends StatefulWidget {
     ClipboardService? clipboardService,
     this.saveService,
     this.destinationStore,
-    this.backgroundManager,
     this.onTransportSelected,
     this.runStartupTasks = true,
   }) : clipboardService = clipboardService ?? const SystemClipboardService();
@@ -5166,7 +5782,6 @@ class HomeScreen extends StatefulWidget {
   final ClipboardService clipboardService;
   final SaveService? saveService;
   final DestinationPreferenceStore? destinationStore;
-  final TransferBackgroundManager? backgroundManager;
   final void Function(Transport transport)? onTransportSelected;
   final bool runStartupTasks;
 
@@ -5174,7 +5789,7 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final TextEditingController _baseUrlController =
       TextEditingController(text: 'http://localhost:8080');
   String _status = 'Idle';
@@ -5192,7 +5807,8 @@ class _HomeScreenState extends State<HomeScreen> {
   late final SecureTransferStateStore _transferStore =
       SecureTransferStateStore();
   final SecureKeyPairStore _keyStore = SecureKeyPairStore();
-  late final TransferBackgroundManager _backgroundManager;
+  final BackgroundTransferApi _backgroundTransfer = BackgroundTransferApiImpl();
+  final DownloadTokenStore _downloadTokenStore = DownloadTokenStore();
   late final DestinationPreferenceStore _destinationStore;
   late final SaveService _saveService;
   late final DestinationSelector _destinationSelector;
@@ -5233,11 +5849,11 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _alwaysRelay = false;
   bool _p2pDisclosureShown = false;
   bool _experimentalDisclosureShown = false;
-  bool _enableBackgroundServices = false;
-  bool _backgroundServicesUnavailableShown = false;
-  bool _enableExperimentalBackgroundTransport = false;
-  bool _backgroundTransportFallbackShown = false;
+  bool _preferBackgroundDownloads = false;
+  bool _showNotificationDetails = false;
+  bool _isForeground = true;
   final Set<String> _trustedFingerprints = {};
+  final Map<String, String> _trustedNicknames = {};
   final Map<String, String> _receiverSasByClaim = {};
   final Set<String> _receiverSasConfirming = {};
 
@@ -5245,9 +5861,9 @@ class _HomeScreenState extends State<HomeScreen> {
   static const _p2pAlwaysRelayKey = 'p2pAlwaysRelay';
   static const _p2pDisclosureKey = 'p2pDirectDisclosureShown';
   static const _experimentalDisclosureKey = 'experimentalDisclosureShown';
-  static const _backgroundServicesKey = 'enableBackgroundServices';
-  static const _experimentalBackgroundTransportKey =
-      'enableExperimentalBackgroundTransport';
+  static const _preferBackgroundDownloadsKey = 'preferBackgroundDownloads';
+  static const _notificationDetailsKey =
+      'showNotificationDetailsInNotifications';
 
   final TextEditingController _qrPayloadController = TextEditingController();
   final TextEditingController _sessionIdController = TextEditingController();
@@ -5259,26 +5875,13 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
-    _backgroundManager = widget.backgroundManager ??
-        TransferBackgroundManager(
-          scheduler: FeatureFlaggedResumeScheduler(
-            scheduler: MethodChannelResumeScheduler(),
-            isEnabled: () => _enableBackgroundServices,
-            onUnavailable: _handleBackgroundServicesUnavailable,
-          ),
-          foregroundController: FeatureFlaggedForegroundController(
-            controller: MethodChannelForegroundController(),
-            isEnabled: () => _enableBackgroundServices,
-            onUnavailable: _handleBackgroundServicesUnavailable,
-          ),
-          onConnectivityRestored: () => _resumePendingTransfers(),
-        );
+    WidgetsBinding.instance.addObserver(this);
     _destinationStore =
         widget.destinationStore ?? SharedPreferencesDestinationStore();
     _saveService = widget.saveService ?? DefaultSaveService();
     _destinationSelector = DestinationSelector(_destinationStore);
+    _loadSettings();
     if (widget.runStartupTasks) {
-      _loadSettings();
       _resumePendingTransfers();
     }
   }
@@ -5294,8 +5897,23 @@ class _HomeScreenState extends State<HomeScreen> {
     _textContentController.dispose();
     _packageTitleController.dispose();
     _pollTimer?.cancel();
-    _backgroundManager.dispose();
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final isForeground = state == AppLifecycleState.resumed;
+    if (isForeground == _isForeground) {
+      return;
+    }
+    if (!mounted) {
+      _isForeground = isForeground;
+      return;
+    }
+    setState(() {
+      _isForeground = isForeground;
+    });
   }
 
   Future<void> _loadSettings() async {
@@ -5305,10 +5923,10 @@ class _HomeScreenState extends State<HomeScreen> {
     final disclosureShown = prefs.getBool(_p2pDisclosureKey) ?? false;
     final experimentalDisclosureShown =
         prefs.getBool(_experimentalDisclosureKey) ?? false;
-    final enableBackgroundServices =
-        prefs.getBool(_backgroundServicesKey) ?? false;
-    final enableBackground =
-        prefs.getBool(_experimentalBackgroundTransportKey) ?? false;
+    final preferBackgroundDownloads =
+        prefs.getBool(_preferBackgroundDownloadsKey) ?? false;
+    final showNotificationDetails =
+        prefs.getBool(_notificationDetailsKey) ?? false;
     final trustedFingerprints = await _trustStore.loadFingerprints();
     if (!mounted) {
       return;
@@ -5318,32 +5936,12 @@ class _HomeScreenState extends State<HomeScreen> {
       _alwaysRelay = alwaysRelay;
       _p2pDisclosureShown = disclosureShown;
       _experimentalDisclosureShown = experimentalDisclosureShown;
-      _enableBackgroundServices = enableBackgroundServices;
-      _enableExperimentalBackgroundTransport = enableBackground;
+      _preferBackgroundDownloads = preferBackgroundDownloads;
+      _showNotificationDetails = showNotificationDetails;
       _trustedFingerprints
         ..clear()
         ..addAll(trustedFingerprints);
     });
-    if (_enableBackgroundServices) {
-      final available = await _areBackgroundServicesAvailable();
-      if (!available && mounted) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) {
-            _handleBackgroundServicesUnavailable();
-          }
-        });
-      }
-    }
-    if (_enableExperimentalBackgroundTransport) {
-      final available = await _isBackgroundTransportAvailable();
-      if (!available && mounted) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) {
-            _handleBackgroundTransportUnavailable();
-          }
-        });
-      }
-    }
   }
 
   Future<void> _persistP2PSettings() async {
@@ -5375,45 +5973,23 @@ class _HomeScreenState extends State<HomeScreen> {
     await _persistP2PSettings();
   }
 
-  Future<void> _setBackgroundServicesEnabled(bool value) async {
+  Future<void> _setPreferBackgroundDownloads(bool value) async {
     if (value) {
       await _maybeShowExperimentalDisclosure();
-      final available = await _areBackgroundServicesAvailable();
-      if (!available) {
-        _handleBackgroundServicesUnavailable();
-        return;
-      }
     }
     setState(() {
-      _enableBackgroundServices = value;
-      if (value) {
-        _backgroundServicesUnavailableShown = false;
-      }
+      _preferBackgroundDownloads = value;
     });
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_backgroundServicesKey, value);
+    await prefs.setBool(_preferBackgroundDownloadsKey, value);
   }
 
-  Future<void> _setExperimentalBackgroundTransport(bool value) async {
-    if (value) {
-      await _maybeShowExperimentalDisclosure();
-      final available = await _isBackgroundTransportAvailable();
-      if (!available) {
-        _handleBackgroundTransportUnavailable();
-        _ensureCoordinator();
-        return;
-      }
-    }
+  Future<void> _setNotificationDetails(bool value) async {
     setState(() {
-      _enableExperimentalBackgroundTransport = value;
-      if (value) {
-        _backgroundTransportFallbackShown = false;
-      }
+      _showNotificationDetails = value;
     });
-    _coordinator = null;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_experimentalBackgroundTransportKey, value);
-    _ensureCoordinator();
+    await prefs.setBool(_notificationDetailsKey, value);
   }
 
   Future<void> _maybeShowDirectDisclosure() async {
@@ -5482,6 +6058,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _addTrustedFingerprint(String fingerprint) async {
     final updated = await _trustStore.addFingerprint(fingerprint);
+    final nicknames = await _trustStore.loadNicknames();
     if (!mounted) {
       return;
     }
@@ -5489,11 +6066,15 @@ class _HomeScreenState extends State<HomeScreen> {
       _trustedFingerprints
         ..clear()
         ..addAll(updated);
+      _trustedNicknames
+        ..clear()
+        ..addAll(nicknames);
     });
   }
 
   Future<void> _removeTrustedFingerprint(String fingerprint) async {
     final updated = await _trustStore.removeFingerprint(fingerprint);
+    final nicknames = await _trustStore.loadNicknames();
     if (!mounted) {
       return;
     }
@@ -5501,6 +6082,9 @@ class _HomeScreenState extends State<HomeScreen> {
       _trustedFingerprints
         ..clear()
         ..addAll(updated);
+      _trustedNicknames
+        ..clear()
+        ..addAll(nicknames);
     });
   }
 
@@ -5521,6 +6105,11 @@ class _HomeScreenState extends State<HomeScreen> {
           style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
         ),
         SizedBox(height: 8),
+        Text(
+          'Trusted means you\'ve verified SAS with this device before. '
+          'Always verify SAS if unsure.',
+        ),
+        SizedBox(height: 8),
         Text('No trusted devices yet.'),
       ];
     }
@@ -5530,60 +6119,38 @@ class _HomeScreenState extends State<HomeScreen> {
         style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
       ),
       const SizedBox(height: 8),
+      const Text(
+        'Trusted means you\'ve verified SAS with this device before. '
+        'Always verify SAS if unsure.',
+      ),
+      const SizedBox(height: 8),
       ...entries.map((fingerprint) {
+        final nickname = _trustedNicknames[fingerprint];
+        final hasNickname = nickname != null && nickname.trim().isNotEmpty;
         return ListTile(
           contentPadding: EdgeInsets.zero,
-          title: Text(_formatFingerprint(fingerprint)),
-          trailing: IconButton(
-            tooltip: 'Remove',
-            icon: const Icon(Icons.delete_outline),
-            onPressed: () {
-              _removeTrustedFingerprint(fingerprint);
-            },
+          title: Text(
+            hasNickname ? nickname : _formatFingerprint(fingerprint),
+          ),
+          subtitle: hasNickname ? Text(_formatFingerprint(fingerprint)) : null,
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                tooltip: 'Edit nickname',
+                icon: const Icon(Icons.edit_outlined),
+                onPressed: () => _promptTrustedNickname(fingerprint),
+              ),
+              IconButton(
+                tooltip: 'Revoke trust',
+                icon: const Icon(Icons.delete_outline),
+                onPressed: () => _removeTrustedFingerprint(fingerprint),
+              ),
+            ],
           ),
         );
       }),
     ];
-  }
-
-  void _handleBackgroundTransportUnavailable() {
-    if (_backgroundTransportFallbackShown || !mounted) {
-      return;
-    }
-    _backgroundTransportFallbackShown = true;
-    setState(() {
-      _enableExperimentalBackgroundTransport = false;
-    });
-    SharedPreferences.getInstance().then((prefs) {
-      prefs.setBool(_experimentalBackgroundTransportKey, false);
-    });
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text(
-          'Background transfers unavailable; using standard mode.',
-        ),
-      ),
-    );
-  }
-
-  void _handleBackgroundServicesUnavailable() {
-    if (_backgroundServicesUnavailableShown || !mounted) {
-      return;
-    }
-    _backgroundServicesUnavailableShown = true;
-    setState(() {
-      _enableBackgroundServices = false;
-    });
-    SharedPreferences.getInstance().then((prefs) {
-      prefs.setBool(_backgroundServicesKey, false);
-    });
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text(
-          'Foreground transfer notification unavailable; using standard mode.',
-        ),
-      ),
-    );
   }
 
   void _openDiagnostics() {
@@ -5601,18 +6168,11 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     final baseUri = Uri.parse(baseUrl);
-    final httpTransport = HttpTransport(baseUri);
-    Transport transport = httpTransport;
-    if (_enableExperimentalBackgroundTransport) {
-      transport = OptionalBackgroundTransport(
-        backgroundTransport: BackgroundUrlSessionTransport(baseUri),
-        fallbackTransport: httpTransport,
-        onFallback: _handleBackgroundTransportUnavailable,
-      );
-    }
+    final transport = HttpTransport(baseUri);
     widget.onTransportSelected?.call(transport);
     _coordinator = TransferCoordinator(
       transport: transport,
+      baseUri: baseUri,
       p2pTransportFactory: (context) => P2PTransport(
         baseUri: baseUri,
         context: context,
@@ -5629,7 +6189,176 @@ class _HomeScreenState extends State<HomeScreen> {
           _scanStatus = status;
         });
       },
-      backgroundHooks: _backgroundManager,
+      backgroundTransfer: _backgroundTransfer,
+      downloadTokenStore: _downloadTokenStore,
+      saveHandler: _handleTransferSave,
+      downloadResolver: _resolveDownloadResumeContext,
+    );
+  }
+
+  TransferDownloadPolicy _downloadPolicy() {
+    return TransferDownloadPolicy(
+      preferBackground: _preferBackgroundDownloads,
+      showNotificationDetails: _showNotificationDetails,
+      destinationResolver: _resolveBackgroundDestination,
+      isAppInForeground: () => _isForeground,
+    );
+  }
+
+  Future<bool> _showTransferSummary({
+    required TransferManifest manifest,
+    required PendingClaim claim,
+  }) async {
+    if (!mounted) {
+      return false;
+    }
+    final summary = buildTransferSummary(manifest);
+    final result = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) => TransferSummaryScreen(
+          summary: summary,
+          manifest: manifest,
+          routeLabel: _routeLabelForClaim(claim),
+          routeDisclosure: _routeDisclosureForClaim(claim),
+        ),
+      ),
+    );
+    return result ?? false;
+  }
+
+  String _routeLabelForClaim(PendingClaim claim) {
+    return _isDirectP2P(claim) ? 'Direct P2P' : 'Relay';
+  }
+
+  String _routeDisclosureForClaim(PendingClaim claim) {
+    if (_isDirectP2P(claim)) {
+      return 'Direct P2P may expose your IP address to the sender.';
+    }
+    return 'Relay keeps your IP address hidden from the sender.';
+  }
+
+  bool _isDirectP2P(PendingClaim claim) {
+    final p2pToken = _p2pTokensByClaim[claim.claimId] ?? '';
+    return _preferDirect && !_alwaysRelay && p2pToken.isNotEmpty;
+  }
+
+  Future<SaveDestination?> _resolveBackgroundDestination(
+    TransferManifest manifest,
+    bool allowPrompt,
+  ) async {
+    if (allowPrompt && mounted) {
+      final defaultDestination =
+          await _destinationSelector.defaultDestination(manifest);
+      final choice = await _showDestinationSelector(
+        defaultDestination,
+        isMediaManifest(manifest),
+      );
+      if (choice == null) {
+        return null;
+      }
+      await _destinationSelector.rememberChoice(manifest, choice);
+      return choice.destination;
+    }
+    final prefs = await _destinationStore.load();
+    if (isMediaManifest(manifest)) {
+      return prefs.defaultMediaDestination ?? SaveDestination.files;
+    }
+    return prefs.defaultFileDestination ?? SaveDestination.files;
+  }
+
+  SaveDestination? _destinationFromState(String? value) {
+    if (value == null || value.isEmpty) {
+      return null;
+    }
+    for (final destination in SaveDestination.values) {
+      if (destination.name == value) {
+        return destination;
+      }
+    }
+    return null;
+  }
+
+  Future<TransferSaveResult> _handleTransferSave(
+    TransferManifest manifest,
+    Uint8List bytes,
+    TransferState state,
+  ) async {
+    final destination = _destinationFromState(state.destination) ??
+        await _resolveBackgroundDestination(manifest, false) ??
+        SaveDestination.files;
+
+    if (manifest.payloadKind == payloadKindText) {
+      final text = utf8.decode(bytes);
+      if (mounted) {
+        setState(() {
+          _receivedText = text;
+          _manifestStatus = 'Text received.';
+          _saveStatus = 'Ready to copy.';
+        });
+      } else {
+        _receivedText = text;
+      }
+      return const TransferSaveResult(shouldSendReceipt: true);
+    }
+
+    if (manifest.packagingMode == packagingModeAlbum) {
+      final outcome = await _saveAlbumPayload(
+        bytes: bytes,
+        manifest: manifest,
+        destination: destination,
+        allowUserInteraction: false,
+      );
+      if (mounted) {
+        setState(() {
+          _manifestStatus =
+              'Album: ${manifest.albumItemCount ?? manifest.files.length} items';
+          _saveStatus =
+              outcome.success ? 'Album saved.' : 'Album saved with fallback.';
+        });
+      }
+      return TransferSaveResult(
+        shouldSendReceipt: outcome.success || outcome.localPath != null,
+        localPath: outcome.localPath,
+      );
+    }
+
+    _lastManifest = manifest;
+    _extractStatus = '';
+    _extractProgress = null;
+    if (manifest.packagingMode == packagingModeZip) {
+      _lastZipBytes = bytes;
+    } else {
+      _lastZipBytes = null;
+    }
+    final fileName = _suggestFileName(manifest);
+    final mime = _suggestMime(manifest);
+    final isMedia = isMediaManifest(manifest);
+    final outcome = await _saveService.saveBytes(
+      bytes: bytes,
+      name: fileName,
+      mime: mime,
+      isMedia: isMedia,
+      destination: destination,
+      allowUserInteraction: false,
+    );
+    _lastSavedPath = outcome.localPath;
+    _lastSaveIsMedia = isMedia;
+    _lastSavedMime = mime;
+    if (mounted) {
+      setState(() {
+        if (manifest.packagingMode == packagingModeZip) {
+          _manifestStatus = 'ZIP: ${manifest.outputFilename ?? fileName}';
+        } else if (manifest.files.isNotEmpty) {
+          _manifestStatus = 'File: ${manifest.files.first.relativePath}';
+        } else {
+          _manifestStatus = 'Downloaded ${bytes.length} bytes.';
+        }
+        _saveStatus = outcome.success ? 'Saved.' : 'Saved locally with fallback.';
+      });
+    }
+    return TransferSaveResult(
+      shouldSendReceipt: outcome.success || outcome.localPath != null,
+      localPath: outcome.localPath,
     );
   }
 
@@ -5641,6 +6370,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     await coordinator.resumePendingDownloads(
       resolve: _resolveDownloadResumeContext,
+      downloadPolicy: _downloadPolicy(),
     );
     await coordinator.resumePendingUploads(
       resolve: _resolveUploadResumeContext,
@@ -5743,16 +6473,6 @@ class _HomeScreenState extends State<HomeScreen> {
       isInitiator: isInitiator,
       iceMode: _alwaysRelay ? P2PIceMode.relay : P2PIceMode.direct,
     );
-  }
-
-  Future<bool> _areBackgroundServicesAvailable() async {
-    final resumeAvailable = await isBackgroundResumePluginAvailable();
-    final foregroundAvailable = await isForegroundServicePluginAvailable();
-    return resumeAvailable && foregroundAvailable;
-  }
-
-  Future<bool> _isBackgroundTransportAvailable() async {
-    return isBackgroundTransportPluginAvailable();
   }
 
   Future<void> _pingBackend() async {
@@ -6169,65 +6889,119 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _downloadManifest(PendingClaim claim) async {
-    final response = _sessionResponse;
-    if (response == null) {
-      return;
-    }
+    final baseUrl = _baseUrlController.text.trim();
+    final sessionId = _sessionResponse?.sessionId ?? '';
     final transferToken = _transferTokensByClaim[claim.claimId] ?? '';
     final senderPubKeyB64 = _senderPubKeysByClaim[claim.claimId] ?? '';
-    if (transferToken.isEmpty || senderPubKeyB64.isEmpty) {
+    if (baseUrl.isEmpty || sessionId.isEmpty) {
+      setState(() {
+        _manifestStatus = 'Create a session first.';
+      });
       return;
     }
-    if (response.sessionId.isEmpty || claim.transferId.isEmpty) {
+    if (claim.transferId.isEmpty) {
+      setState(() {
+        _manifestStatus = 'No transfer ID yet.';
+      });
       return;
     }
-    final senderPubKey = publicKeyFromBase64(senderPubKeyB64);
-    final receiverKeyPair = _receiverKeyPair;
-    if (receiverKeyPair == null) {
+    if (transferToken.isEmpty ||
+        senderPubKeyB64.isEmpty ||
+        _receiverKeyPair == null) {
+      setState(() {
+        _manifestStatus = 'Missing auth context or keys.';
+      });
       return;
     }
+    if (_preferDirect) {
+      await _maybeShowDirectDisclosure();
+    }
+    final p2pToken = _p2pTokensByClaim[claim.claimId] ?? transferToken;
+    final p2pContext = _buildP2PContext(
+      sessionId: sessionId,
+      claimId: claim.claimId,
+      token: p2pToken,
+      isInitiator: false,
+    );
+    setState(() {
+      _manifestStatus = 'Downloading manifest...';
+    });
     try {
       _ensureCoordinator();
       final coordinator = _coordinator;
       if (coordinator == null) {
+        setState(() {
+          _manifestStatus = 'Invalid base URL.';
+        });
         return;
       }
-      final p2pToken = _p2pTokensByClaim[claim.claimId] ?? transferToken;
-      final p2pContext = _buildP2PContext(
-        sessionId: response.sessionId,
-        claimId: claim.claimId,
-        token: p2pToken,
-        isInitiator: false,
-      );
-      final scanChoice = await _promptScanChoice();
-      if (scanChoice == null || scanChoice == false) {
-        return;
-      }
-      final result = await coordinator.download(
-        sessionId: response.sessionId,
+      final senderPublicKey = publicKeyFromBase64(senderPubKeyB64);
+      final preview = await coordinator.fetchManifest(
+        sessionId: sessionId,
         transferToken: transferToken,
         transferId: claim.transferId,
-        senderPublicKey: senderPubKey,
-        receiverKeyPair: receiverKeyPair,
-        chunkSize: 16 * 1024,
+        senderPublicKey: senderPublicKey,
+        receiverKeyPair: _receiverKeyPair!,
         p2pContext: p2pContext,
       );
-      if (result == null) {
+      if (preview == null) {
+        setState(() {
+          _manifestStatus = 'Manifest preview failed.';
+        });
         return;
       }
-      final manifest = TransferManifest.fromJson(
-        jsonDecode(utf8.decode(result.bytes)) as Map<String, dynamic>,
+      final approved = await _showTransferSummary(
+        manifest: preview,
+        claim: claim,
       );
+      if (!approved) {
+        setState(() {
+          _manifestStatus = 'Receive cancelled.';
+        });
+        return;
+      }
+      final result = await coordinator.downloadTransfer(
+        sessionId: sessionId,
+        transferToken: transferToken,
+        transferId: claim.transferId,
+        senderPublicKey: senderPublicKey,
+        receiverKeyPair: _receiverKeyPair!,
+        sendReceipt: false,
+        p2pContext: p2pContext,
+        downloadPolicy: _downloadPolicy(),
+      );
+      if (result == null) {
+        final pending = await _transferStore.load(claim.transferId);
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          if (pending?.backgroundTaskId?.isNotEmpty == true) {
+            _manifestStatus = 'Download running in background.';
+          } else if (pending?.requiresForegroundResume == true) {
+            _manifestStatus = 'Download paused. Resume in foreground.';
+          } else {
+            _manifestStatus = 'Download paused or failed.';
+          }
+        });
+        return;
+      }
+      final manifest = result.manifest;
       _lastManifest = manifest;
+      _extractStatus = '';
+      _extractProgress = null;
+      if (manifest.packagingMode != packagingModeZip) {
+        _lastZipBytes = null;
+      }
       if (manifest.payloadKind == payloadKindText) {
-        final text = utf8.decode(result.payload);
+        final text = utf8.decode(result.bytes);
         setState(() {
           _receivedText = text;
           _manifestStatus = 'Text received.';
           _saveStatus = 'Ready to copy.';
         });
         await coordinator.sendReceipt(
-          sessionId: response.sessionId,
+          sessionId: sessionId,
           transferId: result.transferId,
           transferToken: transferToken,
         );
@@ -6262,7 +7036,7 @@ class _HomeScreenState extends State<HomeScreen> {
         });
         if (outcome.success || outcome.localPath != null) {
           await coordinator.sendReceipt(
-            sessionId: response.sessionId,
+            sessionId: sessionId,
             transferId: result.transferId,
             transferToken: transferToken,
           );
@@ -6299,7 +7073,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
       if (outcome.success || outcome.localPath != null) {
         await coordinator.sendReceipt(
-          sessionId: response.sessionId,
+          sessionId: sessionId,
           transferId: result.transferId,
           transferToken: transferToken,
         );
@@ -6574,6 +7348,7 @@ class _HomeScreenState extends State<HomeScreen> {
     required Uint8List bytes,
     required TransferManifest manifest,
     required SaveDestination destination,
+    bool allowUserInteraction = true,
   }) async {
     final entries = decodeZipEntries(bytes);
     final fileMap = <String, TransferManifestFile>{};
@@ -6604,6 +7379,7 @@ class _HomeScreenState extends State<HomeScreen> {
         mime: mime,
         isMedia: true,
         destination: destination,
+        allowUserInteraction: allowUserInteraction,
       );
       if (_lastSavedPath == null && outcome.localPath != null) {
         _lastSavedPath = outcome.localPath;
@@ -6623,6 +7399,23 @@ class _HomeScreenState extends State<HomeScreen> {
     final manifest = _lastManifest;
     if (zipBytes == null || manifest == null) {
       return;
+    }
+    final safety = analyzeZipBytes(zipBytes);
+    if (safety.exceedsLimits) {
+      setState(() {
+        _extractStatus = safety.refusalMessage ??
+            'Archive exceeds extraction limits and will not be extracted.';
+      });
+      return;
+    }
+    if (safety.nearLimits) {
+      final proceed = await _confirmExtractionWarning();
+      if (!proceed) {
+        setState(() {
+          _extractStatus = 'Extraction cancelled.';
+        });
+        return;
+      }
     }
     setState(() {
       _extracting = true;
@@ -6663,6 +7456,35 @@ class _HomeScreenState extends State<HomeScreen> {
         _extracting = false;
       });
     }
+  }
+
+  Future<bool> _confirmExtractionWarning() async {
+    if (!mounted) {
+      return false;
+    }
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Extract anyway?'),
+          content: const Text(
+            'This archive is close to extraction limits. '
+            'Extracting it could take longer or fail.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Extract anyway'),
+            ),
+          ],
+        );
+      },
+    );
+    return result ?? false;
   }
 
   String _defaultPackageTitle() {
@@ -7001,7 +7823,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('UniversalDrop')),
+      appBar: AppBar(title: const Text('CipherLink')),
       body: Padding(
         padding: const EdgeInsets.all(24),
         child: ListView(
@@ -7053,25 +7875,23 @@ class _HomeScreenState extends State<HomeScreen> {
             Text('Status: $_status'),
             const SizedBox(height: 24),
             const Text(
-              'Transport settings',
+              'Download settings',
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
             ),
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
-              title: const Text(
-                'Experimental: Foreground transfer notification (Android)',
-              ),
-              subtitle: const Text('Shows a notification during transfers'),
-              value: _enableBackgroundServices,
-              onChanged: (value) => _setBackgroundServicesEnabled(value),
+              title: const Text('Prefer background downloads'),
+              subtitle:
+                  const Text('Use background downloads for large transfers'),
+              value: _preferBackgroundDownloads,
+              onChanged: (value) => _setPreferBackgroundDownloads(value),
             ),
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
-              title: const Text('Experimental: Background transfers'),
-              subtitle:
-                  const Text('Use native background sessions when available'),
-              value: _enableExperimentalBackgroundTransport,
-              onChanged: (value) => _setExperimentalBackgroundTransport(value),
+              title: const Text('Show more details in notifications'),
+              subtitle: const Text('May include transfer details'),
+              value: _showNotificationDetails,
+              onChanged: (value) => _setNotificationDetails(value),
             ),
             const SizedBox(height: 16),
             ..._buildTrustedDevicesSection(),
@@ -7475,25 +8295,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   ],
                 ),
               ],
-              if (_lastManifest?.packagingMode == packagingModeZip &&
-                  _lastZipBytes != null) ...[
-                const SizedBox(height: 12),
-                ElevatedButton(
-                  onPressed: _extracting ? null : _extractZip,
-                  child:
-                      Text(_extracting ? 'Extracting...' : 'Extract ZIP'),
-                ),
-                if (_extractProgress != null) ...[
-                  const SizedBox(height: 8),
-                  Text(
-                    'Extracted ${_extractProgress!.filesExtracted}/${_extractProgress!.totalFiles} files',
-                  ),
-                ],
-                if (_extractStatus.isNotEmpty) ...[
-                  const SizedBox(height: 8),
-                  Text(_extractStatus),
-                ],
-              ],
+              ..._buildZipExtractionSection(),
             ],
           ],
         ),

@@ -42,3 +42,17 @@
 4. Deny Photos permission and verify:
    - The app saves to private storage.
    - **Export to Files/Share** is available to move the file out.
+
+## Background download resume (Android + iOS)
+
+1. Receiver: enable **Prefer background downloads** (leave **Show more details in notifications** OFF).
+2. Sender: send a large file (>= 8MB) to trigger background download.
+3. Receiver: accept the transfer and observe the background notification:
+   - Text should read “Receiving transfer…” / “Download in progress”.
+   - No filename or sender label should appear by default.
+4. Android: background the app, then force-stop/kill it. Confirm the download continues via the notification.
+5. iOS: background the app, then swipe it away. Confirm the download continues.
+6. Reopen the app after completion:
+   - Decrypt+save should complete automatically.
+   - Receipt should be sent (transfer removed from backend).
+7. Optional: enable **Show more details in notifications** and repeat step 3 to confirm details appear only with opt-in.

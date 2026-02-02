@@ -1,11 +1,10 @@
 import 'dart:async';
 
+import 'package:background_downloader/background_downloader.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:photo_manager/photo_manager.dart';
 
-import 'package:universaldrop_app/transport.dart';
-import 'package:universaldrop_app/transfer_background.dart';
 import 'package:universaldrop_app/transfer_state_store.dart';
 
 class DiagnosticsScreen extends StatefulWidget {
@@ -24,8 +23,7 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
   String _secureStorageStatus = 'checking...';
   String _connectivityStatus = 'checking...';
   String _connectivityStreamStatus = 'listening';
-  String _backgroundPluginStatus = 'checking...';
-  String _foregroundPluginStatus = 'checking...';
+  String _backgroundDownloaderStatus = 'checking...';
   String _photosPermissionStatus = 'checking...';
   StreamSubscription<ConnectivityResult>? _connectivitySubscription;
 
@@ -45,8 +43,7 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
     await Future.wait([
       _checkSecureStorage(),
       _checkConnectivity(),
-      _checkBackgroundPlugin(),
-      _checkForegroundPlugin(),
+      _checkBackgroundDownloader(),
       _checkPhotosPermission(),
     ]);
   }
@@ -115,40 +112,21 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
     });
   }
 
-  Future<void> _checkBackgroundPlugin() async {
+  Future<void> _checkBackgroundDownloader() async {
     try {
-      final available = await isBackgroundResumePluginAvailable();
+      await FileDownloader().ready;
       if (!mounted) {
         return;
       }
       setState(() {
-        _backgroundPluginStatus = available ? 'true' : 'false';
+        _backgroundDownloaderStatus = 'true';
       });
     } catch (_) {
       if (!mounted) {
         return;
       }
       setState(() {
-        _backgroundPluginStatus = 'false';
-      });
-    }
-  }
-
-  Future<void> _checkForegroundPlugin() async {
-    try {
-      final available = await isForegroundServicePluginAvailable();
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _foregroundPluginStatus = available ? 'true' : 'false';
-      });
-    } catch (_) {
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _foregroundPluginStatus = 'false';
+        _backgroundDownloaderStatus = 'false';
       });
     }
   }
@@ -233,13 +211,8 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
           ),
           ListTile(
             contentPadding: EdgeInsets.zero,
-            title: const Text('Background plugin available'),
-            subtitle: Text(_backgroundPluginStatus),
-          ),
-          ListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Foreground plugin available'),
-            subtitle: Text(_foregroundPluginStatus),
+            title: const Text('Background downloader ready'),
+            subtitle: Text(_backgroundDownloaderStatus),
           ),
           ListTile(
             contentPadding: EdgeInsets.zero,

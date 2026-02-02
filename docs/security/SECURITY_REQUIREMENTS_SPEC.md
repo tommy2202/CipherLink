@@ -39,6 +39,11 @@ All items use RFC 2119 language.
 - R-MUST-16 (T13): Bandwidth caps MUST apply per transfer and globally when configured.
 - R-MUST-17 (T14): Download tokens MUST be short-lived and single-use.
 - R-MUST-18 (T9): Metrics MUST be privacy-safe counters only (no labels or filenames).
+- R-MUST-19 (T1): Background downloads MUST fetch ciphertext only and store it in app-private storage.
+- R-MUST-20 (T6): Receipts MUST only be sent after successful decrypt+save; background resume MUST NOT extend retention beyond TTL.
+- R-MUST-21 (T14): Download token refresh failures MUST pause and require foreground resume (fail closed).
+- R-MUST-22 (T9): Background notifications MUST be privacy-safe by default; details require user opt-in.
+- R-MUST-23 (T9): Background saves to Photos/Gallery MUST avoid prompts and fall back to app storage if permission is not already granted.
 
 ## SHOULD Requirements
 

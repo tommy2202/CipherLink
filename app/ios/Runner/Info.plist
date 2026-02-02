@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Universaldrop App</string>
+	<string>CipherLink</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -13,11 +13,11 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>universaldrop_app</string>
+	<string>CipherLink</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>UniversalDrop needs access to save received photos and videos to your Photos library.</string>
+	<string>CipherLink needs access to save received photos and videos to your Photos library.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>UniversalDrop needs access to select and save photos.</string>
+	<string>CipherLink needs access to select and save photos.</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -47,6 +47,11 @@
 	</array>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>fetch</string>
+		<string>processing</string>
+	</array>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 </dict>
