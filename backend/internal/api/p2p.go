@@ -166,7 +166,7 @@ func (s *Server) handleP2PIceConfig(w http.ResponseWriter, r *http.Request) {
 	if mode == "relay" {
 		ttl := s.turnCredentialTTL()
 		identity := sessionID + ":" + claimID
-		if !s.quotas.AllowRelay(identity, s.cfg.RelayPerIdentityPerDay, s.cfg.RelayConcurrentPerIdentity, ttl) {
+		if !s.quotas.AllowRelay(identity, s.cfg.Quotas.RelayPerIdentityPerDay, s.cfg.Quotas.RelayConcurrentPerIdentity, ttl) {
 			logging.Allowlist(s.logger, map[string]string{
 				"event":           "quota_blocked",
 				"scope":           "relay_issue",
@@ -194,6 +194,9 @@ func (s *Server) handleP2PIceConfig(w http.ResponseWriter, r *http.Request) {
 		response.TURNURLs = nil
 	}
 
+	if mode == "relay" {
+		s.metrics.IncRelayIceConfigIssued()
+	}
 	writeJSON(w, http.StatusOK, response)
 }
 

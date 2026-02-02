@@ -183,7 +183,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip := clientIP(r)
-	if !s.quotas.AllowSession(ip, "", s.cfg.QuotaSessionsPerDayIP, s.cfg.QuotaSessionsPerDaySession) {
+	if !s.quotas.AllowSession(ip, "", s.cfg.Quotas.SessionsPerDayIP, s.cfg.Quotas.SessionsPerDaySession) {
 		logging.Allowlist(s.logger, map[string]string{
 			"event":   "quota_blocked",
 			"scope":   "session_create",
@@ -244,6 +244,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		"event":           "session_created",
 		"session_id_hash": anonHash(session.ID),
 	})
+	s.metrics.IncSessionsCreated()
 
 	writeJSON(w, http.StatusOK, sessionCreateResponse{
 		SessionID:         session.ID,
@@ -757,10 +758,10 @@ func (s *Server) handleInitTransfer(w http.ResponseWriter, r *http.Request) {
 		transferID,
 		ip,
 		session.ID,
-		s.cfg.QuotaTransfersPerDayIP,
-		s.cfg.QuotaTransfersPerDaySession,
-		s.cfg.QuotaConcurrentTransfersIP,
-		s.cfg.QuotaConcurrentTransfersSession,
+		s.cfg.Quotas.TransfersPerDayIP,
+		s.cfg.Quotas.TransfersPerDaySession,
+		s.cfg.Quotas.ConcurrentTransfersIP,
+		s.cfg.Quotas.ConcurrentTransfersSession,
 	) {
 		_ = s.transfers.DeleteOnReceipt(r.Context(), transferID)
 		logging.Allowlist(s.logger, map[string]string{
@@ -781,6 +782,7 @@ func (s *Server) handleInitTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.metrics.IncTransfersStarted()
 	writeJSON(w, http.StatusOK, transferInitResponse{TransferID: transferID})
 }
 
@@ -817,7 +819,7 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 		writeIndistinguishable(w)
 		return
 	}
-	if !s.quotas.AddBytes(ip, session.ID, int64(len(data)), s.cfg.QuotaBytesPerDayIP, s.cfg.QuotaBytesPerDaySession) {
+	if !s.quotas.AddBytes(ip, session.ID, int64(len(data)), s.cfg.Quotas.BytesPerDayIP, s.cfg.Quotas.BytesPerDaySession) {
 		logging.Allowlist(s.logger, map[string]string{
 			"event":            "quota_blocked",
 			"scope":            "upload_bytes",
@@ -990,7 +992,7 @@ func (s *Server) handleDownloadTransfer(w http.ResponseWriter, r *http.Request) 
 		writeIndistinguishable(w)
 		return
 	}
-	if !s.quotas.AddBytes(ip, session.ID, int64(len(data)), s.cfg.QuotaBytesPerDayIP, s.cfg.QuotaBytesPerDaySession) {
+	if !s.quotas.AddBytes(ip, session.ID, int64(len(data)), s.cfg.Quotas.BytesPerDayIP, s.cfg.Quotas.BytesPerDaySession) {
 		logging.Allowlist(s.logger, map[string]string{
 			"event":            "quota_blocked",
 			"scope":            "download_bytes",
@@ -1058,6 +1060,7 @@ func (s *Server) handleTransferReceipt(w http.ResponseWriter, r *http.Request) {
 	}
 	s.quotas.EndTransfer(req.TransferID)
 	s.throttles.ForgetTransfer(req.TransferID)
+	s.metrics.IncTransfersCompleted()
 
 	logging.Allowlist(s.logger, map[string]string{
 		"event":            "transfer_receipt",
@@ -1152,7 +1155,7 @@ func (s *Server) handleScanChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip := clientIP(r)
-	if !s.quotas.AddBytes(ip, scanSession.SessionID, int64(len(data)), s.cfg.QuotaBytesPerDayIP, s.cfg.QuotaBytesPerDaySession) {
+	if !s.quotas.AddBytes(ip, scanSession.SessionID, int64(len(data)), s.cfg.Quotas.BytesPerDayIP, s.cfg.Quotas.BytesPerDaySession) {
 		logging.Allowlist(s.logger, map[string]string{
 			"event":           "quota_blocked",
 			"scope":           "scan_bytes",

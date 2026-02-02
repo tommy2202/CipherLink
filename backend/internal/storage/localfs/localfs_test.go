@@ -51,11 +51,11 @@ func TestSweepExpiredRemovesSessionsAndTransfers(t *testing.T) {
 		t.Fatalf("write chunk: %v", err)
 	}
 
-	count, err := store.SweepExpired(context.Background(), now)
+	result, err := store.SweepExpired(context.Background(), now)
 	if err != nil {
 		t.Fatalf("sweep expired: %v", err)
 	}
-	if count == 0 {
+	if result.Total() == 0 {
 		t.Fatalf("expected sweep to delete entries")
 	}
 

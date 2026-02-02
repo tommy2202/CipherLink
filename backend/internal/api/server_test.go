@@ -92,7 +92,7 @@ func TestReadyzReportsSweeperOkAfterSweep(t *testing.T) {
 	store := &stubStorage{}
 	clk := clock.NewFake(time.Date(2025, 2, 1, 12, 0, 0, 0, time.UTC))
 	liveness := sweeper.NewLiveness()
-	sweep := sweeper.New(store, clk, time.Second, log.New(io.Discard, "", 0), liveness)
+	sweep := sweeper.New(store, clk, time.Second, log.New(io.Discard, "", 0), liveness, nil)
 	sweep.SweepOnce(context.Background())
 
 	server := NewServer(Dependencies{
@@ -129,6 +129,58 @@ func TestReadyzReportsSweeperOkAfterSweep(t *testing.T) {
 	}
 	if payload["sweeper_ok"] != true {
 		t.Fatalf("expected sweeper_ok true")
+	}
+}
+
+func TestMetricszReturnsExpectedKeys(t *testing.T) {
+	server := NewServer(Dependencies{
+		Config: config.Config{
+			Address:               ":0",
+			DataDir:               "data",
+			RateLimitHealth:       config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:           config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitSessionClaim: config.RateLimit{Max: 100, Window: time.Minute},
+			MaxScanBytes:          config.DefaultMaxScanBytes,
+			MaxScanDuration:       config.DefaultMaxScanDuration,
+		},
+		Store:  &stubStorage{},
+		Tokens: token.NewMemoryService(),
+	})
+
+	rec := httptest.NewRecorder()
+	server.Router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metricsz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d", rec.Code)
+	}
+
+	var payload map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	expected := map[string]bool{
+		"sessions_created_total":        true,
+		"transfers_started_total":       true,
+		"transfers_completed_total":     true,
+		"transfers_expired_total":       true,
+		"sweeper_runs_total":            true,
+		"relay_ice_config_issued_total": true,
+	}
+	if len(payload) != len(expected) {
+		t.Fatalf("expected %d keys got %d", len(expected), len(payload))
+	}
+	for key := range expected {
+		if _, ok := payload[key]; !ok {
+			t.Fatalf("missing key %s", key)
+		}
+	}
+	for key, value := range payload {
+		if !expected[key] {
+			t.Fatalf("unexpected key %s", key)
+		}
+		if _, ok := value.(float64); !ok {
+			t.Fatalf("expected numeric value for %s", key)
+		}
 	}
 }
 
@@ -185,16 +237,18 @@ func TestQuotaBlocksExtraTransfers(t *testing.T) {
 	store := &stubStorage{}
 	server := NewServer(Dependencies{
 		Config: config.Config{
-			Address:                     ":0",
-			DataDir:                     "data",
-			RateLimitHealth:             config.RateLimit{Max: 100, Window: time.Minute},
-			RateLimitV1:                 config.RateLimit{Max: 100, Window: time.Minute},
-			RateLimitSessionClaim:       config.RateLimit{Max: 100, Window: time.Minute},
-			ClaimTokenTTL:               config.DefaultClaimTokenTTL,
-			TransferTokenTTL:            config.DefaultTransferTokenTTL,
-			MaxScanBytes:                config.DefaultMaxScanBytes,
-			MaxScanDuration:             config.DefaultMaxScanDuration,
-			QuotaTransfersPerDaySession: 1,
+			Address:               ":0",
+			DataDir:               "data",
+			RateLimitHealth:       config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:           config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitSessionClaim: config.RateLimit{Max: 100, Window: time.Minute},
+			ClaimTokenTTL:         config.DefaultClaimTokenTTL,
+			TransferTokenTTL:      config.DefaultTransferTokenTTL,
+			MaxScanBytes:          config.DefaultMaxScanBytes,
+			MaxScanDuration:       config.DefaultMaxScanDuration,
+			Quotas: config.QuotaConfig{
+				TransfersPerDaySession: 1,
+			},
 		},
 		Store:   store,
 		Tokens:  token.NewMemoryService(),
@@ -239,16 +293,18 @@ func TestUploadThrottleDelaysResponse(t *testing.T) {
 	store := &stubStorage{}
 	server := NewServer(Dependencies{
 		Config: config.Config{
-			Address:                 ":0",
-			DataDir:                 "data",
-			RateLimitHealth:         config.RateLimit{Max: 100, Window: time.Minute},
-			RateLimitV1:             config.RateLimit{Max: 100, Window: time.Minute},
-			RateLimitSessionClaim:   config.RateLimit{Max: 100, Window: time.Minute},
-			ClaimTokenTTL:           config.DefaultClaimTokenTTL,
-			TransferTokenTTL:        config.DefaultTransferTokenTTL,
-			MaxScanBytes:            config.DefaultMaxScanBytes,
-			MaxScanDuration:         config.DefaultMaxScanDuration,
-			TransferBandwidthCapBps: 50,
+			Address:               ":0",
+			DataDir:               "data",
+			RateLimitHealth:       config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:           config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitSessionClaim: config.RateLimit{Max: 100, Window: time.Minute},
+			ClaimTokenTTL:         config.DefaultClaimTokenTTL,
+			TransferTokenTTL:      config.DefaultTransferTokenTTL,
+			MaxScanBytes:          config.DefaultMaxScanBytes,
+			MaxScanDuration:       config.DefaultMaxScanDuration,
+			Throttles: config.ThrottleConfig{
+				TransferBandwidthCapBps: 50,
+			},
 		},
 		Store:   store,
 		Tokens:  token.NewMemoryService(),
@@ -300,18 +356,20 @@ func TestRelayQuotaBlocksExtraIssuance(t *testing.T) {
 	store := &stubStorage{}
 	server := NewServer(Dependencies{
 		Config: config.Config{
-			Address:                ":0",
-			DataDir:                "data",
-			RateLimitHealth:        config.RateLimit{Max: 100, Window: time.Minute},
-			RateLimitV1:            config.RateLimit{Max: 100, Window: time.Minute},
-			RateLimitSessionClaim:  config.RateLimit{Max: 100, Window: time.Minute},
-			ClaimTokenTTL:          config.DefaultClaimTokenTTL,
-			TransferTokenTTL:       config.DefaultTransferTokenTTL,
-			MaxScanBytes:           config.DefaultMaxScanBytes,
-			MaxScanDuration:        config.DefaultMaxScanDuration,
-			TURNURLs:               []string{"turn:relay.example"},
-			TURNSharedSecret:       []byte("secret"),
-			RelayPerIdentityPerDay: 1,
+			Address:               ":0",
+			DataDir:               "data",
+			RateLimitHealth:       config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitV1:           config.RateLimit{Max: 100, Window: time.Minute},
+			RateLimitSessionClaim: config.RateLimit{Max: 100, Window: time.Minute},
+			ClaimTokenTTL:         config.DefaultClaimTokenTTL,
+			TransferTokenTTL:      config.DefaultTransferTokenTTL,
+			MaxScanBytes:          config.DefaultMaxScanBytes,
+			MaxScanDuration:       config.DefaultMaxScanDuration,
+			TURNURLs:              []string{"turn:relay.example"},
+			TURNSharedSecret:      []byte("secret"),
+			Quotas: config.QuotaConfig{
+				RelayPerIdentityPerDay: 1,
+			},
 		},
 		Store:   store,
 		Tokens:  token.NewMemoryService(),
@@ -1788,8 +1846,8 @@ func (s *stubStorage) DeleteTransfer(_ context.Context, transferID string) error
 	return nil
 }
 
-func (s *stubStorage) SweepExpired(_ context.Context, _ time.Time) (int, error) {
-	return 0, nil
+func (s *stubStorage) SweepExpired(_ context.Context, _ time.Time) (storage.SweepResult, error) {
+	return storage.SweepResult{}, nil
 }
 
 func (s *stubStorage) CreateSession(_ context.Context, session domain.Session) error {

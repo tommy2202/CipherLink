@@ -21,7 +21,7 @@ type Storage interface {
 	WriteChunk(ctx context.Context, transferID string, offset int64, data []byte) error
 	ReadRange(ctx context.Context, transferID string, offset int64, length int64) ([]byte, error)
 	DeleteTransfer(ctx context.Context, transferID string) error
-	SweepExpired(ctx context.Context, now time.Time) (int, error)
+	SweepExpired(ctx context.Context, now time.Time) (SweepResult, error)
 
 	CreateSession(ctx context.Context, session domain.Session) error
 	GetSession(ctx context.Context, sessionID string) (domain.Session, error)
@@ -38,4 +38,14 @@ type Storage interface {
 	ListScanChunks(ctx context.Context, scanID string) ([]int, error)
 	LoadScanChunk(ctx context.Context, scanID string, chunkIndex int) ([]byte, error)
 	DeleteScanChunks(ctx context.Context, scanID string) error
+}
+
+type SweepResult struct {
+	Sessions  int
+	Transfers int
+	Scans     int
+}
+
+func (r SweepResult) Total() int {
+	return r.Sessions + r.Transfers + r.Scans
 }

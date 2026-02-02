@@ -41,11 +41,11 @@ func main() {
 	liveness := sweeper.NewLiveness()
 
 	server := api.NewServer(api.Dependencies{
-		Config:  cfg,
-		Store:   store,
-		Tokens:  tokens,
-		Logger:  logger,
-		Scanner: scanner.UnavailableScanner{},
+		Config:        cfg,
+		Store:         store,
+		Tokens:        tokens,
+		Logger:        logger,
+		Scanner:       scanner.UnavailableScanner{},
 		SweeperStatus: liveness,
 	})
 
@@ -58,7 +58,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	sweep := sweeper.New(store, clk, cfg.SweepInterval, logger, liveness)
+	sweep := sweeper.New(store, clk, cfg.SweepInterval, logger, liveness, server.Metrics())
 	sweep.Start(ctx)
 
 	go func() {

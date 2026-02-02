@@ -36,6 +36,18 @@ Configuration (optional):
 - `UD_CLAIM_TOKEN_TTL` (default `3m`, min `2m`, max `5m`)
 - `UD_TRANSFER_TOKEN_TTL` (default `5m`, min `1m`, max `15m`)
 - `UD_SWEEP_INTERVAL` (default `30s`)
+- `UD_QUOTA_IP_SESSIONS_PER_DAY` (default `0`, `0` disables)
+- `UD_QUOTA_SESSION_SESSIONS_PER_DAY` (default `0`, `0` disables)
+- `UD_QUOTA_IP_TRANSFERS_PER_DAY` (default `0`, `0` disables)
+- `UD_QUOTA_SESSION_TRANSFERS_PER_DAY` (default `0`, `0` disables)
+- `UD_QUOTA_IP_BYTES_PER_DAY` (default `0`, `0` disables)
+- `UD_QUOTA_SESSION_BYTES_PER_DAY` (default `0`, `0` disables)
+- `UD_QUOTA_IP_CONCURRENT_TRANSFERS` (default `0`, `0` disables)
+- `UD_QUOTA_SESSION_CONCURRENT_TRANSFERS` (default `0`, `0` disables)
+- `UD_RELAY_ISSUANCE_PER_DAY` (default `0`, `0` disables)
+- `UD_RELAY_CONCURRENT_SESSIONS` (default `0`, `0` disables)
+- `UD_TRANSFER_BANDWIDTH_BPS` (default `0`, `0` disables)
+- `UD_GLOBAL_BANDWIDTH_BPS` (default `0`, `0` disables)
 
 ### Verify
 
@@ -87,6 +99,7 @@ flutter test
 - Transfers use `/v1/transfer/init`, `/v1/transfer/chunk`, `/v1/transfer/finalize`,
   `/v1/transfer/manifest`, `/v1/transfer/download`, and `/v1/transfer/receipt`.
 - `/v1` routes are rate-limited per IP and group.
+- `/metricsz` exposes coarse, privacy-safe counters only.
 - App crypto helpers live in `app/lib/crypto.dart` with tests under `app/test`.
 - The app supports live “Send Text” using the same E2E transfer pipeline;
   content is deleted on receipt or TTL expiry.

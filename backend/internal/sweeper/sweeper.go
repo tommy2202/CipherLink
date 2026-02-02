@@ -8,6 +8,7 @@ import (
 
 	"universaldrop/internal/clock"
 	"universaldrop/internal/logging"
+	"universaldrop/internal/metrics"
 	"universaldrop/internal/storage"
 )
 
@@ -17,15 +18,17 @@ type Sweeper struct {
 	interval time.Duration
 	logger   *log.Logger
 	liveness *Liveness
+	metrics  *metrics.Counters
 }
 
-func New(store storage.Storage, clk clock.Clock, interval time.Duration, logger *log.Logger, liveness *Liveness) *Sweeper {
+func New(store storage.Storage, clk clock.Clock, interval time.Duration, logger *log.Logger, liveness *Liveness, counters *metrics.Counters) *Sweeper {
 	return &Sweeper{
 		store:    store,
 		clock:    clk,
 		interval: interval,
 		logger:   logger,
 		liveness: liveness,
+		metrics:  counters,
 	}
 }
 
@@ -52,7 +55,10 @@ func (s *Sweeper) SweepOnce(ctx context.Context) {
 }
 
 func (s *Sweeper) sweep(ctx context.Context) {
-	count, err := s.store.SweepExpired(ctx, s.clock.Now())
+	if s.metrics != nil {
+		s.metrics.IncSweeperRuns()
+	}
+	result, err := s.store.SweepExpired(ctx, s.clock.Now())
 	if err != nil {
 		logging.Allowlist(s.logger, map[string]string{
 			"event": "sweep_error",
@@ -60,13 +66,16 @@ func (s *Sweeper) sweep(ctx context.Context) {
 		})
 		return
 	}
+	if s.metrics != nil {
+		s.metrics.AddTransfersExpired(result.Transfers)
+	}
 	if s.liveness != nil {
 		s.liveness.Mark(s.clock.Now())
 	}
-	if count > 0 {
+	if total := result.Total(); total > 0 {
 		logging.Allowlist(s.logger, map[string]string{
 			"event": "sweep_complete",
-			"count": strconv.Itoa(count),
+			"count": strconv.Itoa(total),
 		})
 	}
 }
